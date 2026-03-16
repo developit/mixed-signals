@@ -22,13 +22,14 @@
     "disposable.d.ts"
   ],
   "scripts": {
+    "test": "node --test 'test/**/*.test.ts'",
     "build": "tsdown",
     "typecheck": "tsc",
     "lint": "biome lint .",
     "format": "biome format --write .",
     "check": "biome check --write .",
-    "docs:api": "typedoc --json .typedoc/server.json server/index.ts && typedoc --json .typedoc/client.json client/index.ts && node scripts/generate-readme.mjs",
-    "prepublishOnly": "tsdown && pnpm run docs:api"
+    "docs:api": "node scripts/generate-readme.mjs",
+    "prepublishOnly": "tsdown && node scripts/generate-readme.mjs"
   },
   "keywords": [
     "preact",
