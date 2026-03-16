@@ -1,11 +1,26 @@
-import {readFile, writeFile} from 'node:fs/promises';
+import {execFileSync} from 'node:child_process';
+import {mkdir, readFile, writeFile} from 'node:fs/promises';
 
-const outPath = new URL('../README.md', import.meta.url);
+const root = new URL('..', import.meta.url);
+const outPath = new URL('README.md', root);
+const typedocDir = new URL('.typedoc/', root);
 
 const ENTRY_POINTS = [
-  {json: '../.typedoc/server.json', heading: 'signal-wire/server'},
-  {json: '../.typedoc/client.json', heading: 'signal-wire/client'},
+  {src: 'server/index.ts', json: 'server.json', heading: 'signal-wire/server'},
+  {src: 'client/index.ts', json: 'client.json', heading: 'signal-wire/client'},
 ];
+
+// Run typedoc to generate JSON for each entry point
+await mkdir(typedocDir, {recursive: true});
+for (const entry of ENTRY_POINTS) {
+  const jsonPath = new URL(entry.json, typedocDir).pathname;
+  const typedoc = new URL('../node_modules/.bin/typedoc', import.meta.url)
+    .pathname;
+  execFileSync(typedoc, ['--json', jsonPath, entry.src], {
+    cwd: root.pathname,
+    stdio: ['ignore', 'inherit', 'inherit'],
+  });
+}
 
 const KIND = {
   64: 'Function',
@@ -33,13 +48,17 @@ function typeToString(t) {
     const props = t.declaration?.children;
     if (props?.length) {
       const entries = props
-        .map((p) => `${p.name}${p.flags?.isOptional ? '?' : ''}: ${typeToString(p.type)}`)
+        .map(
+          (p) =>
+            `${p.name}${p.flags?.isOptional ? '?' : ''}: ${typeToString(p.type)}`,
+        )
         .join('; ');
       return `{ ${entries} }`;
     }
     return '{ … }';
   }
-  if (t.type === 'predicate') return `${t.name} is ${typeToString(t.targetType)}`;
+  if (t.type === 'predicate')
+    return `${t.name} is ${typeToString(t.targetType)}`;
   if (t.name) return t.name;
   return t.type || 'unknown';
 }
@@ -58,13 +77,21 @@ function sigToLine(sig) {
 function commentText(comment) {
   if (!comment) return '';
   const parts = comment.summary || [];
-  return parts.map((p) => p.text || '').join('').trim();
+  return parts
+    .map((p) => p.text || '')
+    .join('')
+    .trim();
 }
 
-const apiLines = ['## API', '', '_Generated from TypeScript declarations._', ''];
+const apiLines = [
+  '## API',
+  '',
+  '_Generated from TypeScript declarations._',
+  '',
+];
 
 for (const entry of ENTRY_POINTS) {
-  const jsonPath = new URL(entry.json, import.meta.url);
+  const jsonPath = new URL(entry.json, typedocDir);
   const doc = JSON.parse(await readFile(jsonPath, 'utf8'));
   const exports = (doc.children || []).filter(
     (n) => n.variant === 'declaration' && n.kind !== 4,
@@ -85,7 +112,9 @@ for (const entry of ENTRY_POINTS) {
       apiLines.push('- Signatures:');
       for (const sig of node.signatures) {
         const sigDesc = commentText(sig.comment);
-        apiLines.push(`  - \`${sigToLine(sig)}\`${sigDesc ? ' — ' + sigDesc : ''}`);
+        apiLines.push(
+          `  - \`${sigToLine(sig)}\`${sigDesc ? ' — ' + sigDesc : ''}`,
+        );
       }
     }
 
