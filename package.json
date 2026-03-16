@@ -1,7 +1,7 @@
 {
   "name": "signal-wire",
   "version": "0.1.0",
-  "description": "Reflection & RPC for Preact Signals — use server-side reactive models on the client",
+  "description": "RPC Reflection for Preact Models & Signals: use Models/Signals from a somewhere else (server/worker/etc) as if they were here.",
   "type": "module",
   "exports": {
     "./server": {

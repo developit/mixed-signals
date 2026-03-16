@@ -1,16 +1,16 @@
 # signal-wire
 
-Reflection & RPC for [`@preact/signals-core`](https://github.com/preactjs/signals) — synchronize reactive model state between server and client over any transport (WebSocket, etc).
+RPC-based reflection for [Preact Signals and Models](https://github.com/preactjs/signals). Access reactive model state and methods from a server (or worker/tab/etc) on the client. Type-safe, optimized transport-agnostic protocol (WebSocket, SSE, postMessage, etc).
 
 ## Install
 
 ```sh
-npm install signal-wire @preact/signals-core
+npm install signal-wire
 ```
 
 ## How it works
 
-**signal-wire** reflects server-side models built with `@preact/signals-core` to connected clients in real-time. Signals on the server are serialized with identity markers, and the client reconstructs them as local signals that stay in sync via a lightweight wire protocol.
+**signal-wire** reflects server-side Preact Models and Signals (anything created via `@preact/signals-core`) to connected clients in real-time. Signals on the server are serialized with identity markers, and the client reconstructs them as local signals that stay in sync via a lightweight wire protocol.
 
 - **Server** models use `createModel()` from `signal-wire/server` (a thin wrapper around `@preact/signals-core`'s `createModel`)
 - **Client** models use `createReflectedModel()` from `signal-wire/client` to create local proxies that mirror server state
