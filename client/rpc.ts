@@ -1,6 +1,6 @@
-import type {Transport} from '../server/rpc';
-import type {WireContext} from './reflection';
-import {ClientReflection} from './reflection';
+import type {Transport} from '../server/rpc.ts';
+import type {WireContext} from './reflection.ts';
+import {ClientReflection} from './reflection.ts';
 
 export class RPCClient {
   private transport: Transport;

@@ -1,5 +1,5 @@
-import {Instances} from './instances';
-import {Reflection} from './reflection';
+import {Instances} from './instances.ts';
+import {Reflection} from './reflection.ts';
 
 export interface Transport {
   send(data: string): void;

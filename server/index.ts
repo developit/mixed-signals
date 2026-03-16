@@ -1,5 +1,5 @@
-export {Instances} from './instances';
-export {createModel} from './model';
-export {Reflection} from './reflection';
-export type {Transport} from './rpc';
-export {RPC} from './rpc';
+export {Instances} from './instances.ts';
+export {createModel} from './model.ts';
+export {Reflection} from './reflection.ts';
+export type {Transport} from './rpc.ts';
+export {RPC} from './rpc.ts';

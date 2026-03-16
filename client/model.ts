@@ -1,6 +1,6 @@
 import {computed, createModel, Signal, signal} from '@preact/signals-core';
-import type {WireContext} from './reflection';
-import '../shared/disposable';
+import type {WireContext} from './reflection.ts';
+import '../shared/disposable.ts';
 
 // Creates a Preact Model constructor for reflected server models.
 // Every reflected model is an instance with a wire ID from the combined @M field.

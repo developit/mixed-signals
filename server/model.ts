@@ -1,6 +1,6 @@
 import type {ModelConstructor, ModelFactory} from '@preact/signals-core';
 import {createModel as originalCreateModel} from '@preact/signals-core';
-import '../shared/disposable';
+import '../shared/disposable.ts';
 
 export function createModel<TModel, TFactoryArgs extends any[] = []>(
   factory: ModelFactory<TModel, TFactoryArgs>,

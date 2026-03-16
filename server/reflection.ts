@@ -1,5 +1,5 @@
 import {Signal} from '@preact/signals-core';
-import type {Instances} from './instances';
+import type {Instances} from './instances.ts';
 
 type SignalId = number;
 type ClientId = string;
