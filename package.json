@@ -1,7 +1,7 @@
 {
   "name": "signal-wire",
   "version": "0.1.0",
-  "description": "Reflection & RPC for @preact/signals-core — synchronize reactive model state between server and client",
+  "description": "Reflection & RPC for Preact Signals — use server-side reactive models on the client",
   "type": "module",
   "exports": {
     "./server": {
@@ -11,7 +11,9 @@
     "./client": {
       "types": "./build/client/index.d.ts",
       "default": "./build/client/index.js"
-    }
+    },
+    "./disposable.d.ts": "./disposable.d.ts",
+    "./package.json": "./package.json"
   },
   "files": [
     "build",
