@@ -1,0 +1,56 @@
+{
+  "name": "signal-wire",
+  "version": "0.1.0",
+  "description": "Reflection & RPC for @preact/signals-core — synchronize reactive model state between server and client",
+  "type": "module",
+  "exports": {
+    "./server": {
+      "types": "./build/server/index.d.ts",
+      "default": "./build/server/index.js"
+    },
+    "./client": {
+      "types": "./build/client/index.d.ts",
+      "default": "./build/client/index.js"
+    }
+  },
+  "files": [
+    "build",
+    "server",
+    "client",
+    "disposable.d.ts"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc",
+    "lint": "biome lint .",
+    "format": "biome format --write .",
+    "check": "biome check --write .",
+    "docs:api": "typedoc --json .typedoc/server.json server/index.ts && typedoc --json .typedoc/client.json client/index.ts && node scripts/generate-readme.mjs",
+    "prepublishOnly": "tsdown && pnpm run docs:api"
+  },
+  "keywords": [
+    "preact",
+    "signals",
+    "rpc",
+    "reflection",
+    "reactive",
+    "realtime",
+    "websocket"
+  ],
+  "author": "Jason Miller <jason@developit.ca>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/developit/signal-wire.git"
+  },
+  "peerDependencies": {
+    "@preact/signals-core": ">=1.14.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.2",
+    "@preact/signals-core": "^1.14.0",
+    "tsdown": "^0.20.0",
+    "typedoc": "^0.28.13",
+    "typescript": "^5.7.0"
+  }
+}

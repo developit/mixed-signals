@@ -1,0 +1,30 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.4.7/schema.json",
+  "files": {"includes": ["**", "!**/build"]},
+  "vcs": {"enabled": false},
+  "formatter": {
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "bracketSpacing": false
+  },
+  "javascript": {
+    "formatter": {
+      "bracketSpacing": false,
+      "quoteStyle": "single"
+    }
+  },
+  "linter": {
+    "rules": {
+      "style": {
+        "noParameterAssign": "off",
+        "useTemplate": "off",
+        "noUnusedTemplateLiteral": "off",
+        "noNonNullAssertion": "off"
+      },
+      "suspicious": {
+        "noAssignInExpressions": "off",
+        "noExplicitAny": "off"
+      }
+    }
+  }
+}
