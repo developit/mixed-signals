@@ -23,7 +23,9 @@ class FakeTransport implements Transport {
 }
 
 function createContext(): WireContext {
-  return {rpc: {call: async () => undefined}};
+  return {
+    rpc: {call: async () => undefined} as Partial<RPCClient>,
+  } as unknown as WireContext;
 }
 
 describe('RPCClient', () => {
@@ -55,7 +57,7 @@ describe('RPCClient', () => {
       const transport = new FakeTransport();
       const ctx = createContext();
       const client = new RPCClient(transport, ctx);
-      client.reflection.registerModel('Counter', ReflectedCounter);
+      client.registerModel('Counter', ReflectedCounter);
       transport.emit(
         'N:@R:{"@M":"Counter#5","count":{"@S":10,"v":0},"name":{"@S":11,"v":"default"},"items":{"@S":12,"v":[]},"meta":{"@S":13,"v":{}}}',
       );

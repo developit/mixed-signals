@@ -18,9 +18,13 @@ import {
 import {Instances} from './instances.ts';
 import {Reflection} from './reflection.ts';
 
-type ModelConstructor = (new (...args: any[]) => any) | ((...args: any[]) => any);
+type ModelConstructor =
+  | (new (
+      ...args: any[]
+    ) => any)
+  | ((...args: any[]) => any);
 
-// Allow direct calls into nested collections like "sessions.createSession".
+// Allow dotted paths for nested method calls like "sessions.createSession".
 function dlv(obj: any, path: string): any {
   return path.split('.').reduce((acc, key) => acc?.[key], obj);
 }
@@ -29,6 +33,8 @@ export class RPC {
   private reflection: Reflection;
   private clients = new Map<string, Transport>();
   private root: any;
+
+  /** @internal */
   instances: Instances;
 
   /** Registered upstream connections for model forwarding. */
@@ -116,6 +122,7 @@ export class RPC {
   /**
    * Called by ForwardedUpstream when the upstream root changes.
    * Sends the merged root to all clients once every upstream has reported.
+   * @internal
    */
   onUpstreamRootChanged() {
     if (!this.allUpstreamsReady()) return;
@@ -335,6 +342,7 @@ export class RPC {
     }
   }
 
+  /** @internal */
   send(clientId: string, message: string) {
     const transport = this.clients.get(clientId);
     if (!transport) return;

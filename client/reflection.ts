@@ -3,29 +3,27 @@ import {
   UNWATCH_SIGNALS_METHOD,
   WATCH_SIGNALS_METHOD,
 } from '../shared/protocol.ts';
+import type {RPCClient} from './rpc.ts';
 
+/** @internal */
 export interface WireContext {
-  rpc: {call(method: string, params?: unknown[]): Promise<unknown>};
-}
-
-interface RpcNotifier {
-  notify(method: string, params?: unknown[]): void;
+  rpc: RPCClient;
 }
 
 export class ClientReflection {
   private signals = new Map<number | string, Signal<any>>();
   private models = new Map<string, any>();
   private modelRegistry = new Map<string, any>();
-  private rpc: RpcNotifier;
+  private rpc: RPCClient;
   private ctx: WireContext;
   private watchBatch = new Set<number | string>();
   private unwatchBatch = new Set<number | string>();
   private watchFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private unwatchFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
-  constructor(rpc: RpcNotifier, ctx: WireContext) {
+  constructor(rpc: RPCClient, ctx?: any) {
     this.rpc = rpc;
-    this.ctx = ctx;
+    this.ctx = ctx && ctx.rpc === rpc ? ctx : {rpc};
   }
 
   registerModel(typeName: string, ctor: any) {

@@ -8,7 +8,7 @@ import {
   SIGNAL_UPDATE_METHOD,
   type Transport,
 } from '../shared/protocol.ts';
-import {ClientReflection, type WireContext} from './reflection.ts';
+import {ClientReflection} from './reflection.ts';
 
 export class RPCClient {
   private transport: Transport;
@@ -20,13 +20,14 @@ export class RPCClient {
   private notificationListeners = new Set<
     (method: string, params: any[]) => void
   >();
+  /** @internal */
   reflection: ClientReflection;
   private transportReady: Promise<void> | undefined;
   root: any = undefined;
   ready: Promise<void>;
   private _resolveReady!: () => void;
 
-  constructor(transport: Transport, ctx: WireContext) {
+  constructor(transport: Transport, ctx?: any) {
     this.transport = transport;
     this.transportReady = transport.ready;
     this.ready = new Promise((resolve) => {
@@ -73,6 +74,10 @@ export class RPCClient {
       const params = parseWireParams(message.payload, reviver);
       this.handleNotification(message.method, params);
     });
+  }
+
+  registerModel(typeName: string, ctor: any) {
+    this.reflection.registerModel(typeName, ctor);
   }
 
   async call(method: string, params?: any): Promise<any> {

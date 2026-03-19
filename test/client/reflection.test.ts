@@ -1,6 +1,7 @@
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import type {WireContext} from '../../client/reflection.ts';
 import {ClientReflection} from '../../client/reflection.ts';
+import type {RPCClient} from '../../client/rpc.ts';
 import {
   UNWATCH_SIGNALS_METHOD,
   WATCH_SIGNALS_METHOD,
@@ -18,9 +19,12 @@ class TaskModel {
 
 function setup() {
   const notify = vi.fn();
-  const ctx: WireContext = {rpc: {call: vi.fn(async () => undefined)}};
-  const rpc = {notify};
-  const reflection = new ClientReflection(rpc, ctx);
+  const rpc = {
+    notify,
+    call: vi.fn(async () => undefined),
+  } satisfies Partial<RPCClient> as unknown as RPCClient;
+  const ctx = {rpc};
+  const reflection = new ClientReflection(rpc);
   return {reflection, notify, ctx};
 }
 

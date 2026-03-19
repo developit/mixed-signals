@@ -263,11 +263,11 @@ describe('protocol-level forwarding', () => {
       ['rename'],
     );
     let browser!: RPCClient;
-    const ctx: WireContext = {
-      rpc: {call: (m, p) => browser.call(m, p)},
-    };
+    const ctx = {
+      rpc: {call: (m, p) => browser.call(m, p)} satisfies Partial<RPCClient>,
+    } as WireContext;
     browser = new RPCClient(browserTransport, ctx);
-    browser.reflection.registerModel('BrokerProject', ProjectModel);
+    browser.registerModel('BrokerProject', ProjectModel);
 
     serverRpc.addClient(serverDownstreamTransport, 'browser-1');
 
@@ -347,13 +347,13 @@ describe('protocol-level forwarding', () => {
     );
 
     let browser!: RPCClient;
-    const ctx: WireContext = {
-      rpc: {call: (m, p) => browser.call(m, p)},
-    };
+    const ctx = {
+      rpc: {call: (m, p) => browser.call(m, p)} satisfies Partial<RPCClient>,
+    } as WireContext;
     browser = new RPCClient(browserTransport, ctx);
-    browser.reflection.registerModel('BrokerSessions', SessionsModel);
-    browser.reflection.registerModel('BrokerSession', SessionModel);
-    browser.reflection.registerModel('BrokerMessage', MessageModel);
+    browser.registerModel('BrokerSessions', SessionsModel);
+    browser.registerModel('BrokerSession', SessionModel);
+    browser.registerModel('BrokerMessage', MessageModel);
 
     serverRpc.addClient(serverDownstreamTransport, 'browser-1');
     await flush();
@@ -429,9 +429,11 @@ describe('protocol-level forwarding', () => {
       content: Signal<string>;
     }>(['content'], []);
     let browser!: RPCClient;
-    const ctx: WireContext = {rpc: {call: (m, p) => browser.call(m, p)}};
+    const ctx = {
+      rpc: {call: (m, p) => browser.call(m, p)} satisfies Partial<RPCClient>,
+    } as WireContext;
     browser = new RPCClient(browserTransport, ctx);
-    browser.reflection.registerModel('Stream', ClientStreamModel);
+    browser.registerModel('Stream', ClientStreamModel);
 
     serverRpc.addClient(serverDownstreamTransport, 'browser-1');
     await flush();
@@ -500,10 +502,12 @@ describe('protocol-level forwarding', () => {
       value: Signal<string>;
     }>(['value'], []);
     let browser!: RPCClient;
-    const ctx: WireContext = {rpc: {call: (m, p) => browser.call(m, p)}};
+    const ctx = {
+      rpc: {call: (m, p) => browser.call(m, p)} satisfies Partial<RPCClient>,
+    } as WireContext;
     browser = new RPCClient(browserTransport, ctx);
-    browser.reflection.registerModel('Local', ClientLocalModel);
-    browser.reflection.registerModel('Remote', ClientRemoteModel);
+    browser.registerModel('Local', ClientLocalModel);
+    browser.registerModel('Remote', ClientRemoteModel);
 
     serverRpc.addClient(serverDownstreamTransport, 'browser-1');
     await flush();

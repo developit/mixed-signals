@@ -13,7 +13,11 @@ interface RpcSender {
   send(clientId: string, message: string): void;
 }
 
-type ModelConstructor = (new (...args: any[]) => any) | ((...args: any[]) => any);
+type ModelConstructor =
+  | (new (
+      ...args: any[]
+    ) => any)
+  | ((...args: any[]) => any);
 
 export class Reflection {
   private signalIds = new WeakMap<Signal<any>, SignalId>();

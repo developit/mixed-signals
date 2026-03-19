@@ -16,7 +16,7 @@ function connect(rpc: RPC, clientId?: string) {
   const ctx = {rpc: null as any};
   const rpcClient = new RPCClient(clientTransport, ctx);
   ctx.rpc = rpcClient;
-  rpcClient.reflection.registerModel('Counter', ReflectedCounter);
+  rpcClient.registerModel('Counter', ReflectedCounter);
   const cleanup = rpc.addClient(serverTransport, clientId);
   return {rpcClient, cleanup, flush};
 }
@@ -513,15 +513,13 @@ describe('mixed-signals roundtrip', () => {
     rpc.registerModel('Project', Project);
 
     const ctx: WireContext = {
-      rpc: {
-        call(method: string, params?: unknown[]) {
-          return client.call(method, params);
-        },
+      get rpc() {
+        return client;
       },
     };
 
     client = new RPCClient(clientTransport, ctx);
-    client.reflection.registerModel('Project', ProjectModel);
+    client.registerModel('Project', ProjectModel);
 
     rpc.addClient(serverTransport, 'client-1');
     await flush();
@@ -581,30 +579,15 @@ describe('mixed-signals roundtrip', () => {
         ['id', 'toolCallId', 'name', 'args', 'details', 'output', 'status'],
         [],
       );
-    let client!: RPCClient;
 
     rpc.registerModel('TranscriptSession', TranscriptSession);
     rpc.registerModel('TranscriptMessageItem', TranscriptMessageItem);
     rpc.registerModel('TranscriptToolCallItem', TranscriptToolCallItem);
 
-    const ctx: WireContext = {
-      rpc: {
-        call(method: string, params?: unknown[]) {
-          return client.call(method, params);
-        },
-      },
-    };
-
-    client = new RPCClient(clientTransport, ctx);
-    client.reflection.registerModel('TranscriptSession', SessionModel);
-    client.reflection.registerModel(
-      'TranscriptMessageItem',
-      TranscriptMessageModel,
-    );
-    client.reflection.registerModel(
-      'TranscriptToolCallItem',
-      TranscriptToolCallModel,
-    );
+    const client = new RPCClient(clientTransport);
+    client.registerModel('TranscriptSession', SessionModel);
+    client.registerModel('TranscriptMessageItem', TranscriptMessageModel);
+    client.registerModel('TranscriptToolCallItem', TranscriptToolCallModel);
 
     rpc.addClient(serverTransport, 'client-1');
     await flush();
