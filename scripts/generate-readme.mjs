@@ -6,8 +6,16 @@ const outPath = new URL('README.md', root);
 const typedocDir = new URL('.typedoc/', root);
 
 const ENTRY_POINTS = [
-  {src: 'server/index.ts', json: 'server.json', heading: 'signal-wire/server'},
-  {src: 'client/index.ts', json: 'client.json', heading: 'signal-wire/client'},
+  {
+    src: 'server/index.ts',
+    json: 'server.json',
+    heading: 'mixed-signals/server',
+  },
+  {
+    src: 'client/index.ts',
+    json: 'client.json',
+    heading: 'mixed-signals/client',
+  },
 ];
 
 // Run typedoc to generate JSON for each entry point
@@ -160,7 +168,7 @@ for (const entry of ENTRY_POINTS) {
 }
 
 // Preserve authored content above ## API marker
-let authored = '# signal-wire\n\n';
+let authored = '# mixed-signals\n\n';
 try {
   const existing = await readFile(outPath, 'utf8');
   const marker = /\n## API\b[\s\S]*$/m;
