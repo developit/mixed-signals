@@ -24,10 +24,14 @@ for (const entry of ENTRY_POINTS) {
   const jsonPath = new URL(entry.json, typedocDir).pathname;
   const typedoc = new URL('../node_modules/.bin/typedoc', import.meta.url)
     .pathname;
-  execFileSync(typedoc, ['--json', jsonPath, entry.src], {
-    cwd: root.pathname,
-    stdio: ['ignore', 'inherit', 'inherit'],
-  });
+  execFileSync(
+    typedoc,
+    ['--json', jsonPath, '--excludePrivate', '--excludeInternal', entry.src],
+    {
+      cwd: root.pathname,
+      stdio: ['ignore', 'inherit', 'inherit'],
+    },
+  );
 }
 
 const KIND = {

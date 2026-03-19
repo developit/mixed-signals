@@ -18,7 +18,7 @@ No manual subscriptions, no event emitters — just signals.
 | **Instances**            | Registry that maps numeric IDs to server-side model instances, enabling instance-method routing.                        |
 | **RPCClient**            | Client-side hub. Sends method calls, awaits responses, and dispatches incoming notifications.                           |
 | **ClientReflection**     | Client-side signal manager. Creates/updates `Signal` objects from server data, batches `@W`/`@U` subscription messages. |
-| **createReflectedModel** | Factory that produces a Preact Model constructor for a collection or individual instance.                               |
+| **createReflectedModel** | Factory that produces a Preact Model constructor whose signal props and methods mirror a server model.                   |
 
 ## Overview
 
@@ -74,9 +74,8 @@ All messages are compact, newline-free text strings.
 
 #### Method Routing
 
-- **Direct RPC calls** — `path.method` (e.g. `sessions.createSession`)
-- **Collection reflected methods** — `path.method` (e.g. `todos.create`)
-- **Reflected model methods** — `{wireId}#method` (e.g. `42#delete`)
+- **Direct RPC calls** — `path.method` (e.g. `sessions.createSession`) for methods on the root object
+- **Reflected model methods** — `{wireId}#method` (e.g. `42#delete`) for methods on model instances
 - The server assigns `wireId`s when it serializes models with `@M`, and `createReflectedModel()` uses that identity for later calls.
 
 #### Serialization Markers
@@ -290,45 +289,34 @@ subscribe on the same tick" case into one `@W` frame.
 
 ## `createReflectedModel`
 
-Generates a Preact `createModel` constructor that mirrors a server shape.
-Two call sites, one implementation:
+Generates a Preact `createModel` constructor that mirrors a server model.
 
 ```
-                      signalProps      methods           path?
-                      ───────────      ───────           ─────
- collection model  →  ['threads']      ['list','create'] 'threads'
- instance model    →  ['id','title']   ['rename']        undefined
+                      signalProps      methods
+                      ───────────      ───────
+                      ['id','title']   ['rename']
 ```
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  createReflectedModel(signalProps, methods, path?)                          │
+│  createReflectedModel(signalProps, methods)                                 │
 │                                                                             │
 │  ┌──────────────── per signalProp ─────────────────┐                        │
-│  │                                                 │                        │
-│  │  data[p] is Signal?                             │   instance (from @M):  │
-│  │  ── yes ─▶  computed(() => data[p].value)       │   reviver already made │
-│  │                                                 │   the inner signals.   │
-│  │  ── no  ─▶  holder = signal<Signal|null>(null)  │                        │
-│  │            computed(() => holder.value?.value)  │   collection: inner    │
-│  │            (double-deref)                       │   signal arrives later │
-│  └─────────────────────────────────────────────────┘   via method result.   │
+│  │                                                 │   The @M reviver       │
+│  │  data[p] is Signal?                             │   already created the  │
+│  │  ── yes ─▶  computed(() => data[p].value)       │   inner signals.       │
+│  └─────────────────────────────────────────────────┘                        │
 │                                                                             │
 │  ┌──────────────── per method ─────────────────────┐                        │
 │  │                                                 │                        │
-│  │  path  ─▶  ctx.rpc.call(`${path}.${m}`, args)   │   static route         │
-│  │  else  ─▶  ctx.rpc.call(`${wireId}#${m}`, args) │   instance route       │
-│  │                                                 │                        │
-│  │  on result: scan for Signal props,              │   so `threads.list()`  │
-│  │  stuff them into matching holders               │   populates `.threads` │
+│  │  ctx.rpc.call(`${wireId}#${m}`, args)            │   instance route       │
 │  └─────────────────────────────────────────────────┘                        │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The outer `computed` is what makes this composable: UI binds to
-`model.title.value`, which tracks the holder _and_ the remote signal behind
-it. Swapping the underlying facade (e.g. after a refetch) propagates without
-the UI knowing.
+UI binds to `model.title.value`, which tracks the computed wrapping the
+remote signal. Swapping the underlying facade (e.g. after a refetch)
+propagates without the UI knowing.
 
 ---
 
