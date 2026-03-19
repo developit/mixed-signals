@@ -1,22 +1,29 @@
-import type {Signal} from '@preact/signals-core';
-import {signal} from '@preact/signals-core';
+import {type Signal, signal} from '@preact/signals-core';
+import {
+  UNWATCH_SIGNALS_METHOD,
+  WATCH_SIGNALS_METHOD,
+} from '../shared/protocol.ts';
 
 export interface WireContext {
   rpc: {call(method: string, params?: unknown[]): Promise<unknown>};
 }
 
+interface RpcNotifier {
+  notify(method: string, params?: unknown[]): void;
+}
+
 export class ClientReflection {
-  private signals = new Map<number, Signal<any>>();
+  private signals = new Map<number | string, Signal<any>>();
+  private models = new Map<string, any>();
   private modelRegistry = new Map<string, any>();
-  private modelCache = new Map<string, any>();
-  private rpc: any;
+  private rpc: RpcNotifier;
   private ctx: WireContext;
-  private watchBatch = new Set<number>();
-  private unwatchBatch = new Set<number>();
+  private watchBatch = new Set<number | string>();
+  private unwatchBatch = new Set<number | string>();
   private watchFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private unwatchFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
-  constructor(rpc: any, ctx: WireContext) {
+  constructor(rpc: RpcNotifier, ctx: WireContext) {
     this.rpc = rpc;
     this.ctx = ctx;
   }
@@ -25,7 +32,8 @@ export class ClientReflection {
     this.modelRegistry.set(typeName, ctor);
   }
 
-  private scheduleWatch(id: number) {
+  private scheduleWatch(id: number | string) {
+    // Batch watch messages so a render burst becomes one frame.
     this.watchBatch.add(id);
     if (!this.watchFlushTimer) {
       this.watchFlushTimer = setTimeout(() => {
@@ -33,13 +41,14 @@ export class ClientReflection {
         this.watchBatch.clear();
         this.watchFlushTimer = null;
         if (ids.length > 0) {
-          this.rpc.notify('@W', ids);
+          this.rpc.notify(WATCH_SIGNALS_METHOD, ids);
         }
       }, 1);
     }
   }
 
-  private scheduleUnwatch(id: number) {
+  private scheduleUnwatch(id: number | string) {
+    // Unwatchs are batched separately so quick remounts can cancel them.
     this.unwatchBatch.add(id);
     if (!this.unwatchFlushTimer) {
       this.unwatchFlushTimer = setTimeout(() => {
@@ -47,40 +56,39 @@ export class ClientReflection {
         this.unwatchBatch.clear();
         this.unwatchFlushTimer = null;
         if (ids.length > 0) {
-          this.rpc.notify('@U', ids);
+          this.rpc.notify(UNWATCH_SIGNALS_METHOD, ids);
         }
       }, 1);
     }
   }
 
-  getOrCreateSignal(id: number, initialValue: any): Signal<any> {
-    if (!this.signals.has(id)) {
-      let unwatchTimeout: ReturnType<typeof setTimeout> | null = null;
+  getOrCreateSignal(id: number | string, initialValue: any): Signal<any> {
+    const existingSignal = this.signals.get(id);
+    if (existingSignal) return existingSignal;
 
-      const sig = signal(initialValue, {
-        watched: () => {
-          // Cancel pending unwatch if re-subscribing
-          if (unwatchTimeout) {
-            clearTimeout(unwatchTimeout);
-            unwatchTimeout = null;
-          } else {
-            // First subscriber - tell server to send updates (batched)
-            this.scheduleWatch(id);
-          }
-        },
-        unwatched: () => {
-          // Debounce unwatch to prevent rapid unsub/resub loops
-          unwatchTimeout = setTimeout(() => {
-            this.scheduleUnwatch(id);
-            unwatchTimeout = null;
-          }, 10);
-        },
-      });
+    let unwatchTimeout: ReturnType<typeof setTimeout> | null = null;
 
-      this.signals.set(id, sig);
-    }
+    const createdSignal = signal(initialValue, {
+      watched: () => {
+        if (unwatchTimeout) {
+          clearTimeout(unwatchTimeout);
+          unwatchTimeout = null;
+        } else {
+          // Only tell the server once the client actually observes this signal.
+          this.scheduleWatch(id);
+        }
+      },
+      unwatched: () => {
+        // Debounce unwatch so transient unmount/remount cycles stay subscribed.
+        unwatchTimeout = setTimeout(() => {
+          this.scheduleUnwatch(id);
+          unwatchTimeout = null;
+        }, 10);
+      },
+    });
 
-    return this.signals.get(id)!;
+    this.signals.set(id, createdSignal);
+    return createdSignal;
   }
 
   createModelFacade(serialized: any): any {
@@ -89,13 +97,12 @@ export class ClientReflection {
       throw new Error('Model missing @M field');
     }
 
-    // Always return the same facade for a given model identity.
-    // Signals inside are shared references (via getOrCreateSignal),
-    // so the data stays in sync automatically.
-    const cached = this.modelCache.get(raw);
-    if (cached) return cached;
+    const existing = this.models.get(raw);
+    if (existing) {
+      return existing;
+    }
 
-    // Combined @M field: "TypeName#wireId"
+    // Models are branded as TypeName#wireId so the facade knows both pieces.
     const hashIdx = raw.lastIndexOf('#');
     const typeName = hashIdx !== -1 ? raw.slice(0, hashIdx) : raw;
     const wireId = hashIdx !== -1 ? raw.slice(hashIdx + 1) : undefined;
@@ -105,13 +112,12 @@ export class ClientReflection {
       throw new Error(`Unknown model type: ${typeName}`);
     }
 
-    serialized['@wireId'] = wireId;
-    const facade = new ModelCtor(this.ctx, serialized);
-    this.modelCache.set(raw, facade);
-    return facade;
+    const model = new ModelCtor(this.ctx, {...serialized, '@wireId': wireId});
+    this.models.set(raw, model);
+    return model;
   }
 
-  handleUpdate(id: number, value: any, mode?: string) {
+  handleUpdate(id: number | string, value: any, mode?: string) {
     const sig = this.signals.get(id);
     if (!sig) return;
 
@@ -124,6 +130,7 @@ export class ClientReflection {
 
     switch (mode) {
       case 'append':
+        // Streaming text and immutable array pushes both land here.
         if (Array.isArray(current)) {
           sig.value = [...current, ...value];
         } else if (typeof current === 'string') {
@@ -138,11 +145,12 @@ export class ClientReflection {
         break;
 
       case 'splice':
+        // Reserved for richer array diffs; keep client support even if rare today.
         if (Array.isArray(current)) {
           const {start, deleteCount, items} = value;
-          const newArray = [...current];
-          newArray.splice(start, deleteCount, ...items);
-          sig.value = newArray;
+          const nextArray = [...current];
+          nextArray.splice(start, deleteCount, ...items);
+          sig.value = nextArray;
         }
         break;
 

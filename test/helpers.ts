@@ -1,31 +1,57 @@
 import {signal} from '@preact/signals-core';
 import {createReflectedModel} from '../client/model.ts';
 import {createModel} from '../server/model.ts';
-import type {Transport} from '../server/rpc.ts';
+import type {Transport} from '../shared/protocol.ts';
 
-export function createTransportPair(): {server: Transport; client: Transport} {
-  let serverCb: ((data: {toString(): string}) => void) | null = null;
-  let clientCb: ((data: {toString(): string}) => void) | null = null;
+export {createMemoryTransportPair} from '../server/memory-transport.ts';
 
-  const server: Transport = {
-    send(data: string) {
-      clientCb?.({toString: () => data});
-    },
-    onMessage(cb) {
-      serverCb = cb;
-    },
+type MessageHandler = (data: {toString(): string}) => void | Promise<void>;
+
+/**
+ * Creates a linked transport pair with an explicit message queue.
+ * Messages are enqueued synchronously but delivered only when flush() is called,
+ * giving tests full control over message ordering and timing.
+ */
+export function createLinkedTransportPair(): {
+  serverTransport: Transport;
+  clientTransport: Transport;
+  flush: () => Promise<void>;
+} {
+  const queue: Array<() => Promise<void>> = [];
+  const handlers: Record<string, MessageHandler | undefined> = {};
+
+  const enqueue = (key: string, data: string) => {
+    queue.push(async () => {
+      await handlers[key]?.({toString: () => data});
+    });
   };
 
-  const client: Transport = {
-    send(data: string) {
-      serverCb?.({toString: () => data});
+  return {
+    serverTransport: {
+      send(data: string) {
+        enqueue('client', data);
+      },
+      onMessage(cb) {
+        handlers.server = cb;
+      },
     },
-    onMessage(cb) {
-      clientCb = cb;
+    clientTransport: {
+      send(data: string) {
+        enqueue('server', data);
+      },
+      onMessage(cb) {
+        handlers.client = cb;
+      },
+    },
+    async flush() {
+      while (queue.length > 0) {
+        const pending = queue.splice(0);
+        for (const deliver of pending) {
+          await deliver();
+        }
+      }
     },
   };
-
-  return {server, client};
 }
 
 export const Counter = createModel<{
@@ -33,7 +59,6 @@ export const Counter = createModel<{
   name: ReturnType<typeof signal<string>>;
   items: ReturnType<typeof signal<string[]>>;
   meta: ReturnType<typeof signal<Record<string, any>>>;
-  _internal: string;
   increment(): void;
   add(item: string): void;
   rename(name: string): void;

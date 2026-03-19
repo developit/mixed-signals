@@ -1,349 +1,677 @@
-import assert from 'node:assert/strict';
-import {beforeEach, describe, it} from 'node:test';
-import {effect, signal} from '@preact/signals-core';
+import {type Signal, signal} from '@preact/signals-core';
+import {afterEach, describe, expect, it, vi} from 'vitest';
+import {createReflectedModel} from '../client/model.ts';
+import type {WireContext} from '../client/reflection.ts';
 import {RPCClient} from '../client/rpc.ts';
+
 import {RPC} from '../server/rpc.ts';
 import {
   Counter,
-  createTransportPair,
-  flush,
+  createLinkedTransportPair,
   ReflectedCounter,
 } from './helpers.ts';
 
 function connect(rpc: RPC, clientId?: string) {
-  const {server, client: clientTransport} = createTransportPair();
+  const {serverTransport, clientTransport, flush} = createLinkedTransportPair();
   const ctx = {rpc: null as any};
   const rpcClient = new RPCClient(clientTransport, ctx);
   ctx.rpc = rpcClient;
   rpcClient.reflection.registerModel('Counter', ReflectedCounter);
-  const cleanup = rpc.addClient(server, clientId);
-  return {rpcClient, cleanup};
+  const cleanup = rpc.addClient(serverTransport, clientId);
+  return {rpcClient, cleanup, flush};
 }
 
+class Project {
+  id: Signal<string>;
+  name: Signal<string>;
+
+  constructor(id: string, name: string) {
+    this.id = signal(id);
+    this.name = signal(name);
+  }
+
+  rename(next: string) {
+    this.name.value = next;
+    return {ok: true};
+  }
+}
+
+interface ProjectApi {
+  id: Signal<string>;
+  name: Signal<string>;
+  rename(next: string): Promise<unknown>;
+}
+
+class TranscriptMessageItem {
+  id: Signal<string>;
+  role: Signal<'assistant'>;
+  content: Signal<string>;
+  status: Signal<string>;
+
+  constructor(id: string, content: string) {
+    this.id = signal(id);
+    this.role = signal('assistant');
+    this.content = signal(content);
+    this.status = signal('streaming');
+  }
+}
+
+class TranscriptToolCallItem {
+  id: Signal<string>;
+  toolCallId: Signal<string>;
+  name: Signal<string>;
+  args: Signal<string>;
+  details: Signal<unknown | undefined>;
+  output: Signal<string>;
+  status: Signal<string>;
+
+  constructor(id: string, toolCallId: string, name: string) {
+    this.id = signal(id);
+    this.toolCallId = signal(toolCallId);
+    this.name = signal(name);
+    this.args = signal('');
+    this.details = signal(undefined);
+    this.output = signal('');
+    this.status = signal('pending');
+  }
+}
+
+type TranscriptItem = TranscriptMessageItem | TranscriptToolCallItem;
+
+class TranscriptSession {
+  items = signal<TranscriptItem[]>([
+    new TranscriptMessageItem('message-1', 'Hello'),
+  ]);
+  status = signal('running');
+  _abort = 'hidden';
+
+  finish() {
+    const [message] = this.items.value;
+    if (message instanceof TranscriptMessageItem) {
+      message.content.value = 'Done';
+      message.status.value = 'complete';
+    }
+    this.status.value = 'completed';
+    return {ok: true};
+  }
+}
+
+interface TranscriptMessageItemApi {
+  id: Signal<string>;
+  role: Signal<string>;
+  content: Signal<string>;
+  status: Signal<string>;
+}
+
+interface TranscriptToolCallItemApi {
+  id: Signal<string>;
+  toolCallId: Signal<string>;
+  name: Signal<string>;
+  args: Signal<string>;
+  details: Signal<unknown | undefined>;
+  output: Signal<string>;
+  status: Signal<string>;
+}
+
+interface TranscriptSessionApi {
+  id: Signal<string>;
+  items: Signal<TranscriptItem[]>;
+  status: Signal<string>;
+  finish(): Promise<unknown>;
+}
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
 describe('Integration: Server <-> Client', () => {
-  let rpc: RPC;
-  let root: InstanceType<typeof Counter>;
-
-  beforeEach(() => {
-    rpc = new RPC();
+  it('client receives root model on connect', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
     rpc.registerModel('Counter', Counter);
-    root = new Counter();
+    const root = new Counter();
     rpc.expose(root);
+
+    const {rpcClient, flush} = connect(rpc, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    expect(rpcClient.root).toBeDefined();
+    expect(rpcClient.root.id.peek()).toBe('0');
   });
 
-  describe('initial connection', () => {
-    it('client receives root model on connect', async () => {
-      const {rpcClient} = connect(rpc, 'c1');
-      await rpcClient.ready;
+  it('client root has correct signal values', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    root.count.value = 5;
+    root.name.value = 'hello';
+    rpc.expose(root);
 
-      assert.ok(rpcClient.root);
-      assert.equal(rpcClient.root.id.peek(), '0');
-    });
+    const {rpcClient, flush} = connect(rpc, 'c1');
+    await flush();
+    await rpcClient.ready;
 
-    it('client root has correct signal values', async () => {
-      root.count.value = 5;
-      root.name.value = 'hello';
-
-      const {rpcClient} = connect(rpc, 'c1');
-      await rpcClient.ready;
-
-      assert.equal(rpcClient.root.count.peek(), 5);
-      assert.equal(rpcClient.root.name.peek(), 'hello');
-    });
-
-    it('client root has callable methods', async () => {
-      const {rpcClient} = connect(rpc, 'c1');
-      await rpcClient.ready;
-
-      assert.equal(typeof rpcClient.root.increment, 'function');
-      assert.equal(typeof rpcClient.root.add, 'function');
-      assert.equal(typeof rpcClient.root.rename, 'function');
-    });
+    expect(rpcClient.root.count.peek()).toBe(5);
+    expect(rpcClient.root.name.peek()).toBe('hello');
   });
 
-  describe('method calls', () => {
-    it('calling root method executes on server', async () => {
-      const {rpcClient} = connect(rpc, 'c1');
-      await rpcClient.ready;
+  it('client root has callable methods', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    rpc.expose(root);
 
-      await rpcClient.root.increment();
-      assert.equal(root.count.peek(), 1);
+    const {rpcClient, flush} = connect(rpc, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    expect(typeof rpcClient.root.increment).toBe('function');
+    expect(typeof rpcClient.root.add).toBe('function');
+    expect(typeof rpcClient.root.rename).toBe('function');
+  });
+
+  it('calling root method executes on server', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    rpc.expose(root);
+
+    const {rpcClient, flush} = connect(rpc, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    const promise = rpcClient.root.increment();
+    await flush();
+    await promise;
+
+    expect(root.count.peek()).toBe(1);
+  });
+
+  it('calling method with parameters', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    rpc.expose(root);
+
+    const {rpcClient, flush} = connect(rpc, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    const promise = rpcClient.root.rename('new-name');
+    await flush();
+    await promise;
+
+    expect(root.name.peek()).toBe('new-name');
+  });
+
+  it('method error propagates to client', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC({
+      fail() {
+        throw new Error('server error');
+      },
     });
 
-    it('calling method with parameters', async () => {
-      const {rpcClient} = connect(rpc, 'c1');
-      await rpcClient.ready;
+    const {serverTransport, clientTransport, flush} =
+      createLinkedTransportPair();
+    const ctx = {rpc: null as any};
+    const rpcClient = new RPCClient(clientTransport, ctx);
+    ctx.rpc = rpcClient;
+    rpc.addClient(serverTransport, 'c1');
 
-      await rpcClient.root.rename('new-name');
-      assert.equal(root.name.peek(), 'new-name');
+    await flush();
+    await rpcClient.ready;
+
+    const promise = rpcClient.call('fail');
+    await flush();
+    await expect(promise).rejects.toThrow('server error');
+  });
+
+  it('client receives update after watch + server mutation', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    rpc.expose(root);
+
+    const {rpcClient, flush} = connect(rpc, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    rpcClient.root.count.subscribe(() => undefined);
+    vi.advanceTimersByTime(1);
+    await flush();
+
+    root.count.value = 42;
+    await flush();
+
+    expect(rpcClient.root.count.peek()).toBe(42);
+  });
+
+  it('array append delta works end-to-end', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    root.items.value = ['a', 'b'];
+    rpc.expose(root);
+
+    const {rpcClient, flush} = connect(rpc, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    rpcClient.root.items.subscribe(() => undefined);
+    vi.advanceTimersByTime(1);
+    await flush();
+
+    root.items.value = ['a', 'b', 'c'];
+    await flush();
+
+    expect(rpcClient.root.items.peek()).toEqual(['a', 'b', 'c']);
+  });
+
+  it('string append delta works end-to-end', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    root.name.value = 'hello';
+    rpc.expose(root);
+
+    const {rpcClient, flush} = connect(rpc, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    rpcClient.root.name.subscribe(() => undefined);
+    vi.advanceTimersByTime(1);
+    await flush();
+
+    root.name.value = 'hello world';
+    await flush();
+
+    expect(rpcClient.root.name.peek()).toBe('hello world');
+  });
+
+  it('object merge delta works end-to-end', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    root.meta.value = {version: 1, status: 'ok'};
+    rpc.expose(root);
+
+    const {rpcClient, flush} = connect(rpc, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    rpcClient.root.meta.subscribe(() => undefined);
+    vi.advanceTimersByTime(1);
+    await flush();
+
+    root.meta.value = {version: 1, status: 'updated'};
+    await flush();
+
+    expect(rpcClient.root.meta.peek()).toEqual({version: 1, status: 'updated'});
+  });
+
+  it('full replacement when delta does not apply', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    root.name.value = 'abc';
+    rpc.expose(root);
+
+    const {rpcClient, flush} = connect(rpc, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    rpcClient.root.name.subscribe(() => undefined);
+    vi.advanceTimersByTime(1);
+    await flush();
+
+    root.name.value = 'xyz';
+    await flush();
+
+    expect(rpcClient.root.name.peek()).toBe('xyz');
+  });
+
+  it('server returns model from method -> client gets facade', async () => {
+    vi.useFakeTimers();
+    const child = new Counter();
+    child.count.value = 99;
+
+    const rpc = new RPC({
+      getChild() {
+        return child;
+      },
     });
+    rpc.registerModel('Counter', Counter);
+    rpc.instances.register('child-1', child);
 
-    it('method error propagates to client', async () => {
-      const rootObj = {
-        fail() {
-          throw new Error('server error');
+    const {rpcClient, flush} = connect(rpc, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    const promise = rpcClient.call('getChild');
+    await flush();
+    const result = await promise;
+
+    expect(result.id.peek()).toBe('child-1');
+  });
+
+  it('two clients get independent root serializations', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    rpc.expose(root);
+
+    const a = connect(rpc, 'a');
+    const b = connect(rpc, 'b');
+
+    await a.flush();
+    await a.rpcClient.ready;
+    await b.flush();
+    await b.rpcClient.ready;
+
+    expect(a.rpcClient.root).toBeDefined();
+    expect(b.rpcClient.root).toBeDefined();
+    expect(a.rpcClient.root).not.toBe(b.rpcClient.root);
+  });
+
+  it('signal update sent to both subscribed clients', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    rpc.expose(root);
+
+    const a = connect(rpc, 'a');
+    const b = connect(rpc, 'b');
+
+    await a.flush();
+    await a.rpcClient.ready;
+    await b.flush();
+    await b.rpcClient.ready;
+
+    a.rpcClient.root.count.subscribe(() => undefined);
+    b.rpcClient.root.count.subscribe(() => undefined);
+    vi.advanceTimersByTime(1);
+    await a.flush();
+    await b.flush();
+
+    root.count.value = 77;
+    await a.flush();
+    await b.flush();
+
+    expect(a.rpcClient.root.count.peek()).toBe(77);
+    expect(b.rpcClient.root.count.peek()).toBe(77);
+  });
+
+  it('client disconnect cleans up subscriptions', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    rpc.expose(root);
+
+    const a = connect(rpc, 'a');
+    const b = connect(rpc, 'b');
+
+    await a.flush();
+    await a.rpcClient.ready;
+    await b.flush();
+    await b.rpcClient.ready;
+
+    const stopA = a.rpcClient.root.count.subscribe(() => undefined);
+    b.rpcClient.root.count.subscribe(() => undefined);
+    vi.advanceTimersByTime(1);
+    await a.flush();
+    await b.flush();
+
+    stopA();
+    a.cleanup();
+
+    root.count.value = 50;
+    await b.flush();
+
+    expect(b.rpcClient.root.count.peek()).toBe(50);
+  });
+
+  it('cleanup function stops client from receiving messages', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    rpc.expose(root);
+
+    const {rpcClient, cleanup, flush} = connect(rpc, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    rpcClient.root.count.subscribe(() => undefined);
+    vi.advanceTimersByTime(1);
+    await flush();
+
+    root.count.value = 10;
+    await flush();
+
+    expect(rpcClient.root.count.peek()).toBe(10);
+
+    cleanup();
+
+    root.count.value = 999;
+    await flush();
+
+    expect(rpcClient.root.count.peek()).toBe(10);
+  });
+
+  it('rpc.call from client still works with method routing', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    rpc.expose(root);
+
+    const {rpcClient, flush} = connect(rpc, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    const p1 = rpcClient.call('increment');
+    await flush();
+    await p1;
+
+    const p2 = rpcClient.call('increment');
+    await flush();
+    await p2;
+
+    expect(root.count.peek()).toBe(2);
+  });
+});
+
+describe('mixed-signals roundtrip', () => {
+  it('round-trips roots, shared signals, model facades, and live updates', async () => {
+    vi.useFakeTimers();
+
+    const title = signal('Hello');
+    const project = new Project('42', 'Initial');
+    const rpc = new RPC({title, alias: title, project});
+    const {serverTransport, clientTransport, flush} =
+      createLinkedTransportPair();
+    const ProjectModel = createReflectedModel<ProjectApi>(
+      ['id', 'name'],
+      ['rename'],
+    );
+    let client!: RPCClient;
+
+    rpc.registerModel('Project', Project);
+
+    const ctx: WireContext = {
+      rpc: {
+        call(method: string, params?: unknown[]) {
+          return client.call(method, params);
         },
-      };
-      const rpc2 = new RPC();
-      rpc2.expose(rootObj);
+      },
+    };
 
-      const {server, client: clientTransport} = createTransportPair();
-      const ctx = {rpc: null as any};
-      const rpcClient = new RPCClient(clientTransport, ctx);
-      ctx.rpc = rpcClient;
-      rpc2.addClient(server, 'c1');
-      await rpcClient.ready;
+    client = new RPCClient(clientTransport, ctx);
+    client.reflection.registerModel('Project', ProjectModel);
 
-      await assert.rejects(rpcClient.call('fail'), {
-        message: 'server error',
-      });
-    });
+    rpc.addClient(serverTransport, 'client-1');
+    await flush();
+    await client.ready;
+
+    expect(client.root.title.value).toBe('Hello');
+    expect(client.root.title).toBe(client.root.alias);
+    expect(client.root.project.id.value).toBe('42');
+    expect(client.root.project.name.value).toBe('Initial');
+    expect(typeof client.root.project.rename).toBe('function');
+
+    const stopTitle = client.root.title.subscribe(() => undefined);
+    const stopProjectName = client.root.project.name.subscribe(() => undefined);
+
+    vi.advanceTimersByTime(1);
+    await flush();
+
+    title.value = 'World';
+    await flush();
+
+    expect(client.root.title.value).toBe('World');
+    expect(client.root.alias.value).toBe('World');
+
+    const rename = client.root.project.rename('Renamed');
+
+    await flush();
+    await expect(rename).resolves.toEqual({ok: true});
+    expect(client.root.project.name.value).toBe('Renamed');
+
+    project.name.value = 'Again';
+    await flush();
+
+    expect(client.root.project.name.value).toBe('Again');
+
+    stopTitle();
+    stopProjectName();
   });
 
-  describe('signal synchronization', () => {
-    it('client receives update after watch + server mutation', async () => {
-      const {rpcClient} = connect(rpc, 'c1');
-      await rpcClient.ready;
+  it('round-trips reflected models with nested signal-backed timeline items', async () => {
+    vi.useFakeTimers();
 
-      // Subscribe to count signal (triggers watch)
-      let observedCount: number | undefined;
-      const dispose = effect(() => {
-        observedCount = rpcClient.root.count.value;
-      });
+    const session = new TranscriptSession();
+    const rpc = new RPC({session});
+    const {serverTransport, clientTransport, flush} =
+      createLinkedTransportPair();
+    const SessionModel = createReflectedModel<TranscriptSessionApi>(
+      ['items', 'status'],
+      ['finish'],
+    );
+    const TranscriptMessageModel =
+      createReflectedModel<TranscriptMessageItemApi>(
+        ['id', 'role', 'content', 'status'],
+        [],
+      );
+    const TranscriptToolCallModel =
+      createReflectedModel<TranscriptToolCallItemApi>(
+        ['id', 'toolCallId', 'name', 'args', 'details', 'output', 'status'],
+        [],
+      );
+    let client!: RPCClient;
 
-      await flush(); // let watch batch fire
+    rpc.registerModel('TranscriptSession', TranscriptSession);
+    rpc.registerModel('TranscriptMessageItem', TranscriptMessageItem);
+    rpc.registerModel('TranscriptToolCallItem', TranscriptToolCallItem);
 
-      // Mutate on server
-      root.count.value = 42;
-
-      assert.equal(observedCount, 42);
-      dispose();
-    });
-
-    it('array append delta works end-to-end', async () => {
-      root.items.value = ['a', 'b'];
-
-      const {rpcClient} = connect(rpc, 'c1');
-      await rpcClient.ready;
-
-      let observedItems: string[] | undefined;
-      const dispose = effect(() => {
-        observedItems = rpcClient.root.items.value;
-      });
-
-      await flush();
-
-      // Append on server
-      root.items.value = ['a', 'b', 'c'];
-
-      assert.deepEqual(observedItems, ['a', 'b', 'c']);
-      dispose();
-    });
-
-    it('string append delta works end-to-end', async () => {
-      root.name.value = 'hello';
-
-      const {rpcClient} = connect(rpc, 'c1');
-      await rpcClient.ready;
-
-      let observedName: string | undefined;
-      const dispose = effect(() => {
-        observedName = rpcClient.root.name.value;
-      });
-
-      await flush();
-
-      root.name.value = 'hello world';
-
-      assert.equal(observedName, 'hello world');
-      dispose();
-    });
-
-    it('object merge delta works end-to-end', async () => {
-      root.meta.value = {version: 1, status: 'ok'};
-
-      const {rpcClient} = connect(rpc, 'c1');
-      await rpcClient.ready;
-
-      let observedMeta: any;
-      const dispose = effect(() => {
-        observedMeta = rpcClient.root.meta.value;
-      });
-
-      await flush();
-
-      root.meta.value = {version: 1, status: 'updated'};
-
-      assert.deepEqual(observedMeta, {version: 1, status: 'updated'});
-      dispose();
-    });
-
-    it('full replacement when delta does not apply', async () => {
-      root.name.value = 'abc';
-
-      const {rpcClient} = connect(rpc, 'c1');
-      await rpcClient.ready;
-
-      let observedName: string | undefined;
-      const dispose = effect(() => {
-        observedName = rpcClient.root.name.value;
-      });
-
-      await flush();
-
-      root.name.value = 'xyz'; // completely different, no append
-
-      assert.equal(observedName, 'xyz');
-      dispose();
-    });
-
-    it('multiple rapid updates all arrive', async () => {
-      const {rpcClient} = connect(rpc, 'c1');
-      await rpcClient.ready;
-
-      let latest: number | undefined;
-      const dispose = effect(() => {
-        latest = rpcClient.root.count.value;
-      });
-
-      await flush();
-
-      root.count.value = 1;
-      root.count.value = 2;
-      root.count.value = 3;
-
-      assert.equal(latest, 3);
-      dispose();
-    });
-  });
-
-  describe('model references', () => {
-    it('server returns model from method -> client gets facade', async () => {
-      // Add a method that returns a child model
-      const child = new Counter();
-      (child as any).id = signal('child-1');
-      child.name.value = 'child';
-      rpc.instances.register('child-1', child);
-
-      const rootObj = {
-        getChild() {
-          return child;
+    const ctx: WireContext = {
+      rpc: {
+        call(method: string, params?: unknown[]) {
+          return client.call(method, params);
         },
-      };
-      const rpc2 = new RPC();
-      rpc2.registerModel('Counter', Counter);
-      rpc2.expose(rootObj);
-      rpc2.instances.register('child-1', child);
+      },
+    };
 
-      const {rpcClient} = connect(rpc2, 'c1');
-      await rpcClient.ready;
+    client = new RPCClient(clientTransport, ctx);
+    client.reflection.registerModel('TranscriptSession', SessionModel);
+    client.reflection.registerModel(
+      'TranscriptMessageItem',
+      TranscriptMessageModel,
+    );
+    client.reflection.registerModel(
+      'TranscriptToolCallItem',
+      TranscriptToolCallModel,
+    );
 
-      const result = await rpcClient.call('getChild');
-      assert.ok(result);
-      assert.equal(result.id.peek(), 'child-1');
-    });
-  });
+    rpc.addClient(serverTransport, 'client-1');
+    await flush();
+    await client.ready;
 
-  describe('multiple clients', () => {
-    it('two clients get independent root serializations', async () => {
-      const {rpcClient: clientA} = connect(rpc, 'a');
-      const {rpcClient: clientB} = connect(rpc, 'b');
-      await Promise.all([clientA.ready, clientB.ready]);
+    expect(client.root.session.status.value).toBe('running');
+    expect(client.root.session.items.value[0].content.value).toBe('Hello');
+    expect(client.root.session).not.toHaveProperty('_abort');
 
-      assert.ok(clientA.root);
-      assert.ok(clientB.root);
-      assert.notEqual(clientA.root, clientB.root); // different facade instances
-    });
+    const stopItems = client.root.session.items.subscribe(() => undefined);
+    const stopStatus = client.root.session.status.subscribe(() => undefined);
+    const firstServerItem = session.items.value[0];
+    if (!(firstServerItem instanceof TranscriptMessageItem)) {
+      throw new Error('Expected the first server item to be a message');
+    }
+    const stopContent = client.root.session.items.value[0].content.subscribe(
+      () => undefined,
+    );
+    const stopMessageStatus =
+      client.root.session.items.value[0].status.subscribe(() => undefined);
+    vi.advanceTimersByTime(1);
+    await flush();
 
-    it('signal update sent to both subscribed clients', async () => {
-      const {rpcClient: clientA} = connect(rpc, 'a');
-      const {rpcClient: clientB} = connect(rpc, 'b');
-      await Promise.all([clientA.ready, clientB.ready]);
+    firstServerItem.content.value = 'Hello world';
+    await flush();
+    expect(client.root.session.items.value[0].content.value).toBe(
+      'Hello world',
+    );
 
-      let countA: number | undefined;
-      let countB: number | undefined;
+    const toolCall = new TranscriptToolCallItem(
+      'tool-1',
+      'tool-call-1',
+      'read',
+    );
+    toolCall.args.value = '{"path":"index.ts"}';
+    toolCall.output.value = 'Reading...';
+    toolCall.status.value = 'streaming';
+    session.items.value = [...session.items.value, toolCall];
+    await flush();
 
-      const disposeA = effect(() => {
-        countA = clientA.root.count.value;
-      });
-      const disposeB = effect(() => {
-        countB = clientB.root.count.value;
-      });
+    expect(client.root.session.items.value[1].name.value).toBe('read');
+    expect(client.root.session.items.value[1].output.value).toBe('Reading...');
 
-      await flush();
+    toolCall.output.value = 'file contents';
+    toolCall.status.value = 'complete';
+    await flush();
 
-      root.count.value = 77;
+    expect(client.root.session.items.value[1].output.value).toBe(
+      'file contents',
+    );
+    expect(client.root.session.items.value[1].status.value).toBe('complete');
 
-      assert.equal(countA, 77);
-      assert.equal(countB, 77);
+    const finish = client.root.session.finish();
+    await flush();
+    await expect(finish).resolves.toEqual({ok: true});
 
-      disposeA();
-      disposeB();
-    });
+    const firstItem = client.root.session.items.value[0];
+    if (!('role' in firstItem)) {
+      throw new Error('Expected the first session item to be a message');
+    }
+    expect(firstItem.content.value).toBe('Done');
+    expect(firstItem.status.value).toBe('complete');
+    expect(client.root.session.status.value).toBe('completed');
 
-    it('client disconnect cleans up subscriptions', async () => {
-      const {rpcClient: clientA, cleanup: cleanupA} = connect(rpc, 'a');
-      const {rpcClient: clientB} = connect(rpc, 'b');
-      await Promise.all([clientA.ready, clientB.ready]);
-
-      let _countA: number | undefined;
-      let countB: number | undefined;
-
-      const disposeA = effect(() => {
-        _countA = clientA.root.count.value;
-      });
-      const disposeB = effect(() => {
-        countB = clientB.root.count.value;
-      });
-
-      await flush();
-
-      // Disconnect client A
-      disposeA();
-      cleanupA();
-
-      // Update should still reach client B
-      root.count.value = 50;
-      assert.equal(countB, 50);
-
-      disposeB();
-    });
-  });
-
-  describe('lifecycle', () => {
-    it('cleanup function stops client from receiving messages', async () => {
-      const {rpcClient, cleanup} = connect(rpc, 'c1');
-      await rpcClient.ready;
-
-      let count: number | undefined;
-      const dispose = effect(() => {
-        count = rpcClient.root.count.value;
-      });
-
-      await flush();
-      root.count.value = 10;
-      assert.equal(count, 10);
-
-      dispose();
-      cleanup();
-
-      // After cleanup, server mutations should not reach this client
-      // (no transport to deliver to)
-      root.count.value = 999;
-      // count stays at 10 since the effect was disposed
-      assert.equal(count, 10);
-    });
-
-    it('rpc.call from client still works with method routing', async () => {
-      const {rpcClient} = connect(rpc, 'c1');
-      await rpcClient.ready;
-
-      // Direct call without going through model
-      await rpcClient.call('increment');
-      assert.equal(root.count.peek(), 1);
-
-      await rpcClient.call('increment');
-      assert.equal(root.count.peek(), 2);
-    });
+    stopContent?.();
+    stopMessageStatus();
+    stopItems();
+    stopStatus();
   });
 });

@@ -1,30 +1,14 @@
-import assert from 'node:assert/strict';
-import {describe, it} from 'node:test';
 import {type Signal, signal} from '@preact/signals-core';
+import {describe, expect, it, vi} from 'vitest';
 import {createReflectedModel} from '../../client/model.ts';
+import type {WireContext} from '../../client/reflection.ts';
 
 describe('createReflectedModel', () => {
-  function createCtx() {
-    const calls: {method: string; params: any[]}[] = [];
-    return {
-      rpc: {
-        async call(method: string, params?: any[]) {
-          calls.push({method, params: params || []});
-          return `result:${method}`;
-        },
-      },
-      calls,
-    };
-  }
-
   it('exposes id signal with wireId value', () => {
-    const Model = createReflectedModel<{
-      id: Signal<string>;
-    }>([], []);
-    const {rpc} = createCtx();
-
-    const instance = new Model({rpc}, {'@wireId': 'abc-123'});
-    assert.equal(instance.id.peek(), 'abc-123');
+    const Model = createReflectedModel<{id: Signal<string>}>([], []);
+    const ctx: WireContext = {rpc: {call: vi.fn(async () => undefined)}};
+    const instance = new Model(ctx, {'@wireId': 'abc-123'});
+    expect(instance.id.peek()).toBe('abc-123');
   });
 
   it('creates computed signal properties from server signals', () => {
@@ -33,17 +17,16 @@ describe('createReflectedModel', () => {
       count: Signal<number>;
       name: Signal<string>;
     }>(['count', 'name'], []);
-    const {rpc} = createCtx();
 
-    const countSig = signal(42);
-    const nameSig = signal('test');
+    const ctx: WireContext = {rpc: {call: vi.fn(async () => undefined)}};
+    const instance = new Model(ctx, {
+      '@wireId': 'w1',
+      count: signal(42),
+      name: signal('test'),
+    });
 
-    const instance = new Model(
-      {rpc},
-      {'@wireId': '1', count: countSig, name: nameSig},
-    );
-    assert.equal(instance.count.peek(), 42);
-    assert.equal(instance.name.peek(), 'test');
+    expect(instance.count.peek()).toBe(42);
+    expect(instance.name.peek()).toBe('test');
   });
 
   it('computed props update when source signals change', () => {
@@ -51,58 +34,112 @@ describe('createReflectedModel', () => {
       id: Signal<string>;
       count: Signal<number>;
     }>(['count'], []);
-    const {rpc} = createCtx();
 
-    const countSig = signal(0);
-    const instance = new Model({rpc}, {'@wireId': '1', count: countSig});
+    const ctx: WireContext = {rpc: {call: vi.fn(async () => undefined)}};
+    const source = signal(0);
+    const instance = new Model(ctx, {'@wireId': 'w1', count: source});
 
-    assert.equal(instance.count.peek(), 0);
-    countSig.value = 99;
-    assert.equal(instance.count.peek(), 99);
+    expect(instance.count.peek()).toBe(0);
+    source.value = 99;
+    expect(instance.count.peek()).toBe(99);
   });
 
   it('creates method proxies that call rpc.call with wireId#method', async () => {
     const Model = createReflectedModel<{
       id: Signal<string>;
-      increment(): Promise<any>;
-      rename(name: string): Promise<any>;
+      increment(): Promise<void>;
+      rename(name: string): Promise<void>;
     }>([], ['increment', 'rename']);
-    const ctx = createCtx();
 
-    const instance = new Model({rpc: ctx.rpc}, {'@wireId': 'w7'});
+    const call = vi.fn(async () => undefined);
+    const ctx: WireContext = {rpc: {call}};
+    const instance = new Model(ctx, {'@wireId': 'w7'});
 
     await instance.increment();
-    assert.equal(ctx.calls.length, 1);
-    assert.equal(ctx.calls[0].method, 'w7#increment');
-    assert.deepEqual(ctx.calls[0].params, []);
+    expect(call).toHaveBeenCalledWith('w7#increment', []);
 
     await instance.rename('new-name');
-    assert.equal(ctx.calls.length, 2);
-    assert.equal(ctx.calls[1].method, 'w7#rename');
-    assert.deepEqual(ctx.calls[1].params, ['new-name']);
+    expect(call).toHaveBeenCalledWith('w7#rename', ['new-name']);
   });
 
   it('method proxies return rpc call result', async () => {
     const Model = createReflectedModel<{
       id: Signal<string>;
-      getData(): Promise<any>;
+      getData(): Promise<string>;
     }>([], ['getData']);
-    const ctx = createCtx();
 
-    const instance = new Model({rpc: ctx.rpc}, {'@wireId': 'w1'});
+    const call = vi.fn(async () => 'result:w1#getData');
+    const ctx: WireContext = {rpc: {call}};
+    const instance = new Model(ctx, {'@wireId': 'w1'});
+
     const result = await instance.getData();
-    assert.equal(result, 'result:w1#getData');
+    expect(result).toBe('result:w1#getData');
   });
 
   it('skips signal props not present in data', () => {
     const Model = createReflectedModel<{
       id: Signal<string>;
-      missing: Signal<any>;
+      missing: Signal<unknown>;
     }>(['missing'], []);
-    const {rpc} = createCtx();
 
-    const instance = new Model({rpc}, {'@wireId': '1'});
-    // missing prop should not exist since data didn't have it
-    assert.equal(instance.missing, undefined);
+    const ctx: WireContext = {rpc: {call: vi.fn(async () => undefined)}};
+    const instance = new Model(ctx, {'@wireId': 'w1'});
+
+    // Missing signal props get a holder computed that returns undefined
+    expect(instance.missing.value).toBeUndefined();
+  });
+
+  it('uses path-based routes and hydrates deferred signal props from results', async () => {
+    const TodosModel = createReflectedModel<{
+      id: Signal<string>;
+      items: Signal<unknown>;
+      list(): Promise<unknown>;
+    }>(['items'], ['list'], 'todos');
+
+    const itemsSignal = signal(['item-a']);
+    const call = vi.fn(async () => ({items: itemsSignal}));
+    const ctx: WireContext = {rpc: {call}};
+    const instance = new TodosModel(ctx, {'@wireId': 't1'});
+
+    // Before calling list, items holder is empty (deferred)
+    expect(instance.items.value).toBeUndefined();
+
+    // Call list — uses path-based route "todos.list"
+    await instance.list();
+    expect(call).toHaveBeenCalledWith('todos.list', []);
+
+    // After call, the holder should be hydrated with the returned signal
+    expect(instance.items.peek()).toEqual(['item-a']);
+
+    // Source signal updates flow through
+    itemsSignal.value = ['item-a', 'item-b'];
+    expect(instance.items.peek()).toEqual(['item-a', 'item-b']);
+  });
+
+  it('uses wire-id routes for instance methods and eager signal props', async () => {
+    const TaskModel = createReflectedModel<{
+      id: Signal<string>;
+      title: Signal<string>;
+      toggle(): Promise<unknown>;
+    }>(['title'], ['toggle']);
+
+    const call = vi.fn(async () => ({done: true}));
+    const ctx: WireContext = {rpc: {call}};
+    const titleSignal = signal('Ship it');
+    const instance = new TaskModel(ctx, {
+      '@wireId': 'w42',
+      title: titleSignal,
+    });
+
+    // Eager signal prop is immediately available
+    expect(instance.title.peek()).toBe('Ship it');
+
+    // Instance method uses wireId#method route (no path)
+    await instance.toggle();
+    expect(call).toHaveBeenCalledWith('w42#toggle', []);
+
+    // Source signal updates still propagate
+    titleSignal.value = 'Shipped!';
+    expect(instance.title.peek()).toBe('Shipped!');
   });
 });

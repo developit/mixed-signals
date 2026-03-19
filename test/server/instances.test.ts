@@ -1,5 +1,4 @@
-import assert from 'node:assert/strict';
-import {describe, it} from 'node:test';
+import {describe, expect, it} from 'vitest';
 import {Instances} from '../../server/instances.ts';
 
 describe('Instances', () => {
@@ -7,39 +6,39 @@ describe('Instances', () => {
     const inst = new Instances();
     const obj = {foo: 'bar'};
     inst.register('abc', obj);
-    assert.equal(inst.get('abc'), obj);
+    expect(inst.get('abc')).toBe(obj);
   });
 
   it('getId returns id for registered object', () => {
     const inst = new Instances();
     const obj = {foo: 'bar'};
     inst.register('abc', obj);
-    assert.equal(inst.getId(obj), 'abc');
+    expect(inst.getId(obj)).toBe('abc');
   });
 
   it('getId returns undefined for non-object values', () => {
     const inst = new Instances();
-    assert.equal(inst.getId('string'), undefined);
-    assert.equal(inst.getId(42), undefined);
-    assert.equal(inst.getId(null), undefined);
-    assert.equal(inst.getId(undefined), undefined);
+    expect(inst.getId('string')).toBeUndefined();
+    expect(inst.getId(42)).toBeUndefined();
+    expect(inst.getId(null)).toBeUndefined();
+    expect(inst.getId(undefined)).toBeUndefined();
   });
 
   it('getId returns undefined for unregistered object', () => {
     const inst = new Instances();
-    assert.equal(inst.getId({unknown: true}), undefined);
+    expect(inst.getId({unknown: true})).toBeUndefined();
   });
 
   it('remove deletes from both maps', () => {
     const inst = new Instances();
     const obj = {x: 1};
     inst.register('1', obj);
-    assert.equal(inst.get('1'), obj);
-    assert.equal(inst.getId(obj), '1');
+    expect(inst.get('1')).toBe(obj);
+    expect(inst.getId(obj)).toBe('1');
 
     inst.remove('1');
-    assert.equal(inst.get('1'), undefined);
-    assert.equal(inst.getId(obj), undefined);
+    expect(inst.get('1')).toBeUndefined();
+    expect(inst.getId(obj)).toBeUndefined();
   });
 
   it('remove is a no-op for unknown id', () => {
@@ -49,16 +48,17 @@ describe('Instances', () => {
 
   it('nextId returns incrementing string IDs', () => {
     const inst = new Instances();
-    assert.equal(inst.nextId(), '1');
-    assert.equal(inst.nextId(), '2');
-    assert.equal(inst.nextId(), '3');
+    expect(inst.nextId()).toBe('1');
+    expect(inst.nextId()).toBe('2');
+    expect(inst.nextId()).toBe('3');
   });
 
-  it('nextId skips IDs already in use', () => {
+  it('allocates the next available id without collisions', () => {
     const inst = new Instances();
-    inst.register('1', {a: 1});
-    inst.register('2', {b: 2});
-    assert.equal(inst.nextId(), '3');
+    inst.register('1', {});
+    inst.register('3', {});
+    expect(inst.nextId()).toBe('2');
+    expect(inst.nextId()).toBe('4');
   });
 
   it('register overwrites existing entry at same id', () => {
@@ -67,14 +67,18 @@ describe('Instances', () => {
     const obj2 = {v: 2};
     inst.register('x', obj1);
     inst.register('x', obj2);
-    assert.equal(inst.get('x'), obj2);
-    assert.equal(inst.getId(obj2), 'x');
+    expect(inst.get('x')).toBe(obj2);
+    expect(inst.getId(obj2)).toBe('x');
   });
 
-  it('handles registering non-object values (no reverse lookup)', () => {
+  it('does not create reverse lookups for non-object values', () => {
     const inst = new Instances();
     inst.register('num', 42 as any);
-    assert.equal(inst.get('num'), 42);
-    assert.equal(inst.getId(42 as any), undefined);
+    expect(inst.get('num')).toBe(42);
+    expect(inst.getId(42 as any)).toBeUndefined();
+
+    inst.register('value', 'plain-text');
+    expect(inst.get('value')).toBe('plain-text');
+    expect(inst.getId('plain-text')).toBeUndefined();
   });
 });

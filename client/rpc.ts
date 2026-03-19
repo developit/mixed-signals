@@ -1,6 +1,14 @@
-import type {Transport} from '../server/rpc.ts';
-import type {WireContext} from './reflection.ts';
-import {ClientReflection} from './reflection.ts';
+import {
+  formatCallMessage,
+  formatNotificationMessage,
+  parseWireMessage,
+  parseWireParams,
+  parseWireValue,
+  ROOT_NOTIFICATION_METHOD,
+  SIGNAL_UPDATE_METHOD,
+  type Transport,
+} from '../shared/protocol.ts';
+import {ClientReflection, type WireContext} from './reflection.ts';
 
 export class RPCClient {
   private transport: Transport;
@@ -9,14 +17,14 @@ export class RPCClient {
     number,
     {resolve: (v: any) => void; reject: (e: any) => void}
   >();
+  private notificationListeners = new Set<
+    (method: string, params: any[]) => void
+  >();
   reflection: ClientReflection;
   private transportReady: Promise<void> | undefined;
   root: any = undefined;
   ready: Promise<void>;
   private _resolveReady!: () => void;
-  private notificationListeners = new Set<
-    (method: string, params: any[]) => void
-  >();
 
   constructor(transport: Transport, ctx: WireContext) {
     this.transport = transport;
@@ -27,45 +35,43 @@ export class RPCClient {
     this.reflection = new ClientReflection(this, ctx);
 
     transport.onMessage((data) => {
-      const str = data.toString();
-      const type = str[0];
+      const message = parseWireMessage(data.toString());
+      if (!message) return;
 
-      // Reviver for processing @S and @M markers
       const reviver = (_key: string, val: any) => {
         if (typeof val === 'object' && val) {
           if ('@S' in val) {
             return this.reflection.getOrCreateSignal(val['@S'], val.v);
           }
+
           if ('@M' in val) {
             return this.reflection.createModelFacade(val);
           }
         }
+
         return val;
       };
 
-      // Parse with regex: [ER]123:payload or [MN]123:method:payload
-      const parts = str.match(/^(?:[ER](\d+)|[MN](\d*):([^:]*?)):(.*)$/);
-      if (!parts) return;
-
-      const idRaw = parts[1] || parts[2];
-      const id = idRaw ? +idRaw : undefined;
-      const method = parts[3];
-      const paramsRaw = parts[4];
-
-      if (type === 'R' || type === 'E') {
-        const parsed = JSON.parse(paramsRaw, reviver);
-        const pending = this.pending.get(id!);
+      if (message.type === 'result' || message.type === 'error') {
+        const parsed = parseWireValue(message.payload, reviver);
+        const pending = this.pending.get(message.id);
         if (!pending) return;
-        this.pending.delete(id!);
-        if (type === 'R') pending.resolve(parsed);
-        else pending.reject(new Error(parsed.message));
-      } else if (type === 'M') {
-        // M messages shouldn't be sent to client
-      } else {
-        // type === 'N'
-        const params = JSON.parse('[' + paramsRaw + ']', reviver);
-        this.handleNotification(method, params);
+
+        this.pending.delete(message.id);
+
+        if (message.type === 'result') {
+          pending.resolve(parsed);
+          return;
+        }
+
+        pending.reject(new Error((parsed as {message?: string}).message));
+        return;
       }
+
+      if (message.type === 'call') return;
+
+      const params = parseWireParams(message.payload, reviver);
+      this.handleNotification(message.method, params);
     });
   }
 
@@ -76,17 +82,8 @@ export class RPCClient {
     });
   }
 
-  onNotification(cb: (method: string, params: any[]) => void): () => void {
-    this.notificationListeners.add(cb);
-    return () => {
-      this.notificationListeners.delete(cb);
-    };
-  }
-
   notify(method: string, params?: any[]) {
-    const paramStr = (params || []).map((p) => JSON.stringify(p)).join(',');
-    const message = `N:${method}:${paramStr}`;
-    this.transport.send(message);
+    this.transport.send(formatNotificationMessage(method, params));
   }
 
   private sendCall(
@@ -97,28 +94,27 @@ export class RPCClient {
   ) {
     const id = this.nextId++;
     this.pending.set(id, {resolve, reject});
+    this.transport.send(formatCallMessage(id, method, params || []));
+  }
 
-    const paramStr = JSON.stringify(params || []).slice(1, -1);
-    const message = `M${id}:${method}:${paramStr}`;
-
-    this.transport.send(message);
+  onNotification(cb: (method: string, params: any[]) => void): () => void {
+    this.notificationListeners.add(cb);
+    return () => {
+      this.notificationListeners.delete(cb);
+    };
   }
 
   private handleNotification(method: string, params: any[]) {
-    if (method === '@R') {
+    if (method === ROOT_NOTIFICATION_METHOD) {
       this.root = params[0];
       this._resolveReady();
-      return;
-    }
-
-    if (method === '@S') {
+    } else if (method === SIGNAL_UPDATE_METHOD) {
       const [id, value, mode] = params;
       this.reflection.handleUpdate(id, value, mode);
-      return;
-    }
-
-    for (const listener of this.notificationListeners) {
-      listener(method, params);
+    } else {
+      for (const listener of this.notificationListeners) {
+        listener(method, params);
+      }
     }
   }
 }
