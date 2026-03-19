@@ -95,6 +95,98 @@ function commentText(comment) {
     .trim();
 }
 
+function renderNode(node) {
+  const lines = [];
+  const kind = KIND[node.kind] || 'Value';
+  const desc = commentText(node.comment);
+
+  lines.push(`#### \`${node.name}\``);
+  lines.push('');
+  lines.push(`- Kind: **${kind}**`);
+  if (desc) lines.push(`- ${desc}`);
+
+  if (node.signatures?.length) {
+    lines.push('- Signatures:');
+    for (const sig of node.signatures) {
+      const sigDesc = commentText(sig.comment);
+      lines.push(
+        `  - \`${sigToLine(sig)}\`${sigDesc ? ' — ' + sigDesc : ''}`,
+      );
+    }
+  }
+
+  const ctors = (node.children || []).filter((c) => c.kind === 512);
+  if (ctors.length) {
+    lines.push('- Constructor:');
+    for (const c of ctors) {
+      for (const sig of c.signatures || []) {
+        lines.push(`  - \`new ${node.name}${sigToLine(sig)}\``);
+      }
+    }
+  }
+
+  const methods = (node.children || []).filter((c) => c.kind === 2048);
+  if (methods.length) {
+    lines.push('- Methods:');
+    for (const m of methods) {
+      const sig = m.signatures?.[0];
+      const mDesc = commentText(sig?.comment);
+      lines.push(
+        `  - \`${m.name}${sig ? sigToLine(sig) : '()'}\`${mDesc ? ' — ' + mDesc : ''}`,
+      );
+    }
+  }
+
+  const props = (node.children || []).filter((c) => c.kind === 1024);
+  if (props.length) {
+    lines.push('- Properties:');
+    for (const p of props) {
+      const pDesc = commentText(p.comment);
+      lines.push(
+        `  - \`${p.name}: ${typeToString(p.type)}\`${pDesc ? ' — ' + pDesc : ''}`,
+      );
+    }
+  }
+
+  if (node.type) {
+    lines.push(`- Type: \`${typeToString(node.type)}\``);
+  }
+
+  lines.push('');
+  return lines;
+}
+
+// Collect exports from each entrypoint, keyed by name → rendered markdown
+const entryExports = [];
+for (const entry of ENTRY_POINTS) {
+  const jsonPath = new URL(entry.json, typedocDir);
+  const doc = JSON.parse(await readFile(jsonPath, 'utf8'));
+  const exports = (doc.children || []).filter(
+    (n) => n.variant === 'declaration' && n.kind !== 4,
+  );
+  const rendered = new Map();
+  for (const node of exports) {
+    rendered.set(node.name, renderNode(node).join('\n'));
+  }
+  entryExports.push({entry, exports, rendered});
+}
+
+// Find types that appear identically across multiple entrypoints
+const nameCounts = new Map();
+for (const {rendered} of entryExports) {
+  for (const [name, md] of rendered) {
+    const prev = nameCounts.get(name);
+    if (!prev) {
+      nameCounts.set(name, {md, count: 1});
+    } else if (prev.md === md) {
+      prev.count++;
+    }
+  }
+}
+const sharedNames = new Set(
+  [...nameCounts].filter(([, v]) => v.count > 1).map(([k]) => k),
+);
+
 const apiLines = [
   '## API',
   '',
@@ -102,72 +194,27 @@ const apiLines = [
   '',
 ];
 
-for (const entry of ENTRY_POINTS) {
-  const jsonPath = new URL(entry.json, typedocDir);
-  const doc = JSON.parse(await readFile(jsonPath, 'utf8'));
-  const exports = (doc.children || []).filter(
-    (n) => n.variant === 'declaration' && n.kind !== 4,
-  );
+// Emit per-entrypoint sections (excluding shared types)
+for (const {entry, exports} of entryExports) {
+  const specific = exports
+    .filter((n) => !sharedNames.has(n.name))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  if (!specific.length) continue;
 
   apiLines.push(`### \`${entry.heading}\``, '');
+  for (const node of specific) {
+    apiLines.push(...renderNode(node));
+  }
+}
 
-  for (const node of exports.sort((a, b) => a.name.localeCompare(b.name))) {
-    const kind = KIND[node.kind] || 'Value';
-    const desc = commentText(node.comment);
-
-    apiLines.push(`#### \`${node.name}\``);
-    apiLines.push('');
-    apiLines.push(`- Kind: **${kind}**`);
-    if (desc) apiLines.push(`- ${desc}`);
-
-    if (node.signatures?.length) {
-      apiLines.push('- Signatures:');
-      for (const sig of node.signatures) {
-        const sigDesc = commentText(sig.comment);
-        apiLines.push(
-          `  - \`${sigToLine(sig)}\`${sigDesc ? ' — ' + sigDesc : ''}`,
-        );
-      }
-    }
-
-    const ctors = (node.children || []).filter((c) => c.kind === 512);
-    if (ctors.length) {
-      apiLines.push('- Constructor:');
-      for (const c of ctors) {
-        for (const sig of c.signatures || []) {
-          apiLines.push(`  - \`new ${node.name}${sigToLine(sig)}\``);
-        }
-      }
-    }
-
-    const methods = (node.children || []).filter((c) => c.kind === 2048);
-    if (methods.length) {
-      apiLines.push('- Methods:');
-      for (const m of methods) {
-        const sig = m.signatures?.[0];
-        const mDesc = commentText(sig?.comment);
-        apiLines.push(
-          `  - \`${m.name}${sig ? sigToLine(sig) : '()'}\`${mDesc ? ' — ' + mDesc : ''}`,
-        );
-      }
-    }
-
-    const props = (node.children || []).filter((c) => c.kind === 1024);
-    if (props.length) {
-      apiLines.push('- Properties:');
-      for (const p of props) {
-        const pDesc = commentText(p.comment);
-        apiLines.push(
-          `  - \`${p.name}: ${typeToString(p.type)}\`${pDesc ? ' — ' + pDesc : ''}`,
-        );
-      }
-    }
-
-    if (node.type) {
-      apiLines.push(`- Type: \`${typeToString(node.type)}\``);
-    }
-
-    apiLines.push('');
+// Emit shared section
+if (sharedNames.size) {
+  apiLines.push('### Shared', '');
+  const sharedNodes = entryExports[0].exports
+    .filter((n) => sharedNames.has(n.name))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  for (const node of sharedNodes) {
+    apiLines.push(...renderNode(node));
   }
 }
 

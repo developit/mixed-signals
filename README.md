@@ -14,7 +14,7 @@ The only dependency is `@preact/signals-core` (>=1.8.0).
 
 **mixed-signals** reflects server-side Preact Models and Signals (anything created via `@preact/signals-core`) to connected clients in real-time. Signals on the server are serialized with identity markers, and the client reconstructs them as local signals that stay in sync via a lightweight wire protocol.
 
-- **Server** models use `createModel()` from `signal-wire/server` (a thin wrapper around `@preact/signals-core`'s `createModel`)
+- **Server** models use `createModel()` from `signal-wire/server` _(a thin wrapper around `@preact/signals-core`'s `createModel`)_
 - **Client** models use `createReflectedModel()` from `signal-wire/client` to create local proxies that mirror server state
 - An **RPC** layer handles method calls (client → server) and signal updates (server → client)
 - Delta compression for arrays (append), objects (merge), and strings (append) minimizes bandwidth
@@ -65,7 +65,7 @@ wss.on("connection", (ws) => {
 ### `client.tsx`
 
 ```tsx
-import { useSignal } from '@preact/signals';
+import { useSignal } from "@preact/signals";
 import { RPCClient, createReflectedModel } from "mixed-signals/client";
 import type { Todo, Todos } from "./server.ts";
 
@@ -75,7 +75,7 @@ const TodosModel = createReflectedModel<Todos>(["all"], ["add"]);
 const ws = new WebSocket("/rpc");
 const rpc = new RPCClient({
   send: ws.send.bind(ws),
-  onMessage: (cb) => ws.onmessage = (e) => cb(e.data),
+  onMessage: ws.addEventListener.bind(ws, "message"),
   ready: new Promise((r) => ws.addEventListener("open", r, { once: true })),
 }, {});
 rpc.registerModel("Todo", TodoModel);
@@ -145,15 +145,6 @@ forwarded — no per-model declaration needed.
   - `notify(method: string, params: any[], clientId?: string) => void`
   - `registerModel(name: string, Ctor: ModelConstructor) => void`
 
-#### `Transport`
-
-- Kind: **Interface**
-- Methods:
-  - `onMessage(cb: (data: { toString: unknown }) => void) => void`
-  - `send(data: string) => void`
-- Properties:
-  - `ready: Promise<void>`
-
 ### `mixed-signals/client`
 
 #### `createReflectedModel`
@@ -175,6 +166,8 @@ forwarded — no per-model declaration needed.
 - Properties:
   - `ready: Promise<void>`
   - `root: any`
+
+### Shared
 
 #### `Transport`
 
