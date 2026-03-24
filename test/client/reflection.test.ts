@@ -41,10 +41,18 @@ describe('ClientReflection', () => {
       expect(sig.peek()).toBe(42);
     });
 
-    it('returns cached signal for same id and refreshes its snapshot', () => {
+    it('returns cached signal for same id', () => {
       const {reflection} = setup();
       const sig1 = reflection.getOrCreateSignal(1, 42);
       const sig2 = reflection.getOrCreateSignal(1, 99);
+      expect(sig1).toBe(sig2);
+      expect(sig2.peek()).toBe(42);
+    });
+
+    it('syncs an existing signal snapshot without replacing it', () => {
+      const {reflection} = setup();
+      const sig1 = reflection.getOrCreateSignal(1, 42);
+      const sig2 = reflection.syncSignalSnapshot(1, 99);
       expect(sig1).toBe(sig2);
       expect(sig2.peek()).toBe(99);
     });

@@ -71,7 +71,7 @@ export class RPCClient {
       const reviver = (_key: string, val: any) => {
         if (typeof val === 'object' && val) {
           if ('@S' in val) {
-            return this.reflection.getOrCreateSignal(val['@S'], val.v);
+            return this.reflection.syncSignalSnapshot(val['@S'], val.v);
           }
 
           if ('@M' in val) {

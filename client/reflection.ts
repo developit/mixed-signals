@@ -63,10 +63,7 @@ export class ClientReflection {
 
   getOrCreateSignal(id: number | string, initialValue: any): Signal<any> {
     const existingSignal = this.signals.get(id);
-    if (existingSignal) {
-      existingSignal.value = initialValue;
-      return existingSignal;
-    }
+    if (existingSignal) return existingSignal;
 
     let unwatchTimeout: ReturnType<typeof setTimeout> | null = null;
 
@@ -93,6 +90,12 @@ export class ClientReflection {
 
     this.signals.set(id, createdSignal);
     return createdSignal;
+  }
+
+  syncSignalSnapshot(id: number | string, value: any): Signal<any> {
+    const sig = this.getOrCreateSignal(id, value);
+    sig.value = value;
+    return sig;
   }
 
   reconnect() {
