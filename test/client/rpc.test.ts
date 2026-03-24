@@ -8,10 +8,17 @@ class FakeTransport implements Transport {
   sent: string[] = [];
   ready?: Promise<void>;
   closed = false;
+  onOpen?: (cb: () => void) => void;
   private handler?: (data: {toString(): string}) => void;
   private closeHandler?: (error?: unknown) => void;
-  constructor(ready?: Promise<void>) {
+  private openHandler?: () => void;
+  constructor(ready?: Promise<void>, reconnectable = false) {
     this.ready = ready;
+    if (reconnectable) {
+      this.onOpen = (cb: () => void) => {
+        this.openHandler = cb;
+      };
+    }
   }
   send(data: string) {
     this.sent.push(data);
@@ -24,6 +31,10 @@ class FakeTransport implements Transport {
   }
   emit(data: string) {
     this.handler?.({toString: () => data});
+  }
+  open() {
+    this.closed = false;
+    this.openHandler?.();
   }
   close(error?: unknown) {
     this.closed = true;
@@ -232,6 +243,26 @@ describe('RPCClient', () => {
       await vi.advanceTimersByTimeAsync(20);
 
       expect(await outcome).toBe('rejected');
+    });
+
+    it('keeps ready pending for reconnectable transports until root arrives', async () => {
+      vi.useFakeTimers();
+      const transport = new FakeTransport(undefined, true);
+      const client = new RPCClient(transport, createContext());
+
+      transport.close();
+
+      const beforeReconnect = settleWithin(client.ready, 20);
+      await vi.advanceTimersByTimeAsync(20);
+      expect(await beforeReconnect).toBe('timeout');
+
+      transport.open();
+      transport.emit('N:@R:{"value":"root-data"}');
+
+      const afterReconnect = settleWithin(client.ready, 20);
+      await vi.advanceTimersByTimeAsync(20);
+      expect(await afterReconnect).toBe('resolved');
+      expect(client.root).toEqual({value: 'root-data'});
     });
 
     it('@S calls reflection.handleUpdate', () => {

@@ -12,7 +12,7 @@ No manual subscriptions, no event emitters — just signals.
 
 | Concept                  | Description                                                                                                             |
 | ------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
-| **Transport**            | Any object with `send(data: string)` and `onMessage(cb)`, plus optional `onClose(cb)` / `ready`. Typically a WebSocket. |
+| **Transport**            | Any object with `send(data: string)` and `onMessage(cb)`, plus optional `onOpen(cb)`, `onClose(cb)` and `ready`. Typically a WebSocket. |
 | **RPC**                  | Server-side hub. Wraps a root object, routes incoming method calls, manages connected clients.                          |
 | **Reflection**           | Server-side signal tracker. Serializes signal values, computes deltas, and pushes updates to subscribed clients.        |
 | **Instances**            | Registry that maps numeric IDs to server-side model instances, enabling instance-method routing.                        |
@@ -285,6 +285,9 @@ The client also handles `splice` mode; the server doesn't currently emit it.
 Batching coalesces the "20 signals arrive in one response, 20 effects
 subscribe on the same tick" case into one `@W` frame.
 
+On reconnect, the client reuses the root snapshot to refresh cached signal
+values, then replays any currently watched signal ids with a fresh `@W` batch.
+
 ---
 
 ## `createReflectedModel`
@@ -362,5 +365,5 @@ propagates without the UI knowing.
   Redundant `sig.value = same` writes never touch the wire.
 - **Lazy fan-out** — a server signal with zero watchers has zero
   `.subscribe()` callbacks attached to it.
-- **Transport-agnostic** — `Transport = { send(str), onMessage(cb), onClose?(cb), ready? }`.
+- **Transport-agnostic** — `Transport = { send(str), onMessage(cb), onOpen?(cb), onClose?(cb), ready? }`.
   WebSocket, MessagePort, stdin/stdout all fit.

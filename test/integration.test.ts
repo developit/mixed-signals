@@ -5,6 +5,7 @@ import type {WireContext} from '../client/reflection.ts';
 import {RPCClient} from '../client/rpc.ts';
 
 import {RPC} from '../server/rpc.ts';
+import type {Transport} from '../shared/protocol.ts';
 import {
   Counter,
   createLinkedTransportPair,
@@ -19,6 +20,78 @@ function connect(rpc: RPC, clientId?: string) {
   rpcClient.registerModel('Counter', ReflectedCounter);
   const cleanup = rpc.addClient(serverTransport, clientId);
   return {rpcClient, cleanup, flush};
+}
+
+type MessageHandler = (data: {toString(): string}) => void | Promise<void>;
+
+function createReconnectHarness(rpc: RPC, clientId = 'reconnect-client') {
+  const queue: Array<() => Promise<void>> = [];
+  let clientHandler: MessageHandler | undefined;
+  let clientCloseHandler: ((error?: unknown) => void) | undefined;
+  let clientOpenHandler: (() => void) | undefined;
+  let serverHandler: MessageHandler | undefined;
+  let cleanup: (() => void) | undefined;
+
+  const enqueue = (deliver: () => void | Promise<void>) => {
+    queue.push(async () => {
+      await deliver();
+    });
+  };
+
+  const transport: Transport = {
+    send(data: string) {
+      if (!serverHandler) return;
+      enqueue(async () => {
+        await serverHandler?.({toString: () => data});
+      });
+    },
+    onMessage(cb) {
+      clientHandler = cb;
+    },
+    onClose(cb) {
+      clientCloseHandler = cb;
+    },
+    onOpen(cb) {
+      clientOpenHandler = cb;
+    },
+  };
+
+  return {
+    transport,
+    connect() {
+      cleanup?.();
+
+      let nextServerHandler: MessageHandler | undefined;
+      const serverTransport: Transport = {
+        send(data: string) {
+          enqueue(async () => {
+            await clientHandler?.({toString: () => data});
+          });
+        },
+        onMessage(cb) {
+          nextServerHandler = cb;
+        },
+      };
+
+      cleanup = rpc.addClient(serverTransport, clientId);
+      serverHandler = nextServerHandler;
+      clientOpenHandler?.();
+    },
+    disconnect(error?: unknown) {
+      cleanup?.();
+      cleanup = undefined;
+      serverHandler = undefined;
+      clientCloseHandler?.(error);
+    },
+    async flush() {
+      while (queue.length > 0) {
+        const pending = queue.splice(0);
+        for (const deliver of pending) {
+          await deliver();
+        }
+      }
+    },
+  };
 }
 
 class Project {
@@ -470,6 +543,82 @@ describe('Integration: Server <-> Client', () => {
     await flush();
 
     expect(rpcClient.root.count.peek()).toBe(10);
+  });
+
+  it('replays active signal subscriptions after reconnect', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    rpc.expose(root);
+
+    const harness = createReconnectHarness(rpc, 'reconnect-1');
+    const ctx = {rpc: null as any};
+    const client = new RPCClient(harness.transport, ctx);
+    ctx.rpc = client;
+    client.registerModel('Counter', ReflectedCounter);
+
+    harness.connect();
+    await harness.flush();
+    await client.ready;
+
+    const stop = client.root.count.subscribe(() => undefined);
+    vi.advanceTimersByTime(1);
+    await harness.flush();
+
+    root.count.value = 10;
+    await harness.flush();
+    expect(client.root.count.peek()).toBe(10);
+
+    harness.disconnect();
+
+    root.count.value = 20;
+    await harness.flush();
+    expect(client.root.count.peek()).toBe(10);
+
+    harness.connect();
+    await harness.flush();
+
+    expect(client.root.count.peek()).toBe(20);
+
+    root.count.value = 30;
+    await harness.flush();
+
+    expect(client.root.count.peek()).toBe(30);
+    stop();
+  });
+
+  it('restores reflected model method calls after reconnect', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    rpc.expose(root);
+
+    const harness = createReconnectHarness(rpc, 'reconnect-2');
+    const ctx = {rpc: null as any};
+    const client = new RPCClient(harness.transport, ctx);
+    ctx.rpc = client;
+    client.registerModel('Counter', ReflectedCounter);
+
+    harness.connect();
+    await harness.flush();
+    await client.ready;
+
+    const first = client.root.increment();
+    await harness.flush();
+    await first;
+    expect(root.count.peek()).toBe(1);
+
+    harness.disconnect();
+    harness.connect();
+    await harness.flush();
+
+    const second = client.root.increment();
+    await harness.flush();
+    await second;
+
+    expect(root.count.peek()).toBe(2);
   });
 
   it('rpc.call from client still works with method routing', async () => {

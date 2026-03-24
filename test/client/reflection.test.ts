@@ -41,12 +41,12 @@ describe('ClientReflection', () => {
       expect(sig.peek()).toBe(42);
     });
 
-    it('returns cached signal for same id', () => {
+    it('returns cached signal for same id and refreshes its snapshot', () => {
       const {reflection} = setup();
       const sig1 = reflection.getOrCreateSignal(1, 42);
       const sig2 = reflection.getOrCreateSignal(1, 99);
       expect(sig1).toBe(sig2);
-      expect(sig2.peek()).toBe(42);
+      expect(sig2.peek()).toBe(99);
     });
 
     it('different ids get different signals', () => {

@@ -113,6 +113,10 @@ rpc.ready.then(() => {
 });
 ```
 
+If your transport reconnects, expose `onOpen(cb)` alongside `onClose(cb)` so
+`RPCClient` can refresh the root snapshot and replay active signal
+subscriptions after the connection comes back.
+
 ## API
 
 _Generated from TypeScript declarations._
@@ -175,6 +179,7 @@ forwarded — no per-model declaration needed.
 - Kind: **Interface**
 - Methods:
   - `onClose(cb: (error?: unknown) => void) => void`
+  - `onOpen(cb: () => void) => void`
   - `onMessage(cb: (data: { toString: unknown }) => void) => void`
   - `send(data: string) => void`
 - Properties:

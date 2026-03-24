@@ -23,7 +23,11 @@ export class RPCClient {
   /** @internal */
   reflection: ClientReflection;
   private transportReady: Promise<void> | undefined;
-  private disconnectPromise: Promise<never>;
+  private disconnectPromise!: Promise<never>;
+  private reconnectable: boolean;
+  private hasOpened = false;
+  private readyResolved = false;
+  private replaySubscriptionsOnRoot = false;
   private closed = false;
   private disconnectError?: Error;
   root: any = undefined;
@@ -35,15 +39,26 @@ export class RPCClient {
   constructor(transport: Transport, ctx?: any) {
     this.transport = transport;
     this.transportReady = transport.ready;
-    this.disconnectPromise = new Promise((_, reject) => {
-      this._rejectDisconnect = reject;
-    });
-    this.disconnectPromise.catch(() => undefined);
+    this.reconnectable = !!transport.onOpen;
+    this.resetDisconnectPromise();
     this.ready = new Promise((resolve, reject) => {
       this._resolveReady = resolve;
       this._rejectReady = reject;
     });
     this.reflection = new ClientReflection(this, ctx);
+
+    transport.ready?.then(
+      () => {
+        this.handleOpen();
+      },
+      (error) => {
+        this.handleDisconnect(error);
+      },
+    );
+
+    transport.onOpen?.(() => {
+      this.handleOpen();
+    });
 
     transport.onClose?.((error) => {
       this.handleDisconnect(error);
@@ -133,6 +148,29 @@ export class RPCClient {
     this.transport.send(formatCallMessage(id, method, params || []));
   }
 
+  private resetDisconnectPromise() {
+    this.disconnectPromise = new Promise((_, reject) => {
+      this._rejectDisconnect = reject;
+    });
+    this.disconnectPromise.catch(() => undefined);
+  }
+
+  private handleOpen() {
+    if (this.hasOpened && !this.closed) return;
+
+    const wasClosed = this.closed;
+    this.hasOpened = true;
+    this.closed = false;
+    this.disconnectError = undefined;
+
+    if (wasClosed) {
+      this.resetDisconnectPromise();
+      if (this.readyResolved) {
+        this.replaySubscriptionsOnRoot = true;
+      }
+    }
+  }
+
   private handleDisconnect(error?: unknown) {
     if (this.closed) return;
 
@@ -141,7 +179,9 @@ export class RPCClient {
       error instanceof Error ? error : new Error('Transport disconnected');
 
     this._rejectDisconnect(this.disconnectError);
-    this._rejectReady(this.disconnectError);
+    if (!this.readyResolved && !this.reconnectable) {
+      this._rejectReady(this.disconnectError);
+    }
 
     for (const {reject} of this.pending.values()) {
       reject(this.disconnectError);
@@ -163,8 +203,16 @@ export class RPCClient {
 
   private handleNotification(method: string, params: any[]) {
     if (method === ROOT_NOTIFICATION_METHOD) {
+      this.handleOpen();
       this.root = params[0];
-      this._resolveReady();
+      if (!this.readyResolved) {
+        this.readyResolved = true;
+        this._resolveReady();
+      }
+      if (this.replaySubscriptionsOnRoot) {
+        this.replaySubscriptionsOnRoot = false;
+        this.reflection.reconnect();
+      }
     } else if (method === SIGNAL_UPDATE_METHOD) {
       const [id, value, mode] = params;
       this.reflection.handleUpdate(id, value, mode);
