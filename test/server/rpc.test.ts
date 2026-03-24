@@ -20,14 +20,21 @@ type MessageHandler = (data: {toString(): string}) => void | Promise<void>;
 class FakeTransport implements Transport {
   sent: string[] = [];
   private handler?: MessageHandler;
+  private closeHandler?: (error?: unknown) => void;
   send(data: string) {
     this.sent.push(data);
   }
   onMessage(cb: (data: {toString(): string}) => void) {
     this.handler = cb;
   }
+  onClose(cb: (error?: unknown) => void) {
+    this.closeHandler = cb;
+  }
   async emit(data: string) {
     await this.handler?.({toString: () => data});
+  }
+  close(error?: unknown) {
+    this.closeHandler?.(error);
   }
 }
 
@@ -99,6 +106,24 @@ describe('RPC', () => {
 
     cleanup();
     rpc.notify('test', ['data']);
+    expect(sent).toHaveLength(0);
+  });
+
+  it('transport close stops message delivery', () => {
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    rpc.expose(root);
+
+    const sent: string[] = [];
+    const transport = new FakeTransport();
+    transport.send = (data: string) => sent.push(data);
+    rpc.addClient(transport);
+    sent.length = 0;
+
+    transport.close();
+    rpc.notify('test', ['data']);
+
     expect(sent).toHaveLength(0);
   });
 

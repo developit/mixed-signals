@@ -1,4 +1,4 @@
-import {describe, expect, it} from 'vitest';
+import {afterEach, describe, expect, it, vi} from 'vitest';
 import type {WireContext} from '../../client/reflection.ts';
 import {RPCClient} from '../../client/rpc.ts';
 import type {Transport} from '../../shared/protocol.ts';
@@ -7,7 +7,9 @@ import {ReflectedCounter} from '../helpers.ts';
 class FakeTransport implements Transport {
   sent: string[] = [];
   ready?: Promise<void>;
+  closed = false;
   private handler?: (data: {toString(): string}) => void;
+  private closeHandler?: (error?: unknown) => void;
   constructor(ready?: Promise<void>) {
     this.ready = ready;
   }
@@ -17,8 +19,15 @@ class FakeTransport implements Transport {
   onMessage(cb: (data: {toString(): string}) => void) {
     this.handler = cb;
   }
+  onClose(cb: (error?: unknown) => void) {
+    this.closeHandler = cb;
+  }
   emit(data: string) {
     this.handler?.({toString: () => data});
+  }
+  close(error?: unknown) {
+    this.closed = true;
+    this.closeHandler?.(error);
   }
 }
 
@@ -27,6 +36,25 @@ function createContext(): WireContext {
     rpc: {call: async () => undefined} as Partial<RPCClient>,
   } as unknown as WireContext;
 }
+
+async function settleWithin<T>(
+  promise: Promise<T>,
+  ms: number,
+): Promise<'resolved' | 'rejected' | 'timeout'> {
+  return Promise.race([
+    promise.then(
+      () => 'resolved' as const,
+      () => 'rejected' as const,
+    ),
+    new Promise<'timeout'>((resolve) => {
+      setTimeout(() => resolve('timeout'), ms);
+    }),
+  ]);
+}
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe('RPCClient', () => {
   describe('message parsing', () => {
@@ -118,6 +146,24 @@ describe('RPCClient', () => {
       await pending;
     });
 
+    it('rejects calls if the transport disconnects before transport.ready', async () => {
+      vi.useFakeTimers();
+      const ready = new Promise<void>(() => undefined);
+      const transport = new FakeTransport(ready);
+      const client = new RPCClient(transport, createContext());
+      void client.ready.catch(() => undefined);
+
+      const pending = client.call('ping', []);
+      expect(transport.sent).toHaveLength(0);
+
+      transport.close();
+
+      const outcome = settleWithin(pending, 20);
+      await vi.advanceTimersByTimeAsync(20);
+
+      expect(await outcome).toBe('rejected');
+    });
+
     it('resolves and rejects pending calls from result and error frames', async () => {
       const transport = new FakeTransport();
       const client = new RPCClient(transport, createContext());
@@ -130,6 +176,23 @@ describe('RPCClient', () => {
       const sum2 = client.call('sum', []);
       transport.emit('E2:{"message":"boom"}');
       await expect(sum2).rejects.toThrow('boom');
+    });
+
+    it('rejects pending calls when the transport disconnects', async () => {
+      vi.useFakeTimers();
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      void client.ready.catch(() => undefined);
+
+      const pending = client.call('sum', [1, 2]);
+      expect(transport.sent[0]).toBe('M1:sum:1,2');
+
+      transport.close();
+
+      const outcome = settleWithin(pending, 20);
+      await vi.advanceTimersByTimeAsync(20);
+
+      expect(await outcome).toBe('rejected');
     });
   });
 
@@ -156,6 +219,19 @@ describe('RPCClient', () => {
       transport.emit('N:@R:{"value":"root-data"}');
       await client.ready;
       expect(client.root).toEqual({value: 'root-data'});
+    });
+
+    it('rejects ready when the transport disconnects before root arrives', async () => {
+      vi.useFakeTimers();
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+
+      transport.close();
+
+      const outcome = settleWithin(client.ready, 20);
+      await vi.advanceTimersByTimeAsync(20);
+
+      expect(await outcome).toBe('rejected');
     });
 
     it('@S calls reflection.handleUpdate', () => {

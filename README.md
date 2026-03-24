@@ -54,11 +54,11 @@ rpc.registerModel("Todos", Todos);
 
 const wss = new WebSocketServer();
 wss.on("connection", (ws) => {
-  const dispose = rpc.addClient({
+  rpc.addClient({
     send: ws.send.bind(ws),
     onMessage: ws.on.bind(ws, "message"),
+    onClose: (cb) => ws.on("close", cb),
   });
-  ws.on("close", dispose);
 });
 ```
 
@@ -76,6 +76,7 @@ const ws = new WebSocket("/rpc");
 const rpc = new RPCClient({
   send: ws.send.bind(ws),
   onMessage: ws.addEventListener.bind(ws, "message"),
+  onClose: (cb) => ws.addEventListener("close", () => cb(), { once: true }),
   ready: new Promise((r) => ws.addEventListener("open", r, { once: true })),
 }, {});
 rpc.registerModel("Todo", TodoModel);
@@ -173,8 +174,8 @@ forwarded — no per-model declaration needed.
 
 - Kind: **Interface**
 - Methods:
+  - `onClose(cb: (error?: unknown) => void) => void`
   - `onMessage(cb: (data: { toString: unknown }) => void) => void`
   - `send(data: string) => void`
 - Properties:
   - `ready: Promise<void>`
-
