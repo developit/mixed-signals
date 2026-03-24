@@ -1,6 +1,7 @@
 export interface Transport {
   send(data: string): void;
   onMessage(cb: (data: {toString(): string}) => void): void;
+  onClose?(cb: (error?: unknown) => void): void;
   ready?: Promise<void>;
 }
 

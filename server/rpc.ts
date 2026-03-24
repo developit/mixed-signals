@@ -79,6 +79,8 @@ export class RPC {
     const id = clientId ?? crypto.randomUUID();
     this.clients.set(id, transport);
 
+    let disposed = false;
+
     // Bind this client to any upstream connections
     for (const upstream of this.upstreams.values()) {
       upstream.setClient(id);
@@ -110,13 +112,22 @@ export class RPC {
       this.broadcastMergedRoot(id);
     }
 
-    return () => {
+    const cleanup = () => {
+      if (disposed) return;
+      disposed = true;
+
       this.clients.delete(id);
       this.reflection.removeClient(id);
       for (const upstream of this.upstreams.values()) {
         upstream.removeClient(id);
       }
     };
+
+    transport.onClose?.(() => {
+      cleanup();
+    });
+
+    return cleanup;
   }
 
   /**

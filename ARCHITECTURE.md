@@ -12,7 +12,7 @@ No manual subscriptions, no event emitters — just signals.
 
 | Concept                  | Description                                                                                                             |
 | ------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
-| **Transport**            | Any object with `send(data: string)` and `onMessage(cb)`. Typically a WebSocket.                                        |
+| **Transport**            | Any object with `send(data: string)` and `onMessage(cb)`, plus optional `onClose(cb)` / `ready`. Typically a WebSocket. |
 | **RPC**                  | Server-side hub. Wraps a root object, routes incoming method calls, manages connected clients.                          |
 | **Reflection**           | Server-side signal tracker. Serializes signal values, computes deltas, and pushes updates to subscribed clients.        |
 | **Instances**            | Registry that maps numeric IDs to server-side model instances, enabling instance-method routing.                        |
@@ -362,5 +362,5 @@ propagates without the UI knowing.
   Redundant `sig.value = same` writes never touch the wire.
 - **Lazy fan-out** — a server signal with zero watchers has zero
   `.subscribe()` callbacks attached to it.
-- **Transport-agnostic** — `Transport = { send(str), onMessage(cb), ready? }`.
+- **Transport-agnostic** — `Transport = { send(str), onMessage(cb), onClose?(cb), ready? }`.
   WebSocket, MessagePort, stdin/stdout all fit.
