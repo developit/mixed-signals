@@ -1,24 +1,43 @@
 import {describe, expect, it} from 'vitest';
 import type {WireContext} from '../../client/reflection.ts';
 import {RPCClient} from '../../client/rpc.ts';
-import type {Transport} from '../../shared/protocol.ts';
+import type {
+  RawTransport,
+  RawWireMessage,
+  StringTransport,
+} from '../../shared/protocol.ts';
 import {ReflectedCounter} from '../helpers.ts';
 
-class FakeTransport implements Transport {
+class FakeTransport implements StringTransport {
   sent: string[] = [];
   ready?: Promise<void>;
-  private handler?: (data: {toString(): string}) => void;
+  private handler?: (data: string) => void;
   constructor(ready?: Promise<void>) {
     this.ready = ready;
   }
   send(data: string) {
     this.sent.push(data);
   }
-  onMessage(cb: (data: {toString(): string}) => void) {
+  onMessage(cb: (data: string) => void) {
     this.handler = cb;
   }
   emit(data: string) {
-    this.handler?.({toString: () => data});
+    this.handler?.(data);
+  }
+}
+
+class RawFakeTransport implements RawTransport {
+  mode = 'raw' as const;
+  sent: RawWireMessage[] = [];
+  private handler?: (data: RawWireMessage) => void;
+  send(data: RawWireMessage) {
+    this.sent.push(data);
+  }
+  onMessage(cb: (data: RawWireMessage) => void) {
+    this.handler = cb;
+  }
+  emit(data: RawWireMessage) {
+    this.handler?.(data);
   }
 }
 
@@ -71,6 +90,17 @@ describe('RPCClient', () => {
       transport.emit('X1:invalid');
       // No throw, no crash
       expect(client.root).toBeUndefined();
+    });
+
+    it('supports raw message mode without JSON reviver callbacks', () => {
+      const transport = new RawFakeTransport();
+      const client = new RPCClient(transport, createContext());
+      transport.emit({
+        type: 'notification',
+        method: '@R',
+        params: [{'@S': 1, v: 42}],
+      });
+      expect(client.root.peek()).toBe(42);
     });
   });
 

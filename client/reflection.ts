@@ -115,6 +115,40 @@ export class ClientReflection {
     return model;
   }
 
+  deserialize(value: any): any {
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) {
+        value[i] = this.deserialize(value[i]);
+      }
+      return value;
+    }
+
+    if (!value || typeof value !== 'object') {
+      return value;
+    }
+
+    if ('@S' in value) {
+      const id = (value as any)['@S'];
+      const initial = this.deserialize((value as any).v);
+      return this.getOrCreateSignal(id, initial);
+    }
+
+    if ('@M' in value) {
+      const hydrated: Record<string, any> = {'@M': (value as any)['@M']};
+      for (const key in value) {
+        if (key === '@M') continue;
+        hydrated[key] = this.deserialize((value as any)[key]);
+      }
+      return this.createModelFacade(hydrated);
+    }
+
+    for (const key in value) {
+      (value as any)[key] = this.deserialize((value as any)[key]);
+    }
+
+    return value;
+  }
+
   handleUpdate(id: number | string, value: any, mode?: string) {
     const sig = this.signals.get(id);
     if (!sig) return;

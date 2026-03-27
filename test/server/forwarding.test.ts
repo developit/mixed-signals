@@ -6,9 +6,9 @@ import {RPCClient} from '../../client/rpc.ts';
 import {addPrefix, stripPrefix} from '../../server/forwarding.ts';
 import {createModel} from '../../server/model.ts';
 import {RPC} from '../../server/rpc.ts';
-import type {Transport} from '../../shared/protocol.ts';
+import type {StringTransport} from '../../shared/protocol.ts';
 
-type MessageHandler = (data: {toString(): string}) => void | Promise<void>;
+type MessageHandler = (data: string) => void | Promise<void>;
 
 /**
  * Creates a triplet of linked transports for testing the three-hop chain:
@@ -17,10 +17,10 @@ type MessageHandler = (data: {toString(): string}) => void | Promise<void>;
  * Uses a synchronous queue with explicit flush() for deterministic tests.
  */
 function createLinkedTransports(): {
-  brokerTransport: Transport;
-  serverUpstreamTransport: Transport;
-  serverDownstreamTransport: Transport;
-  browserTransport: Transport;
+  brokerTransport: StringTransport;
+  serverUpstreamTransport: StringTransport;
+  serverDownstreamTransport: StringTransport;
+  browserTransport: StringTransport;
   flush: () => Promise<void>;
 } {
   const queue: Array<() => Promise<void>> = [];
@@ -30,7 +30,7 @@ function createLinkedTransports(): {
   const handlers: Record<string, MessageHandler | undefined> = {};
   const enqueue = (key: string, data: string) => {
     queue.push(async () => {
-      await handlers[key]?.({toString: () => data});
+      await handlers[key]?.(data);
     });
   };
 

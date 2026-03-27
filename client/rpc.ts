@@ -1,17 +1,23 @@
 import {
   formatCallMessage,
+  formatRawCallMessage,
+  formatRawNotificationMessage,
   formatNotificationMessage,
   parseWireMessage,
   parseWireParams,
   parseWireValue,
+  type RawWireMessage,
   ROOT_NOTIFICATION_METHOD,
   SIGNAL_UPDATE_METHOD,
+  type RawTransport,
+  type StringTransport,
   type Transport,
 } from '../shared/protocol.ts';
 import {ClientReflection} from './reflection.ts';
 
 export class RPCClient {
   private transport: Transport;
+  private mode: 'string' | 'raw';
   private nextId = 1;
   private pending = new Map<
     number,
@@ -29,32 +35,19 @@ export class RPCClient {
 
   constructor(transport: Transport, ctx?: any) {
     this.transport = transport;
+    this.mode = transport.mode === 'raw' ? 'raw' : 'string';
     this.transportReady = transport.ready;
     this.ready = new Promise((resolve) => {
       this._resolveReady = resolve;
     });
     this.reflection = new ClientReflection(this, ctx);
 
-    transport.onMessage((data) => {
-      const message = parseWireMessage(data.toString());
+    transport.onMessage((data, messageCtx) => {
+      const message = this.readIncomingMessage(data, messageCtx);
       if (!message) return;
 
-      const reviver = (_key: string, val: any) => {
-        if (typeof val === 'object' && val) {
-          if ('@S' in val) {
-            return this.reflection.getOrCreateSignal(val['@S'], val.v);
-          }
-
-          if ('@M' in val) {
-            return this.reflection.createModelFacade(val);
-          }
-        }
-
-        return val;
-      };
-
       if (message.type === 'result' || message.type === 'error') {
-        const parsed = parseWireValue(message.payload, reviver);
+        const parsed = this.reflection.deserialize(message.value);
         const pending = this.pending.get(message.id);
         if (!pending) return;
 
@@ -71,7 +64,7 @@ export class RPCClient {
 
       if (message.type === 'call') return;
 
-      const params = parseWireParams(message.payload, reviver);
+      const params = this.reflection.deserialize(message.params) as any[];
       this.handleNotification(message.method, params);
     });
   }
@@ -88,7 +81,11 @@ export class RPCClient {
   }
 
   notify(method: string, params?: any[]) {
-    this.transport.send(formatNotificationMessage(method, params));
+    this.sendWireMessage(
+      this.mode === 'raw'
+        ? formatRawNotificationMessage(method, params)
+        : formatNotificationMessage(method, params),
+    );
   }
 
   private sendCall(
@@ -99,7 +96,11 @@ export class RPCClient {
   ) {
     const id = this.nextId++;
     this.pending.set(id, {resolve, reject});
-    this.transport.send(formatCallMessage(id, method, params || []));
+    this.sendWireMessage(
+      this.mode === 'raw'
+        ? formatRawCallMessage(id, method, params || [])
+        : formatCallMessage(id, method, params || []),
+    );
   }
 
   onNotification(cb: (method: string, params: any[]) => void): () => void {
@@ -121,5 +122,90 @@ export class RPCClient {
         listener(method, params);
       }
     }
+  }
+
+  private sendWireMessage(message: string | RawWireMessage) {
+    const ctx = {};
+    if (this.mode === 'raw') {
+      const output = this.transport.encode
+        ? this.transport.encode(message, ctx as never)
+        : message;
+      (this.transport as RawTransport).send(output, ctx as never);
+      return;
+    }
+
+    const output = this.transport.encode
+      ? this.transport.encode(message, ctx as never)
+      : (typeof message === 'string' ? message : JSON.stringify(message));
+    (this.transport as StringTransport).send(String(output), ctx as never);
+  }
+
+  private readIncomingMessage(
+    data: unknown,
+    context: unknown,
+  ):
+    | {type: 'call'; id: number; method: string; params: any[]}
+    | {type: 'notification'; method: string; params: any[]}
+    | {type: 'result'; id: number; value: any}
+    | {type: 'error'; id: number; value: any}
+    | null {
+    const ctx = (context ?? {}) as never;
+    const decoded = this.transport.decode
+      ? this.transport.decode(data as never, ctx)
+      : data;
+
+    if (this.mode === 'raw') {
+      if (!decoded || typeof decoded !== 'object') return null;
+      const wire = decoded as RawWireMessage;
+
+      switch (wire.type) {
+        case 'call':
+          return {
+            type: 'call',
+            id: wire.id,
+            method: wire.method,
+            params: (wire.params ?? []) as any[],
+          };
+        case 'notification':
+          return {
+            type: 'notification',
+            method: wire.method,
+            params: (wire.params ?? []) as any[],
+          };
+        case 'result':
+          return {type: 'result', id: wire.id, value: wire.value};
+        case 'error':
+          return {type: 'error', id: wire.id, value: wire.value};
+        default:
+          return null;
+      }
+    }
+
+    const text = typeof decoded === 'string' ? decoded : String(decoded);
+    const parsed = parseWireMessage(text);
+    if (!parsed) return null;
+
+    if (parsed.type === 'result' || parsed.type === 'error') {
+      return {
+        type: parsed.type,
+        id: parsed.id,
+        value: parseWireValue(parsed.payload),
+      };
+    }
+
+    if (parsed.type === 'call') {
+      return {
+        type: 'call',
+        id: parsed.id,
+        method: parsed.method,
+        params: parseWireParams(parsed.payload),
+      };
+    }
+
+    return {
+      type: 'notification',
+      method: parsed.method,
+      params: parseWireParams(parsed.payload),
+    };
   }
 }

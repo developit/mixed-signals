@@ -5,12 +5,16 @@ import type {Transport} from '../shared/protocol.ts';
  * Messages sent on one end are delivered to the other via queueMicrotask.
  */
 export function createMemoryTransportPair(): [Transport, Transport] {
-  let handlerA: ((data: {toString(): string}) => void) | undefined;
-  let handlerB: ((data: {toString(): string}) => void) | undefined;
+  let handlerA:
+    | ((data: string, ctx?: any) => void | Promise<void>)
+    | undefined;
+  let handlerB:
+    | ((data: string, ctx?: any) => void | Promise<void>)
+    | undefined;
 
   const a: Transport = {
     send(data: string) {
-      queueMicrotask(() => handlerB?.({toString: () => data}));
+      queueMicrotask(() => handlerB?.(data));
     },
     onMessage(cb) {
       handlerA = cb;
@@ -20,7 +24,7 @@ export function createMemoryTransportPair(): [Transport, Transport] {
 
   const b: Transport = {
     send(data: string) {
-      queueMicrotask(() => handlerA?.({toString: () => data}));
+      queueMicrotask(() => handlerA?.(data));
     },
     onMessage(cb) {
       handlerB = cb;

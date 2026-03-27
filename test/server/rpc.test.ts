@@ -4,30 +4,47 @@ import {RPC} from '../../server/rpc.ts';
 import {
   formatCallMessage,
   formatNotificationMessage,
+  type RawTransport,
+  type RawWireMessage,
   parseWireMessage,
   parseWireParams,
   parseWireValue,
   ROOT_NOTIFICATION_METHOD,
   SIGNAL_UPDATE_METHOD,
-  type Transport,
+  type StringTransport,
   UNWATCH_SIGNALS_METHOD,
   WATCH_SIGNALS_METHOD,
 } from '../../shared/protocol.ts';
 import {Counter} from '../helpers.ts';
 
-type MessageHandler = (data: {toString(): string}) => void | Promise<void>;
+type MessageHandler = (data: string) => void | Promise<void>;
 
-class FakeTransport implements Transport {
+class FakeTransport implements StringTransport {
   sent: string[] = [];
   private handler?: MessageHandler;
   send(data: string) {
     this.sent.push(data);
   }
-  onMessage(cb: (data: {toString(): string}) => void) {
+  onMessage(cb: (data: string) => void) {
     this.handler = cb;
   }
   async emit(data: string) {
-    await this.handler?.({toString: () => data});
+    await this.handler?.(data);
+  }
+}
+
+class RawFakeTransport implements RawTransport {
+  mode = 'raw' as const;
+  sent: RawWireMessage[] = [];
+  private handler?: (data: RawWireMessage) => void | Promise<void>;
+  send(data: RawWireMessage) {
+    this.sent.push(data);
+  }
+  onMessage(cb: (data: RawWireMessage) => void | Promise<void>) {
+    this.handler = cb;
+  }
+  async emit(data: RawWireMessage) {
+    await this.handler?.(data);
   }
 }
 
@@ -60,6 +77,18 @@ describe('RPC', () => {
     const root = new Counter();
     rpc.expose(root);
     expect(rpc.instances.get('0')).toBe(root);
+  });
+
+  it('supports raw transport payloads', () => {
+    const rpc = new RPC({count: signal(1)});
+    const transport = new RawFakeTransport();
+    rpc.addClient(transport);
+
+    expect(transport.sent[0]).toMatchObject({
+      type: 'notification',
+      method: ROOT_NOTIFICATION_METHOD,
+      params: [{count: {'@S': expect.any(Number), v: 1}}],
+    });
   });
 
   it('sends serialized root to client on addClient', () => {

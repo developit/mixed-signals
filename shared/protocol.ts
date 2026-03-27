@@ -1,13 +1,69 @@
-export interface Transport {
-  send(data: string): void;
-  onMessage(cb: (data: {toString(): string}) => void): void;
+export interface TransportContext {
+  transfer?: Transferable[];
+  [key: string]: unknown;
+}
+
+export type TransportUnsubscribe = () => void;
+
+interface BaseTransport<Outgoing, Incoming = Outgoing, Ctx = TransportContext> {
+  send(data: Outgoing, ctx?: Ctx): void;
+  onMessage(
+    cb: (data: Incoming, ctx?: Ctx) => void | Promise<void>,
+  ): TransportUnsubscribe | void;
+  encode?: (data: unknown, ctx: Ctx) => Outgoing;
+  decode?: (data: Incoming, ctx: Ctx) => unknown;
   ready?: Promise<void>;
 }
+
+export interface StringTransport<Ctx = TransportContext>
+  extends BaseTransport<string, string, Ctx> {
+  mode?: 'string' | undefined;
+}
+
+export interface RawTransport<Ctx = TransportContext>
+  extends BaseTransport<unknown, unknown, Ctx> {
+  mode: 'raw';
+}
+
+export type Transport<Ctx = TransportContext> =
+  | StringTransport<Ctx>
+  | RawTransport<Ctx>;
 
 export const ROOT_NOTIFICATION_METHOD = '@R';
 export const SIGNAL_UPDATE_METHOD = '@S';
 export const WATCH_SIGNALS_METHOD = '@W';
 export const UNWATCH_SIGNALS_METHOD = '@U';
+
+type RawCallMessage = {
+  type: 'call';
+  id: number;
+  method: string;
+  params: unknown[];
+};
+
+type RawNotificationMessage = {
+  type: 'notification';
+  method: string;
+  params: unknown[];
+};
+
+type RawResultMessage = {
+  type: 'result';
+  id: number;
+  value: unknown;
+};
+
+type RawErrorMessage = {
+  type: 'error';
+  id: number;
+  value: unknown;
+};
+
+export type RawWireMessage =
+  | RawCallMessage
+  | RawNotificationMessage
+  | RawResultMessage
+  | RawErrorMessage;
 
 type ParsedCallMessage = {
   type: 'call';
@@ -140,4 +196,27 @@ export function formatResultMessage(id: number, result: unknown): string {
 
 export function formatErrorMessage(id: number, error: unknown): string {
   return `E${id}:${JSON.stringify(error)}`;
+}
+
+export function formatRawCallMessage(
+  id: number,
+  method: string,
+  params: readonly unknown[] = [],
+): RawWireMessage {
+  return {type: 'call', id, method, params: params.slice() as unknown[]};
+}
+
+export function formatRawNotificationMessage(
+  method: string,
+  params: readonly unknown[] = [],
+): RawWireMessage {
+  return {type: 'notification', method, params: params.slice() as unknown[]};
+}
+
+export function formatRawResultMessage(id: number, value: unknown): RawWireMessage {
+  return {type: 'result', id, value};
+}
+
+export function formatRawErrorMessage(id: number, value: unknown): RawWireMessage {
+  return {type: 'error', id, value};
 }

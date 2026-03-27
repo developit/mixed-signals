@@ -1,6 +1,8 @@
 import {Signal} from '@preact/signals-core';
 import {
   formatNotificationMessage,
+  formatRawNotificationMessage,
+  type RawWireMessage,
   SIGNAL_UPDATE_METHOD,
 } from '../shared/protocol.ts';
 import type {Instances} from './instances.ts';
@@ -10,7 +12,8 @@ type ClientId = string;
 type DeltaMode = 'append' | 'merge';
 
 interface RpcSender {
-  send(clientId: string, message: string): void;
+  send(clientId: string, message: string | RawWireMessage): void;
+  isRawClient(clientId: string): boolean;
 }
 
 type ModelConstructor =
@@ -99,7 +102,17 @@ export class Reflection {
         this.watch(clientId, id);
       }
 
-      return {'@S': id, v: this.serializeValue(signalValue, clientId)};
+      const marker: Record<string, any> = {
+        '@S': id,
+        v: this.serializeValue(signalValue, clientId),
+      };
+      Object.defineProperty(marker, 'ref', {
+        value,
+        enumerable: false,
+        configurable: true,
+        writable: true,
+      });
+      return marker;
     }
 
     if (this.isModel(value)) {
@@ -126,6 +139,12 @@ export class Reflection {
       }
 
       const branded: Record<string, any> = {'@M': marker};
+      Object.defineProperty(branded, 'ref', {
+        value,
+        enumerable: false,
+        configurable: true,
+        writable: true,
+      });
       for (const [key, prop] of Object.entries(value)) {
         if (key.startsWith('_')) continue;
 
@@ -163,9 +182,13 @@ export class Reflection {
   }
 
   serialize(value: any, clientId?: ClientId): any {
+    return this.serializeForTransport(value, clientId, false);
+  }
+
+  serializeForTransport(value: any, clientId: ClientId | undefined, raw: boolean): any {
     const serialized = this.serializeValue(value, clientId);
     if (serialized === undefined) return null;
-
+    if (raw) return serialized;
     return JSON.parse(JSON.stringify(serialized));
   }
 
@@ -221,14 +244,20 @@ export class Reflection {
       const update = this.computeDelta(lastValue, newValue);
       if (!update) continue;
 
-      const serializedValue = this.serialize(update.value, clientId);
+      const serializedValue = this.serializeForTransport(
+        update.value,
+        clientId,
+        this.rpc.isRawClient(clientId),
+      );
       const params = update.mode
         ? [signalId, serializedValue, update.mode]
         : [signalId, serializedValue];
 
       this.rpc.send(
         clientId,
-        formatNotificationMessage(SIGNAL_UPDATE_METHOD, params),
+        this.rpc.isRawClient(clientId)
+          ? formatRawNotificationMessage(SIGNAL_UPDATE_METHOD, params)
+          : formatNotificationMessage(SIGNAL_UPDATE_METHOD, params),
       );
       this.lastSentValues.set(`${clientId}:${signalId}`, newValue);
     }
