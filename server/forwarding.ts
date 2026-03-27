@@ -7,7 +7,7 @@ import {
   parseWireParams,
   ROOT_NOTIFICATION_METHOD,
   SIGNAL_UPDATE_METHOD,
-  type Transport,
+  type StringTransport,
   UNWATCH_SIGNALS_METHOD,
   WATCH_SIGNALS_METHOD,
 } from '../shared/protocol.ts';
@@ -110,7 +110,7 @@ interface UpstreamHost {
  */
 export class ForwardedUpstream {
   readonly prefix: string;
-  private transport: Transport;
+  private transport: StringTransport;
   private host: UpstreamHost;
   private disposed = false;
 
@@ -127,7 +127,7 @@ export class ForwardedUpstream {
   /** The single downstream client ID using this upstream (1:1 per-browser mapping). */
   private clientId: string | undefined;
 
-  constructor(prefix: string, transport: Transport, host: UpstreamHost) {
+  constructor(prefix: string, transport: StringTransport, host: UpstreamHost) {
     this.prefix = prefix;
     this.transport = transport;
     this.host = host;
@@ -136,7 +136,7 @@ export class ForwardedUpstream {
     });
 
     transport.onMessage((data) => {
-      this.handleUpstreamMessage(data.toString());
+      this.handleUpstreamMessage(data);
     });
   }
 

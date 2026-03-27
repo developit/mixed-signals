@@ -1,10 +1,17 @@
 import {
   formatErrorMessage,
   formatNotificationMessage,
+  formatRawErrorMessage,
+  formatRawNotificationMessage,
+  formatRawResultMessage,
   formatResultMessage,
   parseWireMessage,
   parseWireParams,
+  parseWireValue,
   ROOT_NOTIFICATION_METHOD,
+  type RawTransport,
+  type RawWireMessage,
+  type StringTransport,
   type Transport,
   UNWATCH_SIGNALS_METHOD,
   WATCH_SIGNALS_METHOD,
@@ -40,6 +47,7 @@ export class RPC {
   /** Registered upstream connections for model forwarding. */
   private upstreams = new Map<string, ForwardedUpstream>();
   private nextUpstreamPrefix = 1;
+  private clientModes = new Map<string, 'string' | 'raw'>();
 
   constructor(root?: any) {
     this.instances = new Instances();
@@ -64,7 +72,7 @@ export class RPC {
    * to downstream clients. All models from the upstream are automatically
    * forwarded — no per-model declaration needed.
    */
-  addUpstream(transport: Transport): () => void {
+  addUpstream(transport: StringTransport): () => void {
     const prefix = String(this.nextUpstreamPrefix++);
     const upstream = new ForwardedUpstream(prefix, transport, this);
     this.upstreams.set(prefix, upstream);
@@ -77,27 +85,28 @@ export class RPC {
 
   addClient(transport: Transport, clientId?: string): () => void {
     const id = clientId ?? crypto.randomUUID();
+    const mode = transport.mode === 'raw' ? 'raw' : 'string';
     this.clients.set(id, transport);
+    this.clientModes.set(id, mode);
 
     // Bind this client to any upstream connections
     for (const upstream of this.upstreams.values()) {
       upstream.setClient(id);
     }
 
-    transport.onMessage(async (data) => {
+    transport.onMessage(async (data, messageCtx) => {
       try {
-        const raw = data.toString();
+        const incoming = this.readIncomingMessage(transport, data, messageCtx);
+        if (!incoming) return;
 
         // Try forwarding first — if the message targets an upstream, handle it there.
-        if (this.tryForwardClientMessage(id, raw)) return;
+        if (this.tryForwardClientMessage(id, incoming)) return;
 
-        const message = parseWireMessage(raw);
-        if (!message || message.type === 'result' || message.type === 'error')
+        if (incoming.type === 'result' || incoming.type === 'error')
           return;
 
-        const params = parseWireParams(message.payload);
-        const messageId = message.type === 'call' ? message.id : undefined;
-        await this.handleMessage(id, messageId, message.method, params);
+        const messageId = incoming.type === 'call' ? incoming.id : undefined;
+        await this.handleMessage(id, messageId, incoming.method, incoming.params);
       } catch (err: any) {
         console.error('Failed to handle message:', err);
       }
@@ -112,6 +121,7 @@ export class RPC {
 
     return () => {
       this.clients.delete(id);
+      this.clientModes.delete(id);
       this.reflection.removeClient(id);
       for (const upstream of this.upstreams.values()) {
         upstream.removeClient(id);
@@ -140,9 +150,10 @@ export class RPC {
   }
 
   private broadcastMergedRoot(clientId: string) {
+    const raw = this.isRawClient(clientId);
     const localRoot =
       this.root !== undefined
-        ? this.reflection.serialize(this.root, clientId)
+        ? this.reflection.serializeForTransport(this.root, clientId, raw)
         : undefined;
     this.sendMergedRoot(clientId, localRoot);
   }
@@ -166,7 +177,9 @@ export class RPC {
     if (merged !== undefined) {
       this.send(
         clientId,
-        formatNotificationMessage(ROOT_NOTIFICATION_METHOD, [merged]),
+        this.isRawClient(clientId)
+          ? formatRawNotificationMessage(ROOT_NOTIFICATION_METHOD, [merged])
+          : formatNotificationMessage(ROOT_NOTIFICATION_METHOD, [merged]),
       );
     }
   }
@@ -175,9 +188,10 @@ export class RPC {
    * Intercept a client message and forward it to an upstream if it targets
    * forwarded models/signals. Returns true if the message was forwarded.
    */
-  private tryForwardClientMessage(clientId: string, raw: string): boolean {
-    const parsed = parseWireMessage(raw);
-    if (!parsed) return false;
+  private tryForwardClientMessage(
+    clientId: string,
+    parsed: RawWireMessage,
+  ): boolean {
 
     // @W and @U: split signal IDs between local and upstream
     if (
@@ -185,7 +199,7 @@ export class RPC {
       (parsed.method === WATCH_SIGNALS_METHOD ||
         parsed.method === UNWATCH_SIGNALS_METHOD)
     ) {
-      const ids = parseWireParams<(number | string)[]>(parsed.payload);
+      const ids = parsed.params as (number | string)[];
       const localIds: number[] = [];
 
       // Group upstream IDs by prefix
@@ -241,7 +255,7 @@ export class RPC {
             clientId,
             parsed.id,
             `${strippedWireId}#${methodName}`,
-            parsed.payload,
+            this.stringifyParams(parsed.params),
           );
           return true;
         }
@@ -292,7 +306,11 @@ export class RPC {
 
     try {
       const result = await this.callMethod(method, params);
-      const serialized = this.reflection.serialize(result, clientId);
+      const serialized = this.reflection.serializeForTransport(
+        result,
+        clientId,
+        this.isRawClient(clientId),
+      );
 
       if (id !== undefined) {
         this.sendResult(clientId, id, serialized);
@@ -331,30 +349,113 @@ export class RPC {
   }
 
   notify(method: string, params: any[], clientId?: string) {
-    const message = formatNotificationMessage(method, params);
-
     if (clientId) {
-      this.clients.get(clientId)?.send(message);
+      const transport = this.clients.get(clientId);
+      if (!transport) return;
+      const raw = this.isRawClient(clientId);
+      const message = raw
+        ? formatRawNotificationMessage(method, params)
+        : formatNotificationMessage(method, params);
+      this.send(clientId, message);
     } else {
-      for (const transport of this.clients.values()) {
-        transport.send(message);
+      for (const [id] of this.clients.entries()) {
+        const raw = this.isRawClient(id);
+        const message = raw
+          ? formatRawNotificationMessage(method, params)
+          : formatNotificationMessage(method, params);
+        this.send(id, message);
       }
     }
   }
 
   /** @internal */
-  send(clientId: string, message: string) {
+  send(clientId: string, message: string | RawWireMessage) {
     const transport = this.clients.get(clientId);
     if (!transport) return;
+    const ctx = {};
+    if (this.isRawClient(clientId)) {
+      const output = transport.encode ? transport.encode(message, ctx as never) : message;
+      (transport as RawTransport).send(output, ctx as never);
+      return;
+    }
 
-    transport.send(message);
+    const output = transport.encode
+      ? transport.encode(message, ctx as never)
+      : (typeof message === 'string' ? message : JSON.stringify(message));
+    (transport as StringTransport).send(String(output), ctx as never);
+  }
+
+  isRawClient(clientId: string): boolean {
+    return this.clientModes.get(clientId) === 'raw';
   }
 
   private sendResult(clientId: string, id: number, result: any) {
-    this.send(clientId, formatResultMessage(id, result));
+    const transport = this.clients.get(clientId);
+    if (!transport) return;
+    this.send(
+      clientId,
+      this.isRawClient(clientId)
+        ? formatRawResultMessage(id, result)
+        : formatResultMessage(id, result),
+    );
   }
 
   private sendError(clientId: string, id: number, error: any) {
-    this.send(clientId, formatErrorMessage(id, error));
+    const transport = this.clients.get(clientId);
+    if (!transport) return;
+    this.send(
+      clientId,
+      this.isRawClient(clientId)
+        ? formatRawErrorMessage(id, error)
+        : formatErrorMessage(id, error),
+    );
+  }
+
+  private readIncomingMessage(
+    transport: Transport,
+    data: unknown,
+    context: unknown,
+  ): RawWireMessage | null {
+    const ctx = (context ?? {}) as never;
+    const decoded = transport.decode ? transport.decode(data as never, ctx) : data;
+
+    if (transport.mode === 'raw') {
+      if (!decoded || typeof decoded !== 'object') return null;
+      return decoded as RawWireMessage;
+    }
+
+    const text = typeof decoded === 'string' ? decoded : String(decoded);
+    const parsed = parseWireMessage(text);
+    if (!parsed) return null;
+
+    switch (parsed.type) {
+      case 'call':
+        return {
+          type: 'call',
+          id: parsed.id,
+          method: parsed.method,
+          params: parseWireParams(parsed.payload),
+        };
+      case 'notification':
+        return {
+          type: 'notification',
+          method: parsed.method,
+          params: parseWireParams(parsed.payload),
+        };
+      case 'result':
+        return {type: 'result', id: parsed.id, value: parseWireValue(parsed.payload)};
+      case 'error':
+        return {type: 'error', id: parsed.id, value: parseWireValue(parsed.payload)};
+    }
+  }
+
+  private stringifyParams(params: unknown[]): string {
+    if (params.length === 0) return '';
+    let output = '';
+    for (let i = 0; i < params.length; i++) {
+      if (i > 0) output += ',';
+      output += JSON.stringify(params[i]);
+    }
+    return output;
   }
 }

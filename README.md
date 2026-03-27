@@ -112,6 +112,153 @@ rpc.ready.then(() => {
 });
 ```
 
+## Transport: one concept, two modes
+
+`Transport` is the boundary between mixed-signals and your I/O layer (WebSocket, `postMessage`, SSE bridge, worker ports, in-memory queues, etc).
+
+The protocol has exactly two runtime modes:
+
+- **String mode** (`mode` omitted or `mode: "string"`): `send()` and `onMessage()` payloads are `string`.
+- **Raw mode** (`mode: "raw"`): payloads are structured values (`unknown`) so adapters/codecs can avoid forced string serialization.
+
+This keeps the default path tiny and makes advanced transports explicit.
+
+### TypeScript shape
+
+At a high level:
+
+- `Transport` is a discriminated union (`mode`) optimized for consumers.
+- `StringTransport<Ctx>` / `RawTransport<Ctx>` can be parameterized with a context type when you want stronger typing.
+
+`ctx` is an open object passed through `send`, `onMessage`, and optional `encode`/`decode` hooks. A common convention is `ctx.transfer` for transferable objects.
+
+---
+
+### Example 1: default string mode (WebSocket-style)
+
+```ts
+import type { StringTransport } from "mixed-signals/client";
+
+const transport: StringTransport = {
+  // mode omitted => "string" mode
+  send(data) {
+    ws.send(data);
+  },
+  onMessage(cb) {
+    ws.addEventListener("message", (event) => cb(String(event.data)));
+  },
+  ready: new Promise<void>((resolve) => {
+    ws.addEventListener("open", () => resolve(), { once: true });
+  }),
+};
+```
+
+Why this is useful:
+
+- Zero custom codec required.
+- Strong payload typing (`string`) in both directions.
+- Matches browser/server websocket APIs directly.
+
+---
+
+### Example 2: raw mode for structured channels (`postMessage`)
+
+```ts
+import type { RawTransport } from "mixed-signals/client";
+
+const transport: RawTransport = {
+  mode: "raw",
+  send(data, ctx) {
+    target.postMessage(data, { transfer: ctx?.transfer });
+  },
+  onMessage(cb) {
+    const handler = (event: MessageEvent) => cb(event.data);
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  },
+};
+```
+
+Why this is useful:
+
+- Structured payloads stay structured.
+- Natural place to pass transferables.
+- No forced stringify/parse at the transport boundary.
+
+---
+
+### Example 3: implementor-typed context (no helper function required)
+
+Use the generic implementor alias with `implements` or `satisfies`:
+
+```ts
+import type { StringTransport } from "mixed-signals/client";
+
+type WsCtx = {
+  transfer?: Transferable[];
+  traceId?: string;
+};
+
+class WsTransport implements StringTransport<WsCtx> {
+  mode = "string" as const;
+
+  send(data: string, ctx?: WsCtx) {
+    if (ctx?.traceId) {
+      // app-specific tracing/telemetry
+      console.debug("[rpc]", ctx.traceId);
+    }
+    ws.send(data);
+  }
+
+  onMessage(cb: (data: string, ctx?: WsCtx) => void) {
+    ws.addEventListener("message", (event) => cb(String(event.data)));
+  }
+}
+```
+
+Why this matters:
+
+- Consumers still use the simple `Transport` union.
+- Transport implementors can keep typed context without extra wrappers.
+- Works for classes and object literals equally well.
+
+---
+
+### Example 4: transport-local codec hooks
+
+`encode`/`decode` are optional hooks on the transport when the underlying channel format differs from what mixed-signals sends internally.
+
+```ts
+import type { RawTransport } from "mixed-signals/client";
+
+const transport: RawTransport = {
+  mode: "raw",
+  encode(data) {
+    return myBinaryCodec.encode(data); // unknown -> Uint8Array
+  },
+  decode(payload) {
+    return myBinaryCodec.decode(payload); // Uint8Array -> unknown
+  },
+  send(payload) {
+    socket.send(payload as Uint8Array);
+  },
+  onMessage(cb) {
+    socket.onmessage = (event) => cb(event.data);
+  },
+};
+```
+
+Use hooks only when needed. If your channel already matches your payload shape, omit them.
+
+---
+
+### Design guidance
+
+- Start in string mode unless you have a concrete reason not to.
+- Move to raw mode when you need structured payloads, transferables, or non-string codecs.
+- Keep `ctx` stable in hot paths (reuse shape/keys) for best VM optimization behavior.
+- Keep transport logic minimal: channel I/O + optional codec, nothing else.
+
 ## API
 
 _Generated from TypeScript declarations._
@@ -177,4 +324,3 @@ forwarded — no per-model declaration needed.
   - `send(data: string) => void`
 - Properties:
   - `ready: Promise<void>`
-

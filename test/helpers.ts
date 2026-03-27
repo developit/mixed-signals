@@ -5,7 +5,7 @@ import type {Transport} from '../shared/protocol.ts';
 
 export {createMemoryTransportPair} from '../server/memory-transport.ts';
 
-type MessageHandler = (data: {toString(): string}) => void | Promise<void>;
+type MessageHandler = (data: string) => void | Promise<void>;
 
 /**
  * Creates a linked transport pair with an explicit message queue.
@@ -22,7 +22,7 @@ export function createLinkedTransportPair(): {
 
   const enqueue = (key: string, data: string) => {
     queue.push(async () => {
-      await handlers[key]?.({toString: () => data});
+      await handlers[key]?.(data);
     });
   };
 

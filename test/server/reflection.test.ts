@@ -16,6 +16,9 @@ class FakeSender {
   send(clientId: string, message: string) {
     this.sent.push({clientId, message});
   }
+  isRawClient(_clientId: string) {
+    return false;
+  }
 }
 
 function parseUpdate(message: string): [number, unknown, string?] {
