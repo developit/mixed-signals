@@ -29,7 +29,14 @@
     "format": "biome format --write .",
     "check": "biome check --write .",
     "docs:api": "node scripts/generate-readme.mjs",
-    "prepublishOnly": "tsdown && node scripts/generate-readme.mjs"
+    "prepublishOnly": "tsdown && node scripts/generate-readme.mjs",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "release": "changeset publish"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "keywords": [
     "preact",
@@ -51,6 +58,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.2",
+    "@changesets/cli": "^2.29.8",
     "@preact/signals-core": "^1.14.0",
     "tsdown": "^0.20.0",
     "typedoc": "^0.28.13",
