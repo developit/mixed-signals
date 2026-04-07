@@ -69,6 +69,11 @@ export class RPC {
     const upstream = new ForwardedUpstream(prefix, transport, this);
     this.upstreams.set(prefix, upstream);
 
+    // Bind any already-connected clients to the new upstream
+    for (const clientId of this.clients.keys()) {
+      upstream.setClient(clientId);
+    }
+
     return () => {
       upstream.dispose();
       this.upstreams.delete(prefix);

@@ -536,4 +536,62 @@ describe('protocol-level forwarding', () => {
     stopLocal();
     stopRemote();
   });
+
+  it('forwards signal updates when addUpstream() is called after addClient()', async () => {
+    vi.useFakeTimers();
+
+    const {
+      brokerTransport,
+      serverUpstreamTransport,
+      serverDownstreamTransport,
+      browserTransport,
+      flush,
+    } = createLinkedTransports();
+
+    // --- Broker setup ---
+    const brokerRpc = new RPC();
+    brokerRpc.registerModel('BrokerProject', BrokerProject);
+    const project = new BrokerProject('42', 'Initial');
+    brokerRpc.expose({project});
+    brokerRpc.addClient(brokerTransport);
+
+    // --- Server setup: add client FIRST, then upstream ---
+    const serverRpc = new RPC();
+    serverRpc.addClient(serverDownstreamTransport, 'browser-1');
+
+    // --- Browser setup ---
+    const ProjectModel = createReflectedModel<ProjectApi>(
+      ['id', 'name'],
+      ['rename'],
+    );
+    let browser!: RPCClient;
+    const ctx = {
+      rpc: {call: (m, p) => browser.call(m, p)} satisfies Partial<RPCClient>,
+    } as WireContext;
+    browser = new RPCClient(browserTransport, ctx);
+    browser.registerModel('BrokerProject', ProjectModel);
+
+    // Now add upstream AFTER client is already connected
+    serverRpc.addUpstream(serverUpstreamTransport);
+
+    // Flush to deliver @R from broker → server → browser
+    await flush();
+    await browser.ready;
+
+    expect(browser.root.project).toBeDefined();
+    expect(browser.root.project.name.value).toBe('Initial');
+
+    // Subscribe to signals
+    const stopName = browser.root.project.name.subscribe(() => {});
+    vi.advanceTimersByTime(1);
+    await flush();
+
+    // Signal update should be forwarded even though upstream was added after client
+    project.name.value = 'Updated';
+    await flush();
+
+    expect(browser.root.project.name.value).toBe('Updated');
+
+    stopName();
+  });
 });
