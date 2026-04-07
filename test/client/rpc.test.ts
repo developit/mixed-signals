@@ -147,6 +147,24 @@ describe('RPCClient', () => {
       client.notify('ping');
       expect(transport.sent[0]).toBe('N:ping:');
     });
+
+    it('waits for transport.ready before sending', async () => {
+      let resolveReady!: () => void;
+      const ready = new Promise<void>((r) => {
+        resolveReady = r;
+      });
+      const transport = new FakeTransport(ready);
+      const client = new RPCClient(transport, createContext());
+      client.notify('ping', [1]);
+      // Not sent yet — transport not ready
+      expect(transport.sent).toHaveLength(0);
+      resolveReady();
+      await ready;
+      // Flush microtask (.then callback)
+      await new Promise((r) => setTimeout(r, 0));
+      expect(transport.sent).toHaveLength(1);
+      expect(transport.sent[0]).toBe('N:ping:1');
+    });
   });
 
   describe('handleNotification', () => {
@@ -222,6 +240,101 @@ describe('RPCClient', () => {
       transport.emit('N:test2:');
       expect(received).toHaveLength(1);
       expect(received[0].method).toBe('test1');
+    });
+  });
+
+  describe('reconnect', () => {
+    it('rejects in-flight RPCs with reconnection error', async () => {
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+
+      const pending = client.call('slow', []);
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+
+      await expect(pending).rejects.toThrow('Transport reconnected');
+    });
+
+    it('resets the ready gate until new @R arrives', async () => {
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+      transport1.emit('N:@R:{"v":1}');
+      await client.ready;
+
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+
+      let resolved = false;
+      client.ready.then(() => {
+        resolved = true;
+      });
+      await new Promise((r) => setTimeout(r, 10));
+      expect(resolved).toBe(false);
+
+      // New @R on new transport resolves ready
+      transport2.emit('N:@R:{"v":2}');
+      await client.ready;
+      expect(client.root).toEqual({v: 2});
+    });
+
+    it('uses the new transport for subsequent calls', async () => {
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+
+      const pending = client.call('ping', []);
+      transport2.emit('R1:"pong"');
+      expect(await pending).toBe('pong');
+
+      // Call went to transport2, not transport1
+      expect(transport2.sent).toHaveLength(1);
+      expect(transport2.sent[0]).toMatch(/^M\d+:ping:/);
+    });
+
+    it('clears reflection state so new signals are created fresh', () => {
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+
+      const oldSig = client.reflection.getOrCreateSignal(1, 'old');
+      expect(oldSig.peek()).toBe('old');
+
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+
+      // Same ID but should get a new signal instance
+      const newSig = client.reflection.getOrCreateSignal(1, 'fresh');
+      expect(newSig).not.toBe(oldSig);
+      expect(newSig.peek()).toBe('fresh');
+    });
+
+    it('processes messages on the new transport', () => {
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+
+      // Signal update via new transport
+      const sig = client.reflection.getOrCreateSignal(5, 'init');
+      transport2.emit('N:@S:5,"updated"');
+      expect(sig.peek()).toBe('updated');
+    });
+
+    it('preserves model registry across reconnect', () => {
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+      client.registerModel('Counter', ReflectedCounter);
+
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+
+      // Model type should still be registered
+      transport2.emit(
+        'N:@R:{"@M":"Counter#1","count":{"@S":1,"v":0},"name":{"@S":2,"v":"x"},"items":{"@S":3,"v":[]},"meta":{"@S":4,"v":{}}}',
+      );
+      expect(client.root.id.peek()).toBe('1');
     });
   });
 });

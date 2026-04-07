@@ -273,6 +273,51 @@ describe('ClientReflection', () => {
     });
   });
 
+  describe('reset', () => {
+    it('clears signals so new ones are created fresh', () => {
+      const {reflection} = setup();
+      const sig1 = reflection.getOrCreateSignal(1, 'old');
+      reflection.reset();
+      const sig2 = reflection.getOrCreateSignal(1, 'new');
+      expect(sig2).not.toBe(sig1);
+      expect(sig2.peek()).toBe('new');
+    });
+
+    it('clears model facade cache', () => {
+      const {reflection} = setup();
+      reflection.registerModel('Task', TaskModel);
+
+      const facade1 = reflection.createModelFacade({'@M': 'Task#1', x: 1});
+      reflection.reset();
+      const facade2 = reflection.createModelFacade({'@M': 'Task#1', x: 2});
+      expect(facade2).not.toBe(facade1);
+    });
+
+    it('preserves model registry', () => {
+      const {reflection} = setup();
+      reflection.registerModel('Task', TaskModel);
+      reflection.reset();
+      // Should still be able to create facades for registered types
+      const facade = reflection.createModelFacade({'@M': 'Task#1'});
+      expect(facade).toBeInstanceOf(TaskModel);
+    });
+
+    it('cancels pending watch/unwatch timers', () => {
+      vi.useFakeTimers();
+      const {reflection, notify} = setup();
+
+      const sig = reflection.getOrCreateSignal(1, 'val');
+      sig.subscribe(() => {});
+      // Watch is pending (1ms timer not yet fired)
+
+      reflection.reset();
+
+      vi.advanceTimersByTime(10);
+      // The pending watch timer should have been cancelled
+      expect(notify).not.toHaveBeenCalled();
+    });
+  });
+
   describe('handleUpdate', () => {
     it('applies append, merge, splice, and replacement updates', () => {
       const {reflection} = setup();

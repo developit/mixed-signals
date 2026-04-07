@@ -26,6 +26,22 @@ export class ClientReflection {
     this.ctx = ctx && ctx.rpc === rpc ? ctx : {rpc};
   }
 
+  /** Clear cached signals and model facades so a reconnection gets fresh state. */
+  reset() {
+    this.signals.clear();
+    this.models.clear();
+    this.watchBatch.clear();
+    this.unwatchBatch.clear();
+    if (this.watchFlushTimer) {
+      clearTimeout(this.watchFlushTimer);
+      this.watchFlushTimer = null;
+    }
+    if (this.unwatchFlushTimer) {
+      clearTimeout(this.unwatchFlushTimer);
+      this.unwatchFlushTimer = null;
+    }
+  }
+
   registerModel(typeName: string, ctor: any) {
     this.modelRegistry.set(typeName, ctor);
   }

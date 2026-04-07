@@ -34,7 +34,35 @@ export class RPCClient {
       this._resolveReady = resolve;
     });
     this.reflection = new ClientReflection(this, ctx);
+    this.wireTransport(transport);
+  }
 
+  /**
+   * Replace the transport and reset internal state for a reconnection.
+   * A new `ready` promise is created that resolves on the next `@R` message.
+   */
+  reconnect(transport: Transport) {
+    this.transport = transport;
+    this.transportReady = transport.ready;
+
+    // Reject all in-flight RPCs
+    for (const {reject} of this.pending.values()) {
+      reject(new Error('Transport reconnected'));
+    }
+    this.pending.clear();
+
+    // Clear reflection caches so the fresh @R rebuilds everything
+    this.reflection.reset();
+
+    // Fresh ready gate
+    this.ready = new Promise((resolve) => {
+      this._resolveReady = resolve;
+    });
+
+    this.wireTransport(transport);
+  }
+
+  private wireTransport(transport: Transport) {
     transport.onMessage((data) => {
       const message = parseWireMessage(data.toString());
       if (!message) return;
@@ -88,7 +116,12 @@ export class RPCClient {
   }
 
   notify(method: string, params?: any[]) {
-    this.transport.send(formatNotificationMessage(method, params));
+    const message = formatNotificationMessage(method, params);
+    if (this.transportReady) {
+      this.transportReady.then(() => this.transport.send(message));
+    } else {
+      this.transport.send(message);
+    }
   }
 
   private sendCall(
