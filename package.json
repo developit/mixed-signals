@@ -1,6 +1,6 @@
 {
   "name": "mixed-signals",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "RPC Reflection for Preact Models & Signals: use Models/Signals from a somewhere else (server/worker/etc) as if they were here.",
   "type": "module",
   "exports": {
