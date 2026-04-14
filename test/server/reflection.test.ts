@@ -247,6 +247,74 @@ describe('Reflection', () => {
       expect(reflection.serialize([1, 2])).toEqual([1, 2]);
     });
 
+    it('preserves Date objects through serialization', () => {
+      const date = new Date('2025-01-15T12:00:00.000Z');
+      expect(reflection.serialize(date)).toEqual(new Date('2025-01-15T12:00:00.000Z'));
+      expect(reflection.serialize(date)).toBeInstanceOf(Date);
+      expect(reflection.serialize({createdAt: date})).toEqual({
+        createdAt: new Date('2025-01-15T12:00:00.000Z'),
+      });
+
+      const s = signal(date);
+      const wrapper = {s};
+      const serialized = reflection.serialize(wrapper);
+      expect(serialized.s.v).toEqual(new Date('2025-01-15T12:00:00.000Z'));
+      expect(serialized.s.v).toBeInstanceOf(Date);
+    });
+
+    it('preserves Uint8Array through serialization', () => {
+      const bytes = new Uint8Array([1, 2, 3]);
+      const result = reflection.serialize(bytes);
+      expect(result).toBeInstanceOf(Uint8Array);
+      expect(result).toEqual(new Uint8Array([1, 2, 3]));
+
+      expect(reflection.serialize({data: bytes})).toEqual({
+        data: new Uint8Array([1, 2, 3]),
+      });
+
+      const s = signal(bytes);
+      const wrapper = {s};
+      const serialized = reflection.serialize(wrapper);
+      expect(serialized.s.v).toBeInstanceOf(Uint8Array);
+      expect(serialized.s.v).toEqual(new Uint8Array([1, 2, 3]));
+    });
+
+    it('preserves BigInt through serialization', () => {
+      expect(reflection.serialize(42n)).toBe(42n);
+      expect(reflection.serialize({id: 42n})).toEqual({id: 42n});
+
+      const s = signal(42n);
+      const wrapper = {s};
+      const serialized = reflection.serialize(wrapper);
+      expect(serialized.s.v).toBe(42n);
+    });
+
+    it('preserves Date and Uint8Array nested in arrays and objects', () => {
+      const date = new Date('2025-01-15T12:00:00.000Z');
+      const bytes = new Uint8Array([0x48, 0x65]);
+
+      const nested = {
+        items: [date, bytes],
+        deep: {d: date, b: bytes},
+      };
+      const result = reflection.serialize(nested);
+
+      expect(result.items[0]).toBeInstanceOf(Date);
+      expect(result.items[1]).toBeInstanceOf(Uint8Array);
+      expect(result.deep.d).toBeInstanceOf(Date);
+      expect(result.deep.b).toBeInstanceOf(Uint8Array);
+    });
+
+    it('throws on unsupported types (Map, Set, RegExp)', () => {
+      expect(() => reflection.serialize(new Map())).toThrow();
+      expect(() => reflection.serialize(new Set())).toThrow();
+      expect(() => reflection.serialize(/foo/)).toThrow();
+      expect(() => reflection.serialize({data: new Map()})).toThrow();
+      expect(() =>
+        reflection.serialize({items: [new Set([1, 2])]}),
+      ).toThrow();
+    });
+
     it('skips rpc, reflection, and instances references', () => {
       reflection.registerModel('Counter', Counter);
       const c = new Counter();

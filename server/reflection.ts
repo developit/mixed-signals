@@ -2,6 +2,8 @@ import {Signal} from '@preact/signals-core';
 import {
   formatNotificationMessage,
   SIGNAL_UPDATE_METHOD,
+  uint8ArrayToBase64,
+  wireReviver,
 } from '../shared/protocol.ts';
 import type {Instances} from './instances.ts';
 
@@ -138,6 +140,10 @@ export class Reflection {
       return branded;
     }
 
+    if (value instanceof Date) return {'@D': value.getTime()};
+    if (value instanceof Uint8Array)
+      return {'@B': uint8ArrayToBase64(value)};
+
     if (Array.isArray(value)) {
       return value.map((item) => {
         const serializedItem = this.serializeValue(item, clientId);
@@ -145,7 +151,23 @@ export class Reflection {
       });
     }
 
+    if (typeof value === 'bigint') return {'@n': value.toString()};
+
     if (value && typeof value === 'object') {
+      if (
+        value instanceof Map ||
+        value instanceof Set ||
+        value instanceof RegExp ||
+        value instanceof WeakMap ||
+        value instanceof WeakSet ||
+        value instanceof Promise
+      ) {
+        const name = value.constructor?.name ?? typeof value;
+        throw new Error(
+          `Cannot serialize ${name}: only plain objects, Arrays, Date, Uint8Array, and BigInt are supported`,
+        );
+      }
+
       const serialized: Record<string, any> = {};
       for (const [key, prop] of Object.entries(value)) {
         if (key.startsWith('_')) continue;
@@ -166,7 +188,7 @@ export class Reflection {
     const serialized = this.serializeValue(value, clientId);
     if (serialized === undefined) return null;
 
-    return JSON.parse(JSON.stringify(serialized));
+    return JSON.parse(JSON.stringify(serialized), wireReviver);
   }
 
   watch(clientId: ClientId, signalId: SignalId) {
@@ -238,11 +260,24 @@ export class Reflection {
    * Compute the delta between the last-sent value and the new value.
    * Returns null if the values are shallow-equal (no update needed).
    */
+  private isAtomicValue(value: any): boolean {
+    return (
+      value instanceof Date ||
+      value instanceof Uint8Array ||
+      typeof value === 'bigint'
+    );
+  }
+
   private computeDelta(
     oldValue: any,
     newValue: any,
   ): {value: any; mode?: DeltaMode} | null {
     if (oldValue === undefined) return {value: newValue};
+
+    // Date, Uint8Array, BigInt are atomic — always send full replacement.
+    if (this.isAtomicValue(newValue) || this.isAtomicValue(oldValue)) {
+      return {value: newValue};
+    }
 
     if (Array.isArray(oldValue) && Array.isArray(newValue)) {
       if (
