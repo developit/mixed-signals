@@ -1,4 +1,5 @@
 import {
+  base64ToUint8Array,
   formatCallMessage,
   formatNotificationMessage,
   parseWireMessage,
@@ -76,6 +77,10 @@ export class RPCClient {
           if ('@M' in val) {
             return this.reflection.createModelFacade(val);
           }
+
+          if ('@D' in val) return new Date(val['@D']);
+          if ('@B' in val) return base64ToUint8Array(val['@B']);
+          if ('@n' in val) return BigInt(val['@n']);
         }
 
         return val;
