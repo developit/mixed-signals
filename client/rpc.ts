@@ -1,6 +1,11 @@
+import {BRAND_REMOTE, type RemoteBrand} from '../shared/brand.ts';
+import {Hydrator} from '../shared/hydrate.ts';
 import {
   formatCallMessage,
   formatNotificationMessage,
+  HANDLE_MARKER,
+  PROMISE_REJECT_METHOD,
+  PROMISE_RESOLVE_METHOD,
   parseWireMessage,
   parseWireParams,
   parseWireValue,
@@ -10,55 +15,76 @@ import {
 } from '../shared/protocol.ts';
 import {ClientReflection} from './reflection.ts';
 
+/**
+ * JSON.stringify replacer used for client → server values. Detects branded
+ * remote Proxies / Signals / functions and re-emits them as bare `@H` markers
+ * so the server resolves them back to the original object by id.
+ *
+ * The brand is a non-enumerable own symbol, so JSON.stringify's default walk
+ * would miss it — we explicitly check each visited value.
+ */
+function outboundReplacer(_key: string, value: unknown): unknown {
+  if (value === null || value === undefined) return value;
+  const t = typeof value;
+  if (t !== 'object' && t !== 'function') return value;
+  const brand = (value as any)[BRAND_REMOTE] as RemoteBrand | undefined;
+  if (brand) return {[HANDLE_MARKER]: brand.id};
+  return value;
+}
+
+/**
+ * Client-side RPC hub.
+ *
+ * No model registration is required. Every incoming value is hydrated
+ * automatically — Models and plain objects become `Proxy`s, functions become
+ * callable proxies, promises become live `Promise`s, signals become real
+ * `Signal`s wired to the watch/unwatch protocol.
+ */
 export class RPCClient {
   private transport: Transport;
   private nextId = 1;
   private pending = new Map<
     number,
-    {resolve: (v: any) => void; reject: (e: any) => void}
+    {resolve(v: any): void; reject(e: any): void}
   >();
   private notificationListeners = new Set<
     (method: string, params: any[]) => void
   >();
+
   /** @internal */
   reflection: ClientReflection;
+  /** @internal */
+  hydrator: Hydrator;
+
   private transportReady: Promise<void> | undefined;
   root: any = undefined;
   ready: Promise<void>;
   private _resolveReady!: () => void;
 
-  constructor(transport: Transport, ctx?: any) {
+  constructor(transport: Transport, _ctx?: any) {
     this.transport = transport;
     this.transportReady = transport.ready;
     this.ready = new Promise((resolve) => {
       this._resolveReady = resolve;
     });
-    this.reflection = new ClientReflection(this, ctx);
+    this.reflection = new ClientReflection(this);
+    this.hydrator = new Hydrator(this.reflection);
+    this.reflection.setHydrator(this.hydrator);
     this.wireTransport(transport);
   }
 
-  /**
-   * Replace the transport and reset internal state for a reconnection.
-   * A new `ready` promise is created that resolves on the next `@R` message.
-   */
   reconnect(transport: Transport) {
     this.transport = transport;
     this.transportReady = transport.ready;
-
-    // Reject all in-flight RPCs
     for (const {reject} of this.pending.values()) {
       reject(new Error('Transport reconnected'));
     }
     this.pending.clear();
-
-    // Clear reflection caches so the fresh @R rebuilds everything
     this.reflection.reset();
-
-    // Fresh ready gate
+    this.hydrator.reset();
     this.ready = new Promise((resolve) => {
       this._resolveReady = resolve;
     });
-
     this.wireTransport(transport);
   }
 
@@ -66,37 +92,17 @@ export class RPCClient {
     transport.onMessage((data) => {
       const message = parseWireMessage(data.toString());
       if (!message) return;
-
-      const reviver = (_key: string, val: any) => {
-        if (typeof val === 'object' && val) {
-          if ('@S' in val) {
-            return this.reflection.getOrCreateSignal(val['@S'], val.v);
-          }
-
-          if ('@M' in val) {
-            return this.reflection.createModelFacade(val);
-          }
-        }
-
-        return val;
-      };
+      const reviver = this.hydrator.reviver;
 
       if (message.type === 'result' || message.type === 'error') {
         const parsed = parseWireValue(message.payload, reviver);
         const pending = this.pending.get(message.id);
         if (!pending) return;
-
         this.pending.delete(message.id);
-
-        if (message.type === 'result') {
-          pending.resolve(parsed);
-          return;
-        }
-
-        pending.reject(new Error((parsed as {message?: string}).message));
+        if (message.type === 'result') pending.resolve(parsed);
+        else pending.reject(new Error((parsed as {message?: string}).message));
         return;
       }
-
       if (message.type === 'call') return;
 
       const params = parseWireParams(message.payload, reviver);
@@ -104,19 +110,19 @@ export class RPCClient {
     });
   }
 
-  registerModel(typeName: string, ctor: any) {
-    this.reflection.registerModel(typeName, ctor);
-  }
-
   async call(method: string, params?: any): Promise<any> {
     if (this.transportReady) await this.transportReady;
     return new Promise((resolve, reject) => {
-      this.sendCall(method, params, resolve, reject);
+      const id = this.nextId++;
+      this.pending.set(id, {resolve, reject});
+      this.transport.send(
+        formatCallMessage(id, method, params || [], outboundReplacer),
+      );
     });
   }
 
   notify(method: string, params?: any[]) {
-    const message = formatNotificationMessage(method, params);
+    const message = formatNotificationMessage(method, params, outboundReplacer);
     if (this.transportReady) {
       this.transportReady.then(() => this.transport.send(message));
     } else {
@@ -124,22 +130,9 @@ export class RPCClient {
     }
   }
 
-  private sendCall(
-    method: string,
-    params: any,
-    resolve: (v: any) => void,
-    reject: (e: any) => void,
-  ) {
-    const id = this.nextId++;
-    this.pending.set(id, {resolve, reject});
-    this.transport.send(formatCallMessage(id, method, params || []));
-  }
-
   onNotification(cb: (method: string, params: any[]) => void): () => void {
     this.notificationListeners.add(cb);
-    return () => {
-      this.notificationListeners.delete(cb);
-    };
+    return () => this.notificationListeners.delete(cb);
   }
 
   private handleNotification(method: string, params: any[]) {
@@ -147,8 +140,14 @@ export class RPCClient {
       this.root = params[0];
       this._resolveReady();
     } else if (method === SIGNAL_UPDATE_METHOD) {
-      const [id, value, mode] = params;
-      this.reflection.handleUpdate(id, value, mode);
+      const [id, value, mode] = params as [string, any, string?];
+      this.hydrator.applySignalUpdate(id, value, mode);
+    } else if (method === PROMISE_RESOLVE_METHOD) {
+      const [id, value] = params as [string, any];
+      this.reflection.settlePromise(id, value, false);
+    } else if (method === PROMISE_REJECT_METHOD) {
+      const [id, value] = params as [string, any];
+      this.reflection.settlePromise(id, value, true);
     } else {
       for (const listener of this.notificationListeners) {
         listener(method, params);

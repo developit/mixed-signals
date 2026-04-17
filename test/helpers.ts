@@ -1,5 +1,4 @@
 import {signal} from '@preact/signals-core';
-import {createReflectedModel} from '../client/model.ts';
 import {createModel} from '../server/model.ts';
 import type {Transport} from '../shared/protocol.ts';
 
@@ -8,8 +7,8 @@ export {createMemoryTransportPair} from '../server/memory-transport.ts';
 type MessageHandler = (data: {toString(): string}) => void | Promise<void>;
 
 /**
- * Creates a linked transport pair with an explicit message queue.
- * Messages are enqueued synchronously but delivered only when flush() is called,
+ * Creates a linked transport pair with an explicit message queue. Messages
+ * are enqueued synchronously but delivered only when flush() is called,
  * giving tests full control over message ordering and timing.
  */
 export function createLinkedTransportPair(): {
@@ -62,7 +61,7 @@ export const Counter = createModel<{
   increment(): void;
   add(item: string): void;
   rename(name: string): void;
-}>(() => {
+}>('Counter', () => {
   const count = signal(0);
   const name = signal('default');
   const items = signal<string[]>([]);
@@ -84,17 +83,6 @@ export const Counter = createModel<{
     },
   };
 });
-
-export const ReflectedCounter = createReflectedModel<{
-  id: ReturnType<typeof signal<string>>;
-  count: ReturnType<typeof signal<number>>;
-  name: ReturnType<typeof signal<string>>;
-  items: ReturnType<typeof signal<string[]>>;
-  meta: ReturnType<typeof signal<Record<string, any>>>;
-  increment(): Promise<void>;
-  add(item: string): Promise<void>;
-  rename(name: string): Promise<void>;
-}>(['count', 'name', 'items', 'meta'], ['increment', 'add', 'rename']);
 
 export function flush(ms = 20): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));

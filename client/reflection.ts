@@ -1,175 +1,116 @@
-import {type Signal, signal} from '@preact/signals-core';
+import type {HydrateEnv, Hydrator} from '../shared/hydrate.ts';
 import {
+  RELEASE_HANDLES_METHOD,
   UNWATCH_SIGNALS_METHOD,
   WATCH_SIGNALS_METHOD,
 } from '../shared/protocol.ts';
 import type {RPCClient} from './rpc.ts';
 
-/** @internal */
+/** @internal — retained for the optional context parameter to `RPCClient`. */
 export interface WireContext {
   rpc: RPCClient;
 }
 
-export class ClientReflection {
-  private signals = new Map<number | string, Signal<any>>();
-  private models = new Map<string, any>();
-  private modelRegistry = new Map<string, any>();
+/**
+ * Owns outbound batching: @W, @U, @H-. All three use the same debounce pattern
+ * (1ms for watch/release bursts, 10ms for unwatch so quick remounts stay
+ * subscribed). The actual hydration is delegated to the shared `Hydrator`.
+ */
+export class ClientReflection implements HydrateEnv {
   private rpc: RPCClient;
-  private ctx: WireContext;
-  private watchBatch = new Set<number | string>();
-  private unwatchBatch = new Set<number | string>();
-  private watchFlushTimer: ReturnType<typeof setTimeout> | null = null;
-  private unwatchFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
-  constructor(rpc: RPCClient, ctx?: any) {
+  private watchBatch = new Set<string>();
+  private unwatchBatch = new Set<string>();
+  private releaseBatch = new Set<string>();
+  private watchTimer: ReturnType<typeof setTimeout> | null = null;
+  private unwatchTimer: ReturnType<typeof setTimeout> | null = null;
+  private releaseTimer: ReturnType<typeof setTimeout> | null = null;
+
+  private pendingPromises = new Map<
+    string,
+    {resolve(v: any): void; reject(e: any): void}
+  >();
+
+  /** @internal */
+  hydrator!: Hydrator;
+
+  constructor(rpc: RPCClient, _ctx?: any) {
     this.rpc = rpc;
-    this.ctx = ctx && ctx.rpc === rpc ? ctx : {rpc};
   }
 
-  /** Clear cached signals and model facades so a reconnection gets fresh state. */
+  setHydrator(h: Hydrator) {
+    this.hydrator = h;
+  }
+
   reset() {
-    this.signals.clear();
-    this.models.clear();
     this.watchBatch.clear();
     this.unwatchBatch.clear();
-    if (this.watchFlushTimer) {
-      clearTimeout(this.watchFlushTimer);
-      this.watchFlushTimer = null;
-    }
-    if (this.unwatchFlushTimer) {
-      clearTimeout(this.unwatchFlushTimer);
-      this.unwatchFlushTimer = null;
-    }
+    this.releaseBatch.clear();
+    if (this.watchTimer) clearTimeout(this.watchTimer);
+    if (this.unwatchTimer) clearTimeout(this.unwatchTimer);
+    if (this.releaseTimer) clearTimeout(this.releaseTimer);
+    this.watchTimer = null;
+    this.unwatchTimer = null;
+    this.releaseTimer = null;
+    this.pendingPromises.clear();
   }
 
-  registerModel(typeName: string, ctor: any) {
-    this.modelRegistry.set(typeName, ctor);
+  // ───── HydrateEnv ──────────────────────────────────────────────────────────
+
+  call(method: string, args: readonly unknown[]): Promise<any> {
+    return this.rpc.call(method, args);
   }
 
-  private scheduleWatch(id: number | string) {
-    // Batch watch messages so a render burst becomes one frame.
+  scheduleWatch(id: string): void {
     this.watchBatch.add(id);
-    if (!this.watchFlushTimer) {
-      this.watchFlushTimer = setTimeout(() => {
+    if (!this.watchTimer) {
+      this.watchTimer = setTimeout(() => {
         const ids = Array.from(this.watchBatch);
         this.watchBatch.clear();
-        this.watchFlushTimer = null;
-        if (ids.length > 0) {
-          this.rpc.notify(WATCH_SIGNALS_METHOD, ids);
-        }
+        this.watchTimer = null;
+        if (ids.length) this.rpc.notify(WATCH_SIGNALS_METHOD, ids);
       }, 1);
     }
   }
 
-  private scheduleUnwatch(id: number | string) {
-    // Unwatchs are batched separately so quick remounts can cancel them.
+  scheduleUnwatch(id: string): void {
     this.unwatchBatch.add(id);
-    if (!this.unwatchFlushTimer) {
-      this.unwatchFlushTimer = setTimeout(() => {
+    if (!this.unwatchTimer) {
+      this.unwatchTimer = setTimeout(() => {
         const ids = Array.from(this.unwatchBatch);
         this.unwatchBatch.clear();
-        this.unwatchFlushTimer = null;
-        if (ids.length > 0) {
-          this.rpc.notify(UNWATCH_SIGNALS_METHOD, ids);
-        }
+        this.unwatchTimer = null;
+        if (ids.length) this.rpc.notify(UNWATCH_SIGNALS_METHOD, ids);
       }, 1);
     }
   }
 
-  getOrCreateSignal(id: number | string, initialValue: any): Signal<any> {
-    const existingSignal = this.signals.get(id);
-    if (existingSignal) return existingSignal;
-
-    let unwatchTimeout: ReturnType<typeof setTimeout> | null = null;
-
-    const createdSignal = signal(initialValue, {
-      watched: () => {
-        if (unwatchTimeout) {
-          clearTimeout(unwatchTimeout);
-          unwatchTimeout = null;
-        } else {
-          // Only tell the server once the client actually observes this signal.
-          this.scheduleWatch(id);
-        }
-      },
-      unwatched: () => {
-        // Debounce unwatch so transient unmount/remount cycles stay subscribed.
-        unwatchTimeout = setTimeout(() => {
-          this.scheduleUnwatch(id);
-          unwatchTimeout = null;
-        }, 10);
-      },
-    });
-
-    this.signals.set(id, createdSignal);
-    return createdSignal;
+  scheduleRelease(id: string): void {
+    this.releaseBatch.add(id);
+    if (!this.releaseTimer) {
+      // Slightly longer — finalization callbacks come in bursts.
+      this.releaseTimer = setTimeout(() => {
+        const ids = Array.from(this.releaseBatch);
+        this.releaseBatch.clear();
+        this.releaseTimer = null;
+        if (ids.length) this.rpc.notify(RELEASE_HANDLES_METHOD, ids);
+      }, 16);
+    }
   }
 
-  createModelFacade(serialized: any): any {
-    const raw: string = serialized['@M'];
-    if (!raw) {
-      throw new Error('Model missing @M field');
-    }
-
-    const existing = this.models.get(raw);
-    if (existing) {
-      return existing;
-    }
-
-    // Models are branded as TypeName#wireId so the facade knows both pieces.
-    const hashIdx = raw.lastIndexOf('#');
-    const typeName = hashIdx !== -1 ? raw.slice(0, hashIdx) : raw;
-    const wireId = hashIdx !== -1 ? raw.slice(hashIdx + 1) : undefined;
-
-    const ModelCtor = this.modelRegistry.get(typeName);
-    if (!ModelCtor) {
-      throw new Error(`Unknown model type: ${typeName}`);
-    }
-
-    const model = new ModelCtor(this.ctx, {...serialized, '@wireId': wireId});
-    this.models.set(raw, model);
-    return model;
+  registerPendingPromise(
+    id: string,
+    settle: {resolve(v: any): void; reject(e: any): void},
+  ): void {
+    this.pendingPromises.set(id, settle);
   }
 
-  handleUpdate(id: number | string, value: any, mode?: string) {
-    const sig = this.signals.get(id);
-    if (!sig) return;
-
-    if (!mode) {
-      sig.value = value;
-      return;
-    }
-
-    const current = sig.value;
-
-    switch (mode) {
-      case 'append':
-        // Streaming text and immutable array pushes both land here.
-        if (Array.isArray(current)) {
-          sig.value = [...current, ...value];
-        } else if (typeof current === 'string') {
-          sig.value = current + value;
-        }
-        break;
-
-      case 'merge':
-        if (current && typeof current === 'object') {
-          sig.value = {...current, ...value};
-        }
-        break;
-
-      case 'splice':
-        // Reserved for richer array diffs; keep client support even if rare today.
-        if (Array.isArray(current)) {
-          const {start, deleteCount, items} = value;
-          const nextArray = [...current];
-          nextArray.splice(start, deleteCount, ...items);
-          sig.value = nextArray;
-        }
-        break;
-
-      default:
-        sig.value = value;
-    }
+  /** @internal — called by the client RPC on @P / @PE notifications. */
+  settlePromise(id: string, value: any, reject: boolean) {
+    const entry = this.pendingPromises.get(id);
+    if (!entry) return;
+    this.pendingPromises.delete(id);
+    if (reject) entry.reject(new Error(value?.message ?? 'RPC error'));
+    else entry.resolve(value);
   }
 }
