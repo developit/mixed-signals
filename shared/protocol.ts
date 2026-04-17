@@ -8,6 +8,30 @@ export const ROOT_NOTIFICATION_METHOD = '@R';
 export const SIGNAL_UPDATE_METHOD = '@S';
 export const WATCH_SIGNALS_METHOD = '@W';
 export const UNWATCH_SIGNALS_METHOD = '@U';
+/** Client → server: release these handle ids (coalesced). */
+export const RELEASE_HANDLES_METHOD = '@H-';
+/** Server → client: a previously-pending promise handle has resolved. */
+export const PROMISE_RESOLVE_METHOD = '@P';
+/** Server → client: a previously-pending promise handle has rejected. */
+export const PROMISE_REJECT_METHOD = '@PE';
+/**
+ * Every structured reference on the wire uses this field name.
+ * The first character of the id is the kind: s=signal, o=object/model,
+ * f=function, p=promise. See shared/brand.ts.
+ */
+export const HANDLE_MARKER = '@H';
+/** Shape prelude, inline on first use of a shape. */
+export const SHAPE_FIELD = 'sh';
+/** Model-name prelude, inline on first use of a named ctor. */
+export const MODEL_NAME_FIELD = 'mn';
+/** Shape id reference (once the receiver has the shape). */
+export const SHAPE_ID_FIELD = 's';
+/** Model-name id reference. */
+export const MODEL_NAME_ID_FIELD = 'n';
+/** Data array (per-shape values). */
+export const DATA_FIELD = 'd';
+/** Signal value (for kind=s, initial inline value). */
+export const SIGNAL_VALUE_FIELD = 'v';
 
 type ParsedCallMessage = {
   type: 'call';
@@ -115,29 +139,42 @@ export function parseWireValue<T = unknown>(
   return JSON.parse(payload, reviver) as T;
 }
 
-function stringifyWireParams(params: readonly unknown[] = []): string {
-  return params.map((param) => JSON.stringify(param)).join(',');
+function stringifyWireParams(
+  params: readonly unknown[] = [],
+  replacer?: (this: any, key: string, value: any) => any,
+): string {
+  return params.map((param) => JSON.stringify(param, replacer)).join(',');
 }
 
 export function formatCallMessage(
   id: number,
   method: string,
   params: readonly unknown[] = [],
+  replacer?: (this: any, key: string, value: any) => any,
 ): string {
-  return `M${id}:${method}:${stringifyWireParams(params)}`;
+  return `M${id}:${method}:${stringifyWireParams(params, replacer)}`;
 }
 
 export function formatNotificationMessage(
   method: string,
   params: readonly unknown[] = [],
+  replacer?: (this: any, key: string, value: any) => any,
 ): string {
-  return `N:${method}:${stringifyWireParams(params)}`;
+  return `N:${method}:${stringifyWireParams(params, replacer)}`;
 }
 
-export function formatResultMessage(id: number, result: unknown): string {
-  return `R${id}:${JSON.stringify(result)}`;
+export function formatResultMessage(
+  id: number,
+  result: unknown,
+  replacer?: (this: any, key: string, value: any) => any,
+): string {
+  return `R${id}:${JSON.stringify(result, replacer)}`;
 }
 
-export function formatErrorMessage(id: number, error: unknown): string {
-  return `E${id}:${JSON.stringify(error)}`;
+export function formatErrorMessage(
+  id: number,
+  error: unknown,
+  replacer?: (this: any, key: string, value: any) => any,
+): string {
+  return `E${id}:${JSON.stringify(error, replacer)}`;
 }

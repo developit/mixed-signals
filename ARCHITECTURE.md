@@ -1,24 +1,27 @@
 # mixed-signals
 
-Transparent projection of [Preact signals] over a transport. A server-side
-`signal(x)` becomes a live client-side `Signal` that updates automatically.
-No manual subscriptions, no event emitters — just signals.
+General-purpose RPC with live reactivity. A server-side value — Signal, Model,
+plain object, function, or Promise — becomes a live client-side counterpart
+that stays in sync automatically, with identity preserved across round trips.
 
-[Preact signals]: https://github.com/preactjs/signals
+No manual declaration on either side. Reactivity is the subscription protocol.
+Refcounts are the lifecycle protocol.
 
 ---
 
 ## Concepts
 
-| Concept                  | Description                                                                                                             |
-| ------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
-| **Transport**            | Any object with `send(data: string)` and `onMessage(cb)`. Typically a WebSocket.                                        |
-| **RPC**                  | Server-side hub. Wraps a root object, routes incoming method calls, manages connected clients.                          |
-| **Reflection**           | Server-side signal tracker. Serializes signal values, computes deltas, and pushes updates to subscribed clients.        |
-| **Instances**            | Registry that maps numeric IDs to server-side model instances, enabling instance-method routing.                        |
-| **RPCClient**            | Client-side hub. Sends method calls, awaits responses, and dispatches incoming notifications.                           |
-| **ClientReflection**     | Client-side signal manager. Creates/updates `Signal` objects from server data, batches `@W`/`@U` subscription messages. |
-| **createReflectedModel** | Factory that produces a Preact Model constructor whose signal props and methods mirror a server model.                   |
+| Concept            | Description                                                                                                                      |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| **Transport**      | `{ send(str), onMessage(cb), ready? }`. WebSocket, postMessage, MessagePort, stdin/stdout all fit.                               |
+| **Handle**         | Any value with identity: Signal, Model, plain object with reactive/handle slots, function, Promise. Keyed by `<kind><n>` id.     |
+| **Kind**           | Single char prefix on every handle id. `s`=signal, `o`=object (Model or plain), `f`=function, `p`=promise.                       |
+| **Shape**          | Cached description of an object's keys + slot kinds. Sent inline once per (client, shape), referenced by numeric id afterward.   |
+| **Brand**          | Hidden registered symbol on every hydrated value. Lets the serializer emit `{@H:id}` when a value is passed back to its owner.   |
+| **Handles**        | Single server registry: id ↔ value, shape cache, model-name cache, per-client refcounts, sent-handle tracking.                   |
+| **Reflection**     | Signal subscription manager on the server; still owns lazy fan-out, per-client delta tracking, and `@S` push.                    |
+| **Hydrator**       | Client-side counterpart to `Serializer`. Builds Proxies, signals, callables, and promises from `@H` markers.                    |
+| **Retention**      | Server policy governing when orphaned handles get freed: `disconnect`, `ttl`, or `weak`. Default is `ttl` with a 30s idle timer. |
 
 ## Overview
 
@@ -27,13 +30,13 @@ No manual subscriptions, no event emitters — just signals.
 │  SERVER                                                          │
 │                                                                  │
 │  root object (ctx)                                               │
-│    └─ ctx.projects.create(...)  ← RPC routes method calls here   │
-│    └─ ctx.projects.all          ← Signal<Project[]>              │
+│    └─ ctx.projects.create(...)     ← RPC routes by dotted path   │
+│    └─ <handleId>#<method>(...)     ← or by handle id             │
 │                                                                  │
-│  RPC ──── Reflection ──── Instances                              │
-│   │           │                                                  │
-│   │    tracks Signals, serializes instances,                     │
-│   │    computes deltas, pushes N:@S updates                      │
+│  RPC ──── Reflection ──── Handles (shared)                       │
+│   │          │                │                                  │
+│   │   subscriptions      id↔value, refcounts,                    │
+│   │   delta push         shape + model-name caches               │
 │   │                                                              │
 │  Transport (WebSocket send/onMessage)                            │
 └────────────────────────┬─────────────────────────────────────────┘
@@ -41,326 +44,222 @@ No manual subscriptions, no event emitters — just signals.
 ┌────────────────────────┴─────────────────────────────────────────┐
 │  CLIENT                                                          │
 │                                                                  │
-│  RPCClient ──── ClientReflection                                 │
-│   │                  │                                           │
-│   │           client Signal objects,                             │
-│   │           batched watch/unwatch                              │
+│  RPCClient ──── ClientReflection ──── Hydrator                   │
+│   │                   │                   │                      │
+│   │        batched @W/@U/@H-,    Proxies for Models & plain      │
+│   │        outbound calls/       objects, callable proxies,      │
+│   │        notifications         live Signals, live Promises     │
 │   │                                                              │
-│  createReflectedModel → Preact Model constructors                │
-│    signals as computed props, methods as RPC proxies             │
+│  Transport                                                       │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### Wire Protocol
+### Wire protocol
 
-All messages are compact, newline-free text strings.
+Framing is unchanged from v0.2: `M/N/R/E` with `<type><corrId>:<method>:<payload>`.
+The reserved methods grew:
 
-#### Client → Server
+| method | dir | payload                     | meaning                               |
+| :----: | :-: | --------------------------- | ------------------------------------- |
+|  `@R`  | s→c | `<root>`                    | initial root delivery                 |
+|  `@W`  | c→s | `id,id,...`                 | subscribe to these signal ids         |
+|  `@U`  | c→s | `id,id,...`                 | unsubscribe                           |
+|  `@S`  | s→c | `id,value[,mode]`           | signal update (with optional delta)   |
+|  `@H-` | c→s | `id,id,...`                 | release these handles (refcount --)   |
+|  `@P`  | s→c | `promiseId,value`           | promise handle resolved               |
+|  `@PE` | s→c | `promiseId,{message}`       | promise handle rejected               |
 
-| Message                 | Meaning                                                                                                   |
-| ----------------------- | --------------------------------------------------------------------------------------------------------- |
-| `M{id}:{method}:{args}` | Method call (expects a response). `{id}` is a monotonic integer; `{args}` is comma-separated JSON values. |
-| `N:{method}:{args}`     | Fire-and-forget notification. Same format but no response is sent.                                        |
-| `N:@W:{ids}`            | Subscribe to signal updates. `{ids}` is comma-separated signal IDs.                                       |
-| `N:@U:{ids}`            | Unsubscribe from signal updates.                                                                          |
+### The `@H` marker
 
-#### Server → Client
+Every structural reference on the wire looks like this:
 
-| Message                      | Meaning                                                                    |
-| ---------------------------- | -------------------------------------------------------------------------- |
-| `R{id}:{result}`             | Successful response to call `{id}`. `{result}` is a single JSON value.     |
-| `E{id}:{error}`              | Error response to call `{id}`. `{error}` is `{"code":-1,"message":"..."}`. |
-| `N:@S:{id},{value}[,{mode}]` | Signal update notification. `{mode}` is omitted for full replacement.      |
+```
+{"@H":"s42","v":0}                               // signal, id=s42, inline value
+{"@H":"s42"}                                     // signal short-ref (client already has it)
+{"@H":"o17","sh":[["id","name"],[1,1]],          // object, first emission:
+  "mn":[3,"Project"],"n":3,"s":5,                //   shape inline (keys+kinds), model-name inline
+  "d":[{"@H":"s1","v":"42"},{"@H":"s2","v":"X"}]}//   data array in shape order
+{"@H":"o17","s":5,"n":3,"d":[…]}                 // object, repeat emission: no shape/mn preludes
+{"@H":"o17"}                                     // object short-ref
+{"@H":"f11"}                                     // function handle — call via Mx:"f11":args
+{"@H":"p7"}                                      // pending promise — settled later via @P/@PE
+```
 
-#### Method Routing
+Kinds live in the id's first character so parsing is `id[0]`. No extra field
+to read, no format ambiguity.
 
-- **Direct RPC calls** — `path.method` (e.g. `sessions.createSession`) for methods on the root object
-- **Reflected model methods** — `{wireId}#method` (e.g. `42#delete`) for methods on model instances
-- The server assigns `wireId`s when it serializes models with `@M`, and `createReflectedModel()` uses that identity for later calls.
+### Method routing
 
-#### Serialization Markers
+| Call                  | Dispatch                                                  |
+| --------------------- | --------------------------------------------------------- |
+| `"foo.bar.baz"`       | dotted path on the server root                             |
+| `"<id>#method"`       | method on a specific handle (Model/plain object/function) |
+| `"<id>"`              | bare function-handle call (for `f<n>` ids)                |
 
-During serialization, special objects are embedded in JSON:
+### Client → server values
 
-| Marker | Shape                                 | Meaning                                                                                                                                   |
-| ------ | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `@S`   | `{"@S": id, "v": value}`              | A server-side `Signal`. The client creates or reuses a `Signal` with the given ID and initial value.                                      |
-| `@M`   | `{"@M": "TypeName#wireId", ...props}` | A server-side model instance. The client instantiates the registered model constructor for `TypeName` and uses `wireId` for method calls. |
-
-Properties beginning with `_` and all functions are stripped from serialized objects.
-
-#### Delta Update Modes
-
-When a signal's value changes, the server may send only the diff instead of the full value:
-
-| Mode     | Applies when                                               | Effect on client                                                     |
-| -------- | ---------------------------------------------------------- | -------------------------------------------------------------------- |
-| _(none)_ | General case                                               | Full replacement: `sig.value = newValue`                             |
-| `append` | Array grew by appending, or string got longer by appending | `sig.value = [...current, ...delta]` / `sig.value = current + delta` |
-| `merge`  | Plain object with changed keys                             | `sig.value = {...current, ...delta}`                                 |
-| `splice` | Array mutation with start/deleteCount/items                | `Array.prototype.splice` applied immutably                           |
+A Proxy / Signal / Promise / function on the client that was originally handed
+down by the server is **branded** (non-enumerable registered symbol). The
+client uses a `JSON.stringify` replacer that detects the brand and re-emits
+`{@H:id}` in call arguments; the server uses a matching reviver that resolves
+the id back to the live object. Identity is preserved end to end with no
+API ceremony.
 
 ---
 
-## Shape
+## Shape cache
 
-```
-mixed-signals/
-├── server/
-│   ├── rpc.ts          multi-client RPC host, method routing
-│   ├── reflection.ts   Signal → wire, subscriptions, delta diffing
-│   └── instances.ts    id ↔ model instance registry
-└── client/
-    ├── rpc.ts          RPC client, request correlation
-    ├── reflection.ts   wire → Signal, batched watch/unwatch
-    └── model.ts        Preact-model factory for remote facades
-```
+Shapes are the key efficiency lever. A shape is `{keys: string[], kinds: SlotKind[]}`.
+Slot kinds are `0=plain JSON`, `1=Signal`, `2=Handle (nested)`.
 
-Two bundles (`./server`, `./client`) with a single peer dep:
-`@preact/signals-core >= 1.8.0` (needs `watched`/`unwatched` hooks).
+- Shape ids are allocated per process, shared across clients.
+- `Handles.hasShape(clientId, shapeId)` decides whether to send the shape
+  inline on a given emission. First use: full `sh` prelude. Subsequent uses:
+  bare shape id reference.
+- Model names work the same way, independently, keyed by constructor.
 
----
-
-## The core trick
-
-A `Signal` crosses the wire as `{"@S": <id>, "v": <snapshot>}`. The client
-rehydrates it into a real `signal()`, wiring its `watched`/`unwatched` hooks
-to `@W`/`@U` notifications. The server only subscribes to the underlying
-signal while ≥1 client is watching, and pushes diffs via `N:@S:`.
-
-**Reactivity is the subscription protocol.** If no component reads
-`user.name.value`, the server never sends updates for it.
-
-```
-┌────────────────────────────────────────────────────────────────────────────┐
-│ SERVER                                                                     │
-│                                                                            │
-│   const count = signal(0)                                                  │
-│        │                                                                   │
-│        │  serialize()                ┌──────────────────────────────┐      │
-│        └──────────────────────────▶  │ Reflection                   │      │
-│                                      │  signalIds:  WeakMap<Sig,id> │      │
-│           assigns id=7               │  signals:    Map<id,Sig>     │      │
-│           {"@S":7,"v":0}  ──────┐    │  subs:       Map<id,Set<c>>  │      │
-│                                 │    │  lastSent:   Map<"c:id",val> │      │
-│                                 │    └───────────────▲──────────────┘      │
-│                                 │                    │                     │
-│                                 │     @W:7 ──────────┘  sig.subscribe()    │
-│                                 │     (first watcher)   → notifySubscribers│
-└─────────────────────────────────┼──────────────────────────────────────────┘
-                                  │ ▲                  │
-                         R1:{...} │ │ N:@W:7           │ N:@S:7,1
-                                  ▼ │                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ CLIENT                                                                      │
-│                                 ┌──────────────────────────────┐            │
-│   JSON.parse(reviver) ────────▶ │ ClientReflection             │            │
-│    sees "@S" → calls            │  signals: Map<id,Signal>     │            │
-│    getOrCreateSignal(7,0)       │  watchBatch / unwatchBatch   │ ── 1ms ──▶ │
-│                                 └────────────┬─────────────────┘    flush   │
-│                                              │                              │
-│           ┌──────────────────────────────────┘                              │
-│           ▼                                                                 │
-│   signal(0, {                                                               │
-│     watched:   () => scheduleWatch(7),    ◀── effect(() => s.value)         │
-│     unwatched: () => scheduleUnwatch(7)       first subscriber triggers     │
-│   })                                                                        │
-│                                                                             │
-│   handleUpdate(7, 1)  →  s.value = 1  →  effect re-runs                     │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+Two plain objects with the same keys share a shape; ten thousand instances of
+a Model share one shape and one name per client. Steady-state traffic after
+warm-up is a bare `{"@H":"o17","s":N,"n":M,"d":[…]}` per object — no key
+names, no type strings, no redundant shape info.
 
 ---
 
-## Wire protocol
+## Refcounting + FinalizationRegistry
 
-Plaintext, regex-parseable, one message per frame.
+Client:
 
-```
-  ┌─ type char                ┌─ JSON fragments, comma-joined (no outer [])
-  │  ┌─ correlation id        │
-  ▼  ▼                        ▼
-  M  17  :  threads.create  :  "hello",{"role":"user"}
-  │      │                  │
-  │      └─ method / topic ─┘
-  │
-  ├─ M<id>:<method>:<args>   client → server   call         (expects R/E)
-  ├─ N    :<method>:<args>   either direction  notify       (fire-and-forget)
-  ├─ R<id>:<json>            server → client   resolve(id)
-  └─ E<id>:<json>            server → client   reject(id)
-```
+1. Every `Hydrator.hydrate(...)` stores the proxy in a `Map<id, WeakRef>` and
+   registers it with a `FinalizationRegistry`.
+2. When the proxy becomes unreachable, the finalization callback adds the id
+   to a batch that flushes as `N:@H-:id,id,...` on a 16ms debounce.
+3. Watch/unwatch/release all share the same batching pattern. Under a render
+   burst, 500 signals → one watch frame. Under a GC burst, N proxies → one
+   release frame.
 
-Reserved methods:
+Server:
 
-| method | dir | payload           | meaning                       |
-| :----: | :-: | ----------------- | ----------------------------- |
-|  `@W`  | c→s | `id,id,...`       | subscribe to these signal ids |
-|  `@U`  | c→s | `id,id,...`       | unsubscribe                   |
-|  `@S`  | s→c | `id,value[,mode]` | signal `id` changed           |
+1. `@H-` decrements the per-client refcount on each listed handle.
+2. When a handle's refcount across all clients drops to zero, the retention
+   policy decides:
+   - `disconnect` — no action on release; drop at disconnect time only.
+     (Useful for stable long-lived clients; not the default because of
+     reconnect risk.)
+   - `ttl` (default, 30s idle) — handle becomes a candidate for a sweep
+     scheduled on a `setTimeout`. If it stays orphaned past `idleMs`, it's
+     dropped. Any activity — a new emission, a method call — calls `touch()`
+     and extends its life.
+   - `weak` — drop the handle immediately. Use when the real domain object
+     lifecycle is managed elsewhere and this RPC layer shouldn't be the
+     retention authority.
 
-Routing on server (`callMethod`):
-
-```
-  "threads.create"   →  dlv(root, "threads.create")(...args)
-  "42#rename"        →  instances.get(42).rename(...args)
-      └─ id#method
-```
+Environments without `FinalizationRegistry` fall back silently to disconnect/TTL.
+No manual `dispose()` exists anywhere.
 
 ---
 
-## Serialization
-
-`Reflection.serialize()` is a `JSON.stringify` replacer that rewrites
-live objects into wire markers. The client's `JSON.parse` reviver inverts it.
-
-```
-  server value                     wire                          client value
- ──────────────                ────────────                    ───────────────
-  signal(3)           ──▶   {"@S":7,"v":3}          ──▶   live Signal (id 7)
-
-  thread instance     ──▶   {"@M":"Thread#42",      ──▶   new ThreadModel(ctx,
-  (registered in             "id":{"@S":9,"v":42},          data)  via
-   Instances with            "title":{"@S":10,...}}         modelRegistry
-   type "Thread")
-
-  obj._private        ──▶   (dropped)
-  obj.method          ──▶   (dropped — replaced by RPC stubs on client)
-```
-
-`@M` handling is eager: it iterates own props, inlines nested `@S` markers
-immediately (so `Signal.toJSON()` never runs), and strips `_`-prefixed and
-function props.
-
----
-
-## Delta compression
-
-Server holds `lastSentValues["<client>:<signal>"]`. On change it computes the
-smallest patch that reconstructs `newValue` from `oldValue`:
-
-```
-                                      ┌─────────┐
-  old            new           mode   │ client  │
-  ───            ───           ────   │ applies │
-  [a,b]       →  [a,b,c,d]     append │ [...cur, ...Δ]
-  "foo"       →  "foobar"      append │ cur + Δ
-  {x:1,y:2}   →  {x:1,y:9}     merge  │ {...cur, ...Δ}    (sends {y:9} only)
-  anything    →  unrelated     —      │ Δ                 (full replace)
-                                      └─────────┘
-```
-
-Array-append is detected by prefix identity (`===` per element), so it only
-fires when the _same_ elements are reused — i.e. immutable push patterns like
-`sig.value = [...sig.value, item]`.
-
-The client also handles `splice` mode; the server doesn't currently emit it.
-
----
-
-## Subscription lifecycle
+## Subscription lifecycle (unchanged in spirit)
 
 ```
  client                                              server
  ──────                                              ──────
  component mounts
-   effect reads s.value
+   effect reads sig.value
      └─▶ watched()
-           watchBatch.add(7)  ─── 1ms ──▶  N:@W:7,8,12  ─▶  subs.get(7).add(client)
-                                                            if first watcher:
-                                                              sig.subscribe(notify)
+           scheduleWatch(id)   ── 1ms ──▶  N:@W:s7,s8,s12
+                                           subs.get(s7).add(client)
+                                           first watcher?
+                                             sig.subscribe(notify)
  component unmounts
    effect disposed
      └─▶ unwatched()
-           setTimeout(10ms)                             ← debounce: if a remount
-             └─▶ unwatchBatch.add(7) ─ 1ms ─▶ N:@U:7      happens inside 10ms the
-                                                          unwatch is cancelled and
-                                                          no traffic is sent.
+           setTimeout(10ms)                  ← debounce: quick remount stays up
+             └─▶ scheduleUnwatch(id) ─▶ N:@U:s7
+ proxy unreachable
+   FinalizationRegistry fires
+     └─▶ scheduleRelease(id) ─ 16ms ─▶ N:@H-:o17,s7,f11
+                                        refcount-- per handle
+                                        TTL sweep scheduled
  client disconnects
-   cleanup()  ───────────────────────────────────────▶  clients.delete(id)
-                                                        reflection.removeClient(id)
-                                                          - drop from all subs sets
-                                                          - purge lastSentValues
+   cleanup()                     ─▶ clients.delete(id)
+                                    reflection.removeClient(id)
+                                    handles.releaseAllForClient(id)
+                                      retention.kind === 'disconnect'?
+                                        drop orphaned
 ```
-
-Batching coalesces the "20 signals arrive in one response, 20 effects
-subscribe on the same tick" case into one `@W` frame.
 
 ---
 
-## `createReflectedModel`
+## Proxy construction
 
-Generates a Preact `createModel` constructor that mirrors a server model.
+For every `@H:o…` the hydrator builds a spine object containing live signals
+for SIGNAL slots and hydrated values for the rest, then wraps it in a Proxy:
 
-```
-                      signalProps      methods
-                      ───────────      ───────
-                      ['id','title']   ['rename']
-```
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  createReflectedModel(signalProps, methods)                                 │
-│                                                                             │
-│  ┌──────────────── per signalProp ─────────────────┐                        │
-│  │                                                 │   The @M reviver       │
-│  │  data[p] is Signal?                             │   already created the  │
-│  │  ── yes ─▶  computed(() => data[p].value)       │   inner signals.       │
-│  └─────────────────────────────────────────────────┘                        │
-│                                                                             │
-│  ┌──────────────── per method ─────────────────────┐                        │
-│  │                                                 │                        │
-│  │  ctx.rpc.call(`${wireId}#${m}`, args)            │   instance route       │
-│  └─────────────────────────────────────────────────┘                        │
-└─────────────────────────────────────────────────────────────────────────────┘
+```ts
+new Proxy(spine, {
+  get(t, key) {
+    if (key === BRAND_REMOTE) return t[BRAND_REMOTE];
+    if (key === 'then' || 'catch' || 'finally' || 'toJSON') return undefined;
+    if (key in t) return t[key];
+    // Synthesize a method stub for unknown keys. No method list anywhere.
+    return cachedMethod(id, key);
+  },
+  has(t, key) { /* 'then' etc. say false so we aren't a thenable */ },
+  ownKeys(t) { /* hide BRAND_REMOTE */ },
+  // …
+})
 ```
 
-UI binds to `model.title.value`, which tracks the computed wrapping the
-remote signal. Swapping the underlying facade (e.g. after a refetch)
-propagates without the UI knowing.
+Thenable guards matter: awaiting a Proxy would otherwise dispatch `.then`
+to the server, a classic foot-gun for live-remote objects.
 
 ---
 
-## Data flow (one round-trip)
+## File layout
 
 ```
- UI                RPCClient         wire           RPC              domain
- ──                ─────────         ────           ───              ──────
- todo.toggle()
-   │
-   └─▶ call("42#toggle", [])
-         pending.set(1,{res,rej})
-         │
-         └────────────────────────▶ M1:42#toggle:
-                                       │
-                                       └─▶ instances.get("42").toggle()
-                                              │
-                                              ▼
-                                           todo.done.value = true
-                                              │
-                                    notifySubscribers(11)
-                                     computeDelta → full replace
-                                              │
-         ◀──────────────────────── N:@S:11,true
-         │
-   handleUpdate(11, true)
-    sig.value = true
-   │
- <Todo> re-renders
+mixed-signals/
+├── shared/
+│   ├── brand.ts         BRAND_REMOTE + RemoteBrand type
+│   ├── handles.ts       Handles registry (id↔value, shapes, names, refs)
+│   ├── shapes.ts        shape classification + signatures
+│   ├── serialize.ts     Serializer (value → wire JSON with @H markers)
+│   ├── hydrate.ts       Hydrator (wire JSON → Proxies/Signals/Promises)
+│   ├── protocol.ts      frame parse/format, method-name constants
+│   └── disposable.ts    Symbol.dispose shim (kept for parity with signals-core)
+├── server/
+│   ├── rpc.ts           multi-client RPC host + retention + routing
+│   ├── reflection.ts    signal subscriptions, delta diffing, @S push
+│   ├── model.ts         createModel(name, factory) — name stamp on ctor
+│   ├── forwarding.ts    broker chain: prefix/unprefix @H ids
+│   ├── memory-transport.ts
+│   └── index.ts
+└── client/
+    ├── rpc.ts           RPC client, outbound brand-aware replacer
+    ├── reflection.ts    outbound batching, promise settlement, HydrateEnv impl
+    ├── model.ts         deprecated no-op shim for createReflectedModel
+    └── index.ts
 ```
+
+Two bundles (`./server`, `./client`). One peer dep: `@preact/signals-core ≥1.14`.
 
 ---
 
 ## Invariants
 
-- **Signal identity** — one server `Signal` = one wire id for the process
-  lifetime (`WeakMap<Signal,id>`). Re-serializing the same signal yields the
-  same id; the client dedupes on it.
-- **Instance identity** — `Instances.nextId()` skips occupied slots and
-  ratchets past any `register(id, …)` so storage-hydrated ids and fresh ids
-  never collide.
-- **At-most-once push** — `lastSentValues` gates notifications by `===`.
-  Redundant `sig.value = same` writes never touch the wire.
-- **Lazy fan-out** — a server signal with zero watchers has zero
-  `.subscribe()` callbacks attached to it.
+- **Handle identity** — one server value = one handle id for the process
+  lifetime (while it's live). Re-serializing the same value yields the same
+  id; the client dedupes on it.
+- **At-most-once body emission per (client, handle)** — `hasSentHandle` gates
+  full emission; repeat emissions are bare `{@H:id}`.
+- **Refcount symmetry** — exactly one retain per new emission, exactly one
+  release per `@H-`. Short refs do not retain again.
+- **No push without watch** — a server Signal with zero watchers has zero
+  `.subscribe()` callbacks attached.
+- **No pull without identity** — plain JSON dictionaries are inlined without
+  an id; only values with structural identity (Models, plain objects with
+  signal/handle slots, functions, promises) get registered.
+- **Thenables can't be proxies** — Proxy traps for `then`/`catch`/`finally`
+  return `undefined` to keep the JS runtime from conflating a live-remote
+  object with a Promise.
 - **Transport-agnostic** — `Transport = { send(str), onMessage(cb), ready? }`.
-  WebSocket, MessagePort, stdin/stdout all fit.
