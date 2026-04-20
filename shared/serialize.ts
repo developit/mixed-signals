@@ -10,45 +10,106 @@ import {
   SHAPE_ID_FIELD,
   SIGNAL_VALUE_FIELD,
 } from './protocol.ts';
-import {
-  classifySlot,
-  type Shape,
-  SLOT_HANDLE,
-  SLOT_PLAIN,
-  SLOT_SIGNAL,
-  shapeOf,
-  shapeSignature,
-} from './shapes.ts';
+import {type Shape, shapeSignature} from './shapes.ts';
 
 /**
- * A brand stamped onto server-created Model constructors (by our wrapped
- * `createModel`) so the serializer can recognize "this is a named model" vs
- * "this is a plain object". Defined here to keep a single source of truth
- * that both server and client can read without a cross-module import cycle.
+ * Brand stamped onto server-side Model constructors by our wrapped
+ * `createModel(name, factory)`. Its presence on a constructor marks the
+ * object as a "named" model — the serializer uses it to decide whether to
+ * emit a model-name prelude.
  */
 export const MODEL_NAME_SYMBOL: unique symbol = Symbol.for(
   'mixed-signals.modelName',
 ) as unknown as typeof MODEL_NAME_SYMBOL;
 
-/** Hooks the caller (server RPC) passes in to drive the serializer. */
+/** Hooks the caller passes in to drive the serializer. */
 export interface SerializeHooks {
-  /** The peer id we're serializing for — drives per-peer shape/name caches. */
+  /** The peer id we're serializing for — drives per-peer caches. */
   peerId: string;
   /** Called on every signal we emit, so the caller can wire subscriptions. */
   onSignalEmitted?(id: string, signal: Signal<any>): void;
-  /** Called on every handle we emit, so the caller can bump refcounts. */
+  /** Called on every handle emission that requires client retention (o, f). */
   onHandleEmitted?(id: string): void;
   /**
-   * Called on every Promise we emit. Caller should attach settlement
-   * listeners that send a later frame carrying the resolved/rejected value.
+   * Called once per Promise we give a pid to. Caller should attach settlement
+   * listeners that send a later frame (@P / @PE) with the resolved value.
    */
   onPromiseEmitted?(id: string, promise: Promise<any>): void;
   /** Called on every function we emit. */
   onFunctionEmitted?(id: string, fn: (...args: any[]) => any): void;
 }
 
+/** Per-ctor cache for the behavior check (prototype walk is O(chain depth)). */
+const hasMethodByCtor = new WeakMap<object, boolean>();
+
+/**
+ * A value is "behavioral" — and therefore earns an `o` handle — if its
+ * constructor is stamped by `createModel` OR if any non-`_` member is a
+ * function, anywhere in the prototype chain up to (but not including)
+ * `Object.prototype`. This covers hand-written classes with methods while
+ * correctly ignoring base `Object` methods like `hasOwnProperty`.
+ */
+function hasBehavior(obj: object): boolean {
+  const ctor = obj.constructor as object | undefined;
+  // Stamped Model ctors always upgrade.
+  if (ctor && (ctor as any)[MODEL_NAME_SYMBOL] !== undefined) return true;
+
+  // Own-prop fast path: a method declared directly on the instance counts.
+  for (const key of Object.keys(obj)) {
+    if (key[0] === '_') continue;
+    if (typeof (obj as any)[key] === 'function') return true;
+  }
+
+  // No constructor / plain `{}` / `Object.create(null)` — nothing to walk.
+  if (!ctor || ctor === Object) return false;
+
+  // Prototype chain, cached by ctor.
+  const cached = hasMethodByCtor.get(ctor);
+  if (cached !== undefined) return cached;
+
+  let result = false;
+  let proto: object | null = (ctor as any).prototype ?? null;
+  while (proto && proto !== Object.prototype) {
+    for (const key of Object.getOwnPropertyNames(proto)) {
+      if (key === 'constructor' || key[0] === '_') continue;
+      if (typeof (proto as any)[key] === 'function') {
+        result = true;
+        break;
+      }
+    }
+    if (result) break;
+    proto = Object.getPrototypeOf(proto);
+  }
+  hasMethodByCtor.set(ctor, result);
+  return result;
+}
+
+/**
+ * Build an object's wire shape. Enumerates own enumerable keys, skipping
+ * `_`-prefixed and function-valued keys (methods live on the handle, not on
+ * the data spine). Each remaining slot is tagged "signal" or "handle/plain",
+ * which lets the hydrator install live Signals in the right spots.
+ */
+function shapeOfHandleObject(obj: Record<string, unknown>): Shape {
+  const keys: string[] = [];
+  const kinds: number[] = [];
+  for (const key of Object.keys(obj)) {
+    if (key[0] === '_') continue;
+    const v = obj[key];
+    if (typeof v === 'function') continue; // methods → trap-dispatched
+    keys.push(key);
+    // 1 = signal, 0 = everything else (handle or plain JSON, re-walked)
+    kinds.push(v instanceof Signal ? 1 : 0);
+  }
+  return {keys, kinds: kinds as Shape['kinds']};
+}
+
 export class Serializer {
   private handles: Handles;
+  /** Monotonic promise id counter — promises never touch Handles. */
+  private nextPromiseId = 1;
+  /** De-dupe pids for the same Promise instance across repeated emissions. */
+  private promiseIds = new WeakMap<Promise<any>, string>();
 
   constructor(handles: Handles) {
     this.handles = handles;
@@ -56,8 +117,7 @@ export class Serializer {
 
   /**
    * Serialize a value for a specific peer. Returns a JSON-serializable tree.
-   * Call JSON.stringify on the result. The output contains `@H` markers the
-   * receiving side will hydrate via `Hydrator`.
+   * The output contains `@H` markers the receiving side hydrates.
    */
   serialize(value: any, hooks: SerializeHooks): any {
     return this.walk(value, hooks);
@@ -73,7 +133,6 @@ export class Serializer {
     // so the owning peer can resolve it back to the original object/function.
     const brand = (value as any)[BRAND_REMOTE] as RemoteBrand | undefined;
     if (brand) {
-      // Touch the handle so TTL policies see continued activity.
       this.handles.touch(brand.id);
       return {[HANDLE_MARKER]: brand.id};
     }
@@ -83,9 +142,9 @@ export class Serializer {
     if (t === 'function')
       return this.emitFunction(value as (...a: any[]) => any, hooks);
 
-    if (t !== 'object') return value; // symbols, bigints — pass through as JSON does
+    if (t !== 'object') return value;
 
-    // Promises (pending or not) — everything thenable is treated as a handle.
+    // Thenables get a pid; nothing else traverses through their state.
     if (typeof (value as any).then === 'function') {
       return this.emitPromise(value as Promise<any>, hooks);
     }
@@ -99,32 +158,38 @@ export class Serializer {
       return out;
     }
 
+    // Respect .toJSON — matches JSON.stringify's own behavior, lets Date and
+    // user-defined types opt out of handle upgrading with a one-liner.
+    const toJSON = (value as any).toJSON;
+    if (typeof toJSON === 'function') {
+      return this.walk(toJSON.call(value), hooks);
+    }
+
     return this.emitObject(value as Record<string, unknown>, hooks);
   }
 
-  // ───── emitters ────────────────────────────────────────────────────────────
+  // ───── signal (tier 1) ────────────────────────────────────────────────────
 
   private emitSignal(sig: Signal<any>, hooks: SerializeHooks): any {
     let id = this.handles.idOf(sig);
-    let entry = id ? this.handles.get(id) : undefined;
-    if (!id || !entry) {
+    if (!id || !this.handles.get(id)) {
       id = this.handles.allocateId('s');
-      entry = this.handles.register(id, sig);
+      this.handles.register(id, sig);
     }
     hooks.onSignalEmitted?.(id, sig);
-    // If the client has already hydrated this signal, emit a bare reference
-    // and do not retain again — the client still owes us exactly one release.
+    // Subsequent emissions to the same client are bare references. Signals
+    // never participate in refcounted release (their lifecycle is @W/@U).
     if (this.handles.hasSentHandle(hooks.peerId, id)) {
       return {[HANDLE_MARKER]: id};
     }
-    this.handles.retain(id, hooks.peerId);
-    hooks.onHandleEmitted?.(id);
     this.handles.markHandleSent(hooks.peerId, id);
-    // Inline the current value so the receiver has a fully-hydrated signal
-    // on the first frame (important for sync-RPC readers).
+    // First emission: inline the current value so the receiver has a fully
+    // hydrated signal on the first frame (matters for sync-RPC readers).
     const inner = this.walk(sig.peek(), hooks);
     return {[HANDLE_MARKER]: id, [SIGNAL_VALUE_FIELD]: inner};
   }
+
+  // ───── function (tier 2) ──────────────────────────────────────────────────
 
   private emitFunction(
     fn: (...args: any[]) => any,
@@ -144,57 +209,42 @@ export class Serializer {
     return {[HANDLE_MARKER]: id};
   }
 
+  // ───── promise (tier 3, one-shot) ─────────────────────────────────────────
+
   private emitPromise(p: Promise<any>, hooks: SerializeHooks): any {
-    let id = this.handles.idOf(p);
-    const firstTime = !id;
+    // Promises are outside the Handles registry. Their lifecycle is a single
+    // resolution or rejection; there is nothing to refcount or release.
+    let id = this.promiseIds.get(p);
     if (!id) {
-      id = this.handles.allocateId('p');
-      this.handles.register(id, p);
-    }
-    if (firstTime) hooks.onPromiseEmitted?.(id, p);
-    if (!this.handles.hasSentHandle(hooks.peerId, id)) {
-      this.handles.retain(id, hooks.peerId);
-      hooks.onHandleEmitted?.(id);
-      this.handles.markHandleSent(hooks.peerId, id);
+      id = `p${this.nextPromiseId++}`;
+      this.promiseIds.set(p, id);
+      hooks.onPromiseEmitted?.(id, p);
     }
     return {[HANDLE_MARKER]: id};
   }
 
+  // ───── object (tier 2, may upgrade to `o` handle) ─────────────────────────
+
   private emitObject(obj: Record<string, unknown>, hooks: SerializeHooks): any {
-    // Already known object — reuse id. The owning ctor determines whether this
-    // is a Model (named) or a plain object (anonymous).
-    let id = this.handles.idOf(obj);
-    const ctor = obj.constructor as ((...a: any[]) => any) | undefined;
+    const known = this.handles.idOf(obj);
+    const ctor = obj.constructor as object | undefined;
     const modelName =
       ctor && (ctor as any)[MODEL_NAME_SYMBOL] !== undefined
         ? ((ctor as any)[MODEL_NAME_SYMBOL] as string)
         : undefined;
 
-    // Only allocate an id for objects that carry structural identity — either
-    // they're Models (named), or the caller explicitly pre-registered them,
-    // or they have at least one signal/handle slot (so reuse matters). Pure
-    // JSON dictionaries are inlined without an id, which keeps wire traffic
-    // minimal for plain request/response shapes.
-    const shape = shapeOf(obj);
-    const signature = shapeSignature(shape);
-    const hasIdentity =
-      !!id ||
-      !!modelName ||
-      shape.kinds.some((k) => k !== SLOT_PLAIN) ||
-      // Safety valve: if an object has *no* keys we still prefer to inline.
-      false;
+    // Upgrade decision. Keep objects we've already allocated an id for
+    // (some earlier call gave them identity) even if they'd otherwise look
+    // plain now.
+    const upgrade = !!known || hasBehavior(obj);
 
-    if (!hasIdentity) {
-      return this.emitPlainObject(obj, shape, hooks);
+    if (!upgrade) {
+      return this.emitPlainObject(obj, hooks);
     }
 
-    if (!id) {
-      id = this.handles.allocateId('o');
-      this.handles.register(id, obj);
-    }
+    const id = known ?? this.allocateObjectId(obj);
 
     // Short-reference path: client already has the body for this handle.
-    // Don't retain again — the client still owes exactly one release.
     if (this.handles.hasSentHandle(hooks.peerId, id)) {
       return {[HANDLE_MARKER]: id};
     }
@@ -202,29 +252,26 @@ export class Serializer {
     hooks.onHandleEmitted?.(id);
     this.handles.markHandleSent(hooks.peerId, id);
 
+    const shape = shapeOfHandleObject(obj);
+    const signature = shapeSignature(shape);
     const shapeId = this.handles.shapeIdFor(ctor, signature, shape);
     const sendShape = !this.handles.hasShape(hooks.peerId, shapeId);
     if (sendShape) this.handles.markShapeSent(hooks.peerId, shapeId);
 
     let sendModelName: number | undefined;
+    let modelNameId: number | undefined;
     if (modelName && ctor) {
-      const nameId = this.handles.modelNameIdFor(ctor, modelName);
-      if (!this.handles.hasModelName(hooks.peerId, nameId)) {
-        sendModelName = nameId;
-        this.handles.markModelNameSent(hooks.peerId, nameId);
+      modelNameId = this.handles.modelNameIdFor(ctor, modelName);
+      if (!this.handles.hasModelName(hooks.peerId, modelNameId)) {
+        sendModelName = modelNameId;
+        this.handles.markModelNameSent(hooks.peerId, modelNameId);
       }
     }
-    const modelNameId =
-      modelName && ctor
-        ? this.handles.modelNameIdFor(ctor, modelName)
-        : undefined;
 
     const data = this.emitShapedData(obj, shape, hooks);
 
     const out: Record<string, any> = {[HANDLE_MARKER]: id};
-    if (sendShape) {
-      out[SHAPE_FIELD] = [shape.keys, shape.kinds];
-    }
+    if (sendShape) out[SHAPE_FIELD] = [shape.keys, shape.kinds];
     out[SHAPE_ID_FIELD] = shapeId;
     if (modelNameId !== undefined) {
       if (sendModelName !== undefined) {
@@ -236,16 +283,21 @@ export class Serializer {
     return out;
   }
 
+  private allocateObjectId(obj: object): string {
+    const id = this.handles.allocateId('o');
+    this.handles.register(id, obj);
+    return id;
+  }
+
   private emitPlainObject(
     obj: Record<string, unknown>,
-    shape: Shape,
     hooks: SerializeHooks,
   ): any {
-    // Truly plain JSON: emit inline, no id, no shape. Receiver sees a plain
-    // object. We still filter `_`-prefixed keys for parity with today.
+    // Pure JSON: emit inline, no id, no shape. Nested Signals/Models/etc.
+    // still get `@H` markers through the walk. `_`-prefixed keys stripped.
     const out: Record<string, any> = {};
-    for (let i = 0; i < shape.keys.length; i++) {
-      const key = shape.keys[i];
+    for (const key of Object.keys(obj)) {
+      if (key[0] === '_') continue;
       const v = this.walk(obj[key], hooks);
       if (v !== undefined) out[key] = v;
     }
@@ -261,23 +313,12 @@ export class Serializer {
     for (let i = 0; i < shape.keys.length; i++) {
       const key = shape.keys[i];
       const v = obj[key];
-      const kind = shape.kinds[i];
-      if (kind === SLOT_SIGNAL) {
-        data[i] = this.emitSignal(v as Signal<any>, hooks);
-      } else if (kind === SLOT_HANDLE) {
-        data[i] = this.walk(v, hooks);
-      } else {
-        // SLOT_PLAIN — recurse so nested signals/handles still flow through.
-        // Small optimization: the common case (primitive) falls through the
-        // walk() fast path in constant time.
-        data[i] = this.walk(v, hooks);
-      }
-      // Null-safety for JSON.
-      if (data[i] === undefined) data[i] = null;
+      // Shape kinds are 1 for signal, 0 otherwise — either way we recurse.
+      // The kind byte is for the hydrator's slot wiring; serialization just
+      // walks the value and lets each handle kind self-describe.
+      const walked = this.walk(v, hooks);
+      data[i] = walked === undefined ? null : walked;
     }
     return data;
   }
 }
-
-// Re-export for convenience.
-export {classifySlot};

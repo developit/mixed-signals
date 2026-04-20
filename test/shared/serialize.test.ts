@@ -10,47 +10,89 @@ function serialize(value: any, peerId = 'c1') {
   const s = new Serializer(h);
   const signals: string[] = [];
   const handles: string[] = [];
+  const promises: string[] = [];
   const out = s.serialize(value, {
     peerId,
     onSignalEmitted: (id) => signals.push(id),
     onHandleEmitted: (id) => handles.push(id),
+    onPromiseEmitted: (id) => promises.push(id),
   });
-  return {out, signals, handles, h};
+  return {out, signals, handles, promises, h};
 }
 
-describe('Serializer', () => {
-  it('primitives pass through unchanged', () => {
+describe('Serializer: basics', () => {
+  it('primitives pass through', () => {
     expect(serialize(42).out).toBe(42);
     expect(serialize('hi').out).toBe('hi');
     expect(serialize(null).out).toBe(null);
+    expect(serialize(true).out).toBe(true);
   });
 
-  it('plain objects with only JSON data are inlined (no id)', () => {
-    const {out} = serialize({a: 1, b: 'two'});
-    expect(out).toEqual({a: 1, b: 'two'});
+  it('plain data objects are inlined as JSON with no @H', () => {
+    const {out} = serialize({a: 1, b: 'two', c: [1, 2, 3]});
+    expect(out).toEqual({a: 1, b: 'two', c: [1, 2, 3]});
     expect(out[HANDLE_MARKER]).toBeUndefined();
   });
 
+  it('plain data objects with nested signals stay inline; the signals get @H', () => {
+    const {out, signals} = serialize({name: signal('x')});
+    expect(out[HANDLE_MARKER]).toBeUndefined();
+    expect(out.name[HANDLE_MARKER]).toMatch(/^s\d+$/);
+    expect(out.name.v).toBe('x');
+    expect(signals).toHaveLength(1);
+  });
+
+  it('plain data object with a method upgrades to an o handle', () => {
+    const {out, handles} = serialize({
+      count: 5,
+      next() {
+        return 6;
+      },
+    });
+    expect(out[HANDLE_MARKER]).toMatch(/^o\d+$/);
+    expect(out.sh[0]).toEqual(['count']); // next is omitted
+    expect(handles).toHaveLength(1); // only the object itself
+  });
+
+  it('arrays are emitted as arrays with recursed items', () => {
+    const {out} = serialize([1, signal(2), {a: 3}]);
+    expect(Array.isArray(out)).toBe(true);
+    expect(out[0]).toBe(1);
+    expect(out[1][HANDLE_MARKER]).toMatch(/^s/);
+    expect(out[1].v).toBe(2);
+    expect(out[2]).toEqual({a: 3});
+  });
+});
+
+describe('Serializer: signals (tier 1)', () => {
   it('signals get an @H:s<n> handle with inline value', () => {
     const s = signal(7);
     const {out, signals} = serialize(s);
-    expect(out['@H']).toMatch(/^s\d+$/);
+    expect(out[HANDLE_MARKER]).toMatch(/^s\d+$/);
     expect(out.v).toBe(7);
-    expect(signals.length).toBe(1);
+    expect(signals).toHaveLength(1);
   });
 
-  it('re-emitting the same signal to the same client sends a short reference', () => {
+  it('re-emitting the same signal to the same peer sends a short reference', () => {
     const s = signal(7);
     const h = new Handles();
     const ser = new Serializer(h);
     const first = ser.serialize(s, {peerId: 'c1'});
     const second = ser.serialize(s, {peerId: 'c1'});
-    expect(first['@H']).toBe(second['@H']);
+    expect(first[HANDLE_MARKER]).toBe(second[HANDLE_MARKER]);
     expect(first.v).toBe(7);
-    expect(second.v).toBeUndefined(); // short ref, no inline value
+    expect(second.v).toBeUndefined();
   });
 
-  it('Models emit shape + data inline on first use, only data on reuse', () => {
+  it('signals do NOT participate in refcounts (tier 1 uses @W/@U instead)', () => {
+    const {h, out} = serialize(signal(0));
+    const id = (out as any)[HANDLE_MARKER] as string;
+    expect(h.get(id)?.refs.size).toBe(0);
+  });
+});
+
+describe('Serializer: models and classes (tier 2)', () => {
+  it('Models emit shape + data inline on first use, only @H on reuse', () => {
     const M = createModel<{
       a: ReturnType<typeof signal<number>>;
       b: ReturnType<typeof signal<string>>;
@@ -60,69 +102,118 @@ describe('Serializer', () => {
     const h = new Handles();
     const ser = new Serializer(h);
     const first = ser.serialize(instance, {peerId: 'c1'});
-    expect(first['@H']).toMatch(/^o\d+$/);
-    expect(first.s).toBeDefined(); // shape id
+    expect(first[HANDLE_MARKER]).toMatch(/^o\d+$/);
+    expect(first.s).toBeDefined();
     expect(first.sh).toEqual([
       ['a', 'b'],
       [1, 1],
-    ]); // kinds: signal, signal
-    expect(first.n).toBeDefined(); // model-name id
+    ]);
     expect(first.mn).toEqual([expect.any(Number), 'M']);
-    expect(first.d).toBeInstanceOf(Array);
-    expect(first.d.length).toBe(2);
+    expect(first.n).toBeDefined();
+    expect(first.d).toHaveLength(2);
 
-    // Second emission to the same client: short reference.
     const second = ser.serialize(instance, {peerId: 'c1'});
-    expect(second['@H']).toBe(first['@H']);
+    expect(second[HANDLE_MARKER]).toBe(first[HANDLE_MARKER]);
     expect(second.sh).toBeUndefined();
     expect(second.mn).toBeUndefined();
-    // Shape-id and data are not re-sent in the short-reference form.
     expect(second.s).toBeUndefined();
     expect(second.d).toBeUndefined();
   });
 
-  it('plain objects with signal or handle slots get a shape + id', () => {
-    const plain = {count: signal(0)};
-    const {out} = serialize(plain);
-    expect(out['@H']).toMatch(/^o\d+$/);
-    expect(out.sh).toBeDefined();
-    // No model-name because no createModel() on the ctor.
+  it('class with prototype methods auto-upgrades to an o handle (no createModel needed)', () => {
+    class Project {
+      id = signal('1');
+      rename(next: string) {
+        this.id.value = next;
+      }
+    }
+    const {out} = serialize(new Project());
+    expect(out[HANDLE_MARKER]).toMatch(/^o\d+$/);
+    // No model name (ctor isn't stamped)
     expect(out.mn).toBeUndefined();
+    // `rename` is a prototype method; it is NOT in the shape.
+    expect(out.sh[0]).toEqual(['id']);
   });
 
-  it('functions become @H:f<n> handles', () => {
-    const {out, handles} = serialize(() => 1);
-    expect(out['@H']).toMatch(/^f\d+$/);
-    expect(handles.length).toBe(1);
+  it('class with no methods stays pure JSON', () => {
+    class Point {
+      constructor(
+        public x: number,
+        public y: number,
+      ) {}
+    }
+    const {out} = serialize(new Point(3, 4));
+    expect(out[HANDLE_MARKER]).toBeUndefined();
+    expect(out).toEqual({x: 3, y: 4});
   });
 
-  it('promises become @H:p<n> handles', () => {
-    const {out, handles} = serialize(Promise.resolve(1));
-    expect(out['@H']).toMatch(/^p\d+$/);
-    expect(handles.length).toBe(1);
+  it('methods are omitted from shape and data; they are trap-dispatched', () => {
+    const M = createModel('Thing', () => ({
+      count: signal(0),
+      increment() {},
+      add(_x: number) {},
+    }));
+    const {out} = serialize(new M());
+    expect(out.sh[0]).toEqual(['count']);
+    expect(out.d).toHaveLength(1);
+  });
+});
+
+describe('Serializer: functions (tier 2)', () => {
+  it('free functions become @H:f<n> handles and retain', () => {
+    const {out, handles, h} = serialize(() => 1);
+    expect(out[HANDLE_MARKER]).toMatch(/^f\d+$/);
+    expect(handles).toHaveLength(1);
+    const id = (out as any)[HANDLE_MARKER] as string;
+    expect(h.get(id)?.refs.get('c1')).toBe(1);
+  });
+});
+
+describe('Serializer: promises (tier 3)', () => {
+  it('promises get an @H:p<n> marker without entering the Handles registry', () => {
+    const {out, promises, h} = serialize(Promise.resolve(1));
+    expect(out[HANDLE_MARKER]).toMatch(/^p\d+$/);
+    expect(promises).toHaveLength(1);
+    const id = (out as any)[HANDLE_MARKER] as string;
+    // Tier 3: no Handle entry, no refcount, no release path.
+    expect(h.get(id)).toBeUndefined();
   });
 
-  it('arrays are emitted as arrays with recursed items', () => {
-    const {out} = serialize([1, signal(2), {a: 3}]);
-    expect(Array.isArray(out)).toBe(true);
-    expect(out[0]).toBe(1);
-    expect(out[1]['@H']).toMatch(/^s/);
-    expect(out[1].v).toBe(2);
-    expect(out[2]).toEqual({a: 3});
-  });
-
-  it('retain/release contract: one retain per new emission, none on short refs', () => {
-    const s = signal(0);
+  it('the same Promise re-emits with the same pid (no double settlement)', () => {
+    const p = Promise.resolve(1);
     const h = new Handles();
     const ser = new Serializer(h);
-    ser.serialize(s, {peerId: 'c1'});
-    const id = h.idOf(s)!;
-    expect(h.get(id)?.refs.get('c1')).toBe(1);
-    ser.serialize(s, {peerId: 'c1'});
-    // Short reference — refcount unchanged.
-    expect(h.get(id)?.refs.get('c1')).toBe(1);
-    // Different client: fresh refcount.
-    ser.serialize(s, {peerId: 'c2'});
-    expect(h.get(id)?.refs.get('c2')).toBe(1);
+    const fired: string[] = [];
+    const hooks = {
+      peerId: 'c1',
+      onPromiseEmitted: (id: string) => fired.push(id),
+    };
+    const first = ser.serialize(p, hooks);
+    const second = ser.serialize(p, hooks);
+    expect(first[HANDLE_MARKER]).toBe(second[HANDLE_MARKER]);
+    expect(fired).toHaveLength(1);
+  });
+});
+
+describe('Serializer: toJSON opt-out', () => {
+  it('respects .toJSON() on values, matching JSON.stringify semantics', () => {
+    const date = new Date('2024-01-01T00:00:00.000Z');
+    const {out} = serialize(date);
+    expect(typeof out).toBe('string');
+    expect(out).toBe('2024-01-01T00:00:00.000Z');
+  });
+
+  it('a user-defined toJSON opts out of handle upgrading', () => {
+    class Opinion {
+      say() {
+        return 'hi';
+      }
+      toJSON() {
+        return {plain: true};
+      }
+    }
+    const {out} = serialize(new Opinion());
+    expect(out[HANDLE_MARKER]).toBeUndefined();
+    expect(out).toEqual({plain: true});
   });
 });

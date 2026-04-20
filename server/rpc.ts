@@ -408,6 +408,10 @@ export class RPC {
   // ───── retention ───────────────────────────────────────────────────────────
 
   private handleRelease(clientId: string, handleId: string) {
+    // Only object (o) and function (f) handles participate in release.
+    // Signals are driven by @W/@U; promises are one-shot and don't track refs.
+    const kind = handleId[0];
+    if (kind !== 'o' && kind !== 'f') return;
     const fullyOrphaned = this.handles.release(handleId, clientId);
     if (fullyOrphaned) {
       if (this.retention.kind === 'disconnect') {

@@ -424,6 +424,124 @@ describe('Integration: functions and promises', () => {
   });
 });
 
+describe('Integration: tiered lifecycle', () => {
+  it('non-Model class with methods auto-upgrades; methods route through the trap', async () => {
+    vi.useFakeTimers();
+    class Project {
+      id = signal('42');
+      name = signal('Initial');
+      rename(next: string) {
+        this.name.value = next;
+        return {ok: true};
+      }
+    }
+    const rpc = new RPC({project: new Project()});
+    const {client, flush} = connect(rpc, 'c1');
+    await flush();
+    await client.ready;
+
+    // No createModel, no type name — but the Proxy still dispatches methods.
+    expect(typeOfRemote(client.root.project)).toBeUndefined();
+    expect(client.root.project.name.peek()).toBe('Initial');
+    const p = client.root.project.rename('Renamed');
+    await flush();
+    await expect(p).resolves.toEqual({ok: true});
+  });
+
+  it('plain data objects with no methods stay pure JSON', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC({
+      getUser() {
+        return {id: 1, name: 'jason', email: 'x@y.z'};
+      },
+    });
+    const {client, flush} = connect(rpc, 'c1');
+    await flush();
+    await client.ready;
+
+    const p = client.call('getUser');
+    await flush();
+    const result = await p;
+    // Not a Proxy: the brand is absent, typeOfRemote returns undefined.
+    expect(typeOfRemote(result)).toBeUndefined();
+    expect(result).toEqual({id: 1, name: 'jason', email: 'x@y.z'});
+  });
+
+  it('plain data with a method upgrades to a handle (methods become callable)', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC({
+      query() {
+        const items = [1, 2, 3];
+        return {
+          items,
+          count() {
+            return items.length;
+          },
+        };
+      },
+    });
+    const {client, flush} = connect(rpc, 'c1');
+    await flush();
+    await client.ready;
+
+    const p = client.call('query');
+    await flush();
+    const result = await p;
+    expect(result.items).toEqual([1, 2, 3]);
+    const c = result.count();
+    await flush();
+    expect(await c).toBe(3);
+  });
+
+  it('values with .toJSON() opt out of handle upgrading', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC({
+      when() {
+        return new Date('2024-01-01T00:00:00.000Z');
+      },
+    });
+    const {client, flush} = connect(rpc, 'c1');
+    await flush();
+    await client.ready;
+
+    const p = client.call('when');
+    await flush();
+    const result = await p;
+    // Serialized via Date.prototype.toJSON — arrives as a string.
+    expect(result).toBe('2024-01-01T00:00:00.000Z');
+  });
+
+  it('Symbol.dispose on a Proxy eagerly releases the handle', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC(
+      {
+        make() {
+          return new Counter();
+        },
+      },
+      {retention: {kind: 'ttl', idleMs: 100_000}},
+    );
+
+    const {client, flush} = connect(rpc, 'c1');
+    await flush();
+    await client.ready;
+
+    const p = client.call('make');
+    await flush();
+    const proxy = await p;
+    const brand = (proxy as any)[Symbol.for('mixed-signals.remote')];
+    const id = brand.id as string;
+    expect(rpc.handles.get(id)?.refs.size).toBe(1);
+
+    // Deterministic dispose — no waiting for GC.
+    proxy[Symbol.dispose]();
+    // Release batch is debounced ~16ms.
+    vi.advanceTimersByTime(20);
+    await flush();
+    expect(rpc.handles.get(id)?.refs.size).toBe(0);
+  });
+});
+
 describe('Integration: reconnect', () => {
   it('client.reconnect() re-hydrates shapes and signals from scratch', async () => {
     vi.useFakeTimers();

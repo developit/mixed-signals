@@ -9,7 +9,7 @@ import {
   SHAPE_ID_FIELD,
   SIGNAL_VALUE_FIELD,
 } from './protocol.ts';
-import {type Shape, SLOT_HANDLE, SLOT_SIGNAL, type SlotKind} from './shapes.ts';
+import {type Shape, SLOT_SIGNAL, type SlotKind} from './shapes.ts';
 
 /**
  * Minimal public surface the hydrator uses to do its job. The concrete RPC
@@ -54,8 +54,9 @@ export class Hydrator {
     this.env = env;
     if (HAS_FINALIZATION_REGISTRY) {
       this.finalization = new FinalizationRegistry<string>((id) => {
-        // Only release if we haven't already re-hydrated this id with a new
-        // live proxy in the meantime.
+        // Tier 2 only (o/f). Signals use @W/@U; promises settle once and are
+        // never released by the client. Neither is ever registered here, so
+        // the callback doesn't need to filter them out.
         const ref = this.handles.get(id);
         if (ref instanceof WeakRef && ref.deref() === undefined) {
           this.handles.delete(id);
@@ -154,7 +155,9 @@ export class Hydrator {
       enumerable: false,
       configurable: true,
     });
-    this.register(id, sig);
+    // Tier 1: signals are governed by @W/@U, not by GC. Store for lookup;
+    // do not register with the FinalizationRegistry.
+    this.handles.set(id, sig);
     return sig;
   }
 
@@ -213,10 +216,21 @@ export class Hydrator {
 
     const methodCache = new Map<string, (...args: any[]) => any>();
     const env = this.env;
+    let disposed = false;
+    const disposeFn = () => {
+      if (disposed) return;
+      disposed = true;
+      env.scheduleRelease(id);
+    };
     const proxy = new Proxy(spine, {
       get(target, key) {
         if (key === BRAND_REMOTE) return target[BRAND_REMOTE];
-        if (typeof key === 'symbol') return (target as any)[key];
+        if (typeof key === 'symbol') {
+          // Opt-in deterministic release via `using proxy = …` or a manual
+          // `proxy[Symbol.dispose]()` call. Short-circuits GC.
+          if (key === Symbol.dispose) return disposeFn;
+          return (target as any)[key];
+        }
         if (key in target) return target[key];
         // Well-known JS duck-typing probes: return undefined so runtime code
         // that checks `typeof obj.then === 'function'` (Promise resolution,
@@ -271,20 +285,23 @@ export class Hydrator {
         return true;
       },
     });
-    this.register(id, proxy);
+    this.registerWithFinalization(id, proxy);
     return proxy;
   }
 
-  private reviveSlot(kind: SlotKind, data: any): any {
+  private reviveSlot(_kind: SlotKind, data: any): any {
     if (data === null || data === undefined) return data;
-    // In all three cases the data was written by walk() on the server, so any
-    // handles are already reconstructed by our reviver upstream of here.
-    // However, the reviver is only invoked during JSON.parse; if the caller
-    // passes already-parsed objects, we recurse ourselves.
-    if (kind === SLOT_SIGNAL || kind === SLOT_HANDLE) {
-      if (data && typeof data === 'object' && HANDLE_MARKER in data) {
-        return this.hydrate(data);
-      }
+    // If the JSON reviver already ran, this slot holds a real hydrated value
+    // (Signal, Proxy, Promise, function). Those carry `BRAND_REMOTE`; skip.
+    if (typeof data !== 'object') return data;
+    if ((data as any)[BRAND_REMOTE]) return data;
+    // Direct-path case (tests / in-process hydration without JSON.parse):
+    // markers are plain objects with an own `@H` string.
+    if (
+      Object.hasOwn(data, HANDLE_MARKER) &&
+      typeof (data as any)[HANDLE_MARKER] === 'string'
+    ) {
+      return this.hydrate(data);
     }
     return data;
   }
@@ -335,7 +352,7 @@ export class Hydrator {
       kind: 'f',
       owner: 'server',
     } satisfies RemoteBrand;
-    this.register(id, fn);
+    this.registerWithFinalization(id, fn);
     return fn;
   }
 
@@ -352,13 +369,17 @@ export class Hydrator {
       owner: 'server',
     } satisfies RemoteBrand;
     this.env.registerPendingPromise(id, settle);
-    this.register(id, p);
+    // Tier 3: one-shot lifecycle. No GC registration, no release frame. If
+    // the client drops the Promise before the server settles, the settlement
+    // arrives and finds no pending entry — fine.
+    this.handles.set(id, p);
     return p;
   }
 
   // ───── registry / finalization ────────────────────────────────────────────
 
-  private register(id: string, value: object) {
+  /** Tier 2 registration: stored weakly, release sent on finalization. */
+  private registerWithFinalization(id: string, value: object) {
     this.handles.set(id, new WeakRef(value));
     this.finalization?.register(value, id, value);
   }

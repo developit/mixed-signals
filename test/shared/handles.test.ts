@@ -49,8 +49,8 @@ describe('Handles', () => {
   it('shape registry dedupes by ctor and signature', () => {
     const h = new Handles();
     class Ctor {}
-    const s1 = h.shapeIdFor(Ctor, 'a:1|b:2', {keys: ['a', 'b'], kinds: [1, 2]});
-    const s2 = h.shapeIdFor(Ctor, 'a:1|b:2', {keys: ['a', 'b'], kinds: [1, 2]});
+    const s1 = h.shapeIdFor(Ctor, 'a:1|b:0', {keys: ['a', 'b'], kinds: [1, 0]});
+    const s2 = h.shapeIdFor(Ctor, 'a:1|b:0', {keys: ['a', 'b'], kinds: [1, 0]});
     expect(s1).toBe(s2);
     const s3 = h.shapeIdFor(undefined, 'c:0', {keys: ['c'], kinds: [0]});
     expect(s3).not.toBe(s1);

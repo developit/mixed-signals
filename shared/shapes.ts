@@ -1,64 +1,27 @@
-import {Signal} from '@preact/signals-core';
-
 /**
- * Each slot in a shape is one of:
- *   0 — plain JSON value (string, number, boolean, null, array, nested plain object)
- *   1 — a Signal (reconstructed on the receiver via @H with kind "s")
- *   2 — a nested handle (model, plain object, function, promise)
+ * A "shape" is the compressed description of an `o` handle's data slots.
+ * We track two kinds:
+ *
+ *   0 — everything non-signal (plain JSON, nested `@H` handle, arrays, …)
+ *   1 — a Signal slot (the hydrator materializes a live `Signal` there)
+ *
+ * That's the entire classification. Methods never appear in a shape —
+ * they're dispatched via the Proxy trap, not carried as data.
  */
-export const SLOT_PLAIN = 0 as const;
+export const SLOT_OTHER = 0 as const;
 export const SLOT_SIGNAL = 1 as const;
-export const SLOT_HANDLE = 2 as const;
 
-export type SlotKind =
-  | typeof SLOT_PLAIN
-  | typeof SLOT_SIGNAL
-  | typeof SLOT_HANDLE;
+export type SlotKind = typeof SLOT_OTHER | typeof SLOT_SIGNAL;
 
 export interface Shape {
-  /** Ordered list of own enumerable keys (stripped of `_`-prefixed & non-serializable). */
+  /** Ordered list of own enumerable non-`_`, non-function keys. */
   keys: string[];
-  /** Slot classification, aligned with `keys`. */
+  /** One slot tag per key. */
   kinds: SlotKind[];
 }
 
-/** Classify a single value to a slot kind. */
-export function classifySlot(value: unknown): SlotKind {
-  if (value instanceof Signal) return SLOT_SIGNAL;
-  if (value === null || value === undefined) return SLOT_PLAIN;
-  const t = typeof value;
-  if (t === 'function') return SLOT_HANDLE;
-  if (t !== 'object') return SLOT_PLAIN;
-  // Promises always become handles (pending or settled — the serializer decides).
-  if (typeof (value as any).then === 'function') return SLOT_HANDLE;
-  // Plain objects / arrays are PLAIN at the slot level; the serializer will
-  // recurse into them and any Signals/handles encountered deeper will appear
-  // inline as `@H` markers inside the plain JSON.
-  return SLOT_PLAIN;
-}
-
-/**
- * Compute the shape of a non-null object. Skips `_`-prefixed keys. Function
- * properties are included — they become handle slots.
- */
-export function shapeOf(value: Record<string, unknown>): Shape {
-  const keys: string[] = [];
-  const kinds: SlotKind[] = [];
-  for (const key of Object.keys(value)) {
-    if (key[0] === '_') continue;
-    keys.push(key);
-    kinds.push(classifySlot(value[key]));
-  }
-  return {keys, kinds};
-}
-
-/**
- * A canonical string signature for a shape, used as a cache key on the server.
- * The receiver never parses this — it only sees shape objects inline on first
- * use, keyed by numeric shapeId.
- */
+/** A canonical string signature, used as a shape-cache key on the sender. */
 export function shapeSignature(shape: Shape): string {
-  // keys are already ordered; kinds are aligned. "key:kind|key:kind|…"
   let out = '';
   for (let i = 0; i < shape.keys.length; i++) {
     if (i) out += '|';
