@@ -86,6 +86,13 @@ export class ClientReflection implements HydrateEnv {
   }
 
   scheduleRelease(id: string): void {
+    // Only object (o) and function (f) handles participate in refcounted
+    // release. Signals (s) are driven by @W/@U. Promises (p) are one-shot.
+    // We never register those with the FinalizationRegistry, but filter here
+    // too so manual callers (e.g. Symbol.dispose) can't accidentally send
+    // release frames for kinds that shouldn't carry them.
+    const kind = id[0];
+    if (kind !== 'o' && kind !== 'f') return;
     this.releaseBatch.add(id);
     if (!this.releaseTimer) {
       // Slightly longer — finalization callbacks come in bursts.

@@ -160,15 +160,39 @@ export class Handles {
    * Release everything a client was holding. Returns the ids that became
    * fully orphaned (so the caller can free them from any secondary state
    * — lastSentValues, subscriptions, etc).
+   *
+   * Covers two populations:
+   *   - tier 2 (`o`, `f`): ref-counted; orphaned means "last holder gone."
+   *   - tier 1 (`s`): not refcounted; orphaned means "no other client has
+   *     ever received this signal." We use `sentHandlesByClient` as the
+   *     liveness witness.
    */
   releaseAllForClient(clientId: ClientId): string[] {
     const orphaned: string[] = [];
+    // Tier 2: decrement refs.
     for (const e of this.entries.values()) {
       if (e.refs.delete(clientId) && e.refs.size === 0) orphaned.push(e.id);
     }
+    // Snapshot this client's sent set before we drop it.
+    const sent = this.sentHandlesByClient.get(clientId);
     this.shapesByClient.delete(clientId);
     this.modelNamesByClient.delete(clientId);
     this.sentHandlesByClient.delete(clientId);
+    // Tier 1: signals the departing client saw, that no remaining client
+    // has seen, are orphaned too.
+    if (sent) {
+      for (const id of sent) {
+        if (id[0] !== 's') continue;
+        let stillSeen = false;
+        for (const otherSent of this.sentHandlesByClient.values()) {
+          if (otherSent.has(id)) {
+            stillSeen = true;
+            break;
+          }
+        }
+        if (!stillSeen) orphaned.push(id);
+      }
+    }
     return orphaned;
   }
 
@@ -193,13 +217,21 @@ export class Handles {
 
   // ───── shape cache ────────────────────────────────────────────────────────
 
-  /** Look up (or allocate) a shape id from a ctor (fast path for Models). */
+  /**
+   * Look up (or allocate) a shape id.
+   *
+   * The signature is always authoritative. The ctor cache is a micro-opt
+   * for Models where every instance shares a shape — but plain objects all
+   * have `Object` as their ctor yet may have wildly different shapes, so we
+   * only use the ctor cache when the ctor is not `Object`.
+   */
   shapeIdFor(
     ctor: object | undefined,
     signature: string,
     shape: Shape,
   ): number {
-    if (ctor) {
+    const useCtorCache = ctor && ctor !== Object;
+    if (useCtorCache) {
       const hit = this.shapeIdByCtor.get(ctor);
       if (hit !== undefined) return hit;
     }
@@ -209,7 +241,7 @@ export class Handles {
       this.shapeIdBySig.set(signature, id);
       this.shapes.set(id, shape);
     }
-    if (ctor) this.shapeIdByCtor.set(ctor, id);
+    if (useCtorCache) this.shapeIdByCtor.set(ctor, id);
     return id;
   }
 

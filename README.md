@@ -120,23 +120,41 @@ calls on first access.
 
 ## Handles: what crosses the wire
 
-| Value                                 | Wire handle | Client rehydrates as                                 |
-| ------------------------------------- | ----------- | ---------------------------------------------------- |
-| `signal(x)`                           | `s<n>`      | live `Signal` wired to `@W`/`@U`                     |
-| `new Model()` (created via `createModel`) | `o<n>`      | `Proxy` with `typeName`, signal props, method stubs  |
-| plain object with signals or handles  | `o<n>`      | same, anonymous (no `typeName`)                      |
-| plain object of pure JSON             | —           | inlined JSON (no id — nothing to retain)             |
-| function                              | `f<n>`      | callable `Proxy` that RPCs to the server             |
-| `Promise` (pending)                   | `p<n>`      | live `Promise`, settled by `@P` / `@PE`              |
-| `Promise` (already settled)           | —           | the resolved value directly (no extra round trip)    |
+| Value                                       | Wire | Tier | Release mechanism                  | Client rehydrates as                                 |
+| ------------------------------------------- | ---- | ---- | ---------------------------------- | ---------------------------------------------------- |
+| `signal(x)`                                 | `s`  | 1    | `@W`/`@U` subscription (no GC)     | live `Signal`                                        |
+| `new Model()` (via `createModel(name, …)`) | `o`  | 2    | refcount + `FinalizationRegistry`  | `Proxy` with `typeName`, signal props, method trap   |
+| class instance with methods (no createModel)| `o`  | 2    | same                               | same, no `typeName`                                  |
+| plain object with at least one method       | `o`  | 2    | same                               | same, no `typeName`                                  |
+| plain object of pure data (no methods)      | —    | —    | none — pass-by-value                | plain JS object                                      |
+| function                                    | `f`  | 2    | refcount + `FinalizationRegistry`  | callable `Proxy` that RPCs to the server             |
+| `Promise` (pending)                         | `p`  | 3    | one-shot `@P`/`@PE` settlement     | live `Promise`                                       |
+| `Promise` (already settled)                 | —    | —    | none                               | the resolved value inline                            |
 
-When you pass one of these back to the server, the client's `JSON.stringify`
-replacer detects the brand and emits `{"@H":"<id>"}`. The server resolves
-that to the original live value. **Identity is preserved end to end.**
+### What each tier means for you
 
-## Retention policies
+- **Tier 1 (signals)** — subscription *is* retention. No GC needed; works
+  on every JS engine. The server only holds a live `.subscribe(...)` while
+  a client is `@W`-watching.
+- **Tier 2 (objects, functions)** — the client's `FinalizationRegistry`
+  observes unreachable Proxies / callables and batches `@H-` release
+  frames. Server decrements refcounts; retention policy handles cleanup
+  once they hit zero.
+- **Tier 3 (promises)** — one settlement frame, no refcount, no release.
+  A Promise the client stopped caring about is O(1) wasted frame.
 
-Configure on the server constructor:
+### Identity round-trip
+
+When you pass a hydrated value back to the server (as a method argument,
+a callback receiver, anything), the client's `JSON.stringify` replacer
+detects the hidden brand and emits `{"@H":"<id>"}`. The server resolves
+that to the original live object. **`===` identity is preserved end to
+end, no user API needed.**
+
+## Retention policies (tier 2 only)
+
+Configure on the server constructor. Only affects `o` and `f` handles;
+signals and promises have their own lifecycles.
 
 ```ts
 new RPC(root, { retention: { kind: "ttl", idleMs: 30_000 } }); // default
@@ -149,14 +167,25 @@ new RPC(root, { retention: { kind: "weak" } });
   emission, method call, reconnection) resets the clock. Default because it
   tolerates reconnects.
 - **`disconnect`** — handles stay until the client disconnects; on disconnect
-  everything orphaned is dropped. Use when reconnection is rare and you want
-  zero idle-time sweep.
+  everything orphaned is dropped.
 - **`weak`** — orphaned handles drop immediately. Use when your domain layer
   owns the lifecycle and RPC is just reflecting live objects.
 
-No manual disposal API. Clients use `FinalizationRegistry` to feed release
-notifications back to the server; environments without it rely on the
-chosen retention policy.
+No manual disposal API. On environments with `FinalizationRegistry`,
+clients send `@H-` release frames as Proxies become unreachable. On older
+engines, the chosen retention policy is the sole cleanup mechanism.
+
+### Deterministic dispose via `Symbol.dispose`
+
+```ts
+{
+  using project = await rpc.root.getProject('42');
+  // … use project
+} // on scope exit, Symbol.dispose fires → immediate @H- release
+```
+
+Or explicitly: `project[Symbol.dispose]()`. Short-circuits GC and is
+entirely optional.
 
 ## API
 
