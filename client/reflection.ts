@@ -12,7 +12,7 @@ export interface WireContext {
 }
 
 /**
- * Owns outbound batching: @W, @U, @H-. All three use the same debounce pattern
+ * Owns outbound batching: @W, @U, @D. All three use the same debounce pattern
  * (1ms for watch/release bursts, 10ms for unwatch so quick remounts stay
  * subscribed). The actual hydration is delegated to the shared `Hydrator`.
  */
@@ -112,7 +112,7 @@ export class ClientReflection implements HydrateEnv {
     this.pendingPromises.set(id, settle);
   }
 
-  /** @internal — called by the client RPC on @P / @PE notifications. */
+  /** @internal — called by the client RPC on @P / @E notifications. */
   settlePromise(id: string, value: any, reject: boolean) {
     const entry = this.pendingPromises.get(id);
     if (!entry) return;

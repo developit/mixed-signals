@@ -126,7 +126,7 @@ describe('Release protocol', () => {
   it('client relays a release when a handle becomes unreachable (FinalizationRegistry)', async () => {
     // FinalizationRegistry timing is nondeterministic, so we verify the
     // deterministic path: the client env's scheduleRelease is exposed via
-    // the release batch mechanism, and @H- frames land on the server.
+    // the release batch mechanism, and @D frames land on the server.
     vi.useFakeTimers();
     const rpc = new RPC(
       {

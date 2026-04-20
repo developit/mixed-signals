@@ -8,12 +8,12 @@ export const ROOT_NOTIFICATION_METHOD = '@R';
 export const SIGNAL_UPDATE_METHOD = '@S';
 export const WATCH_SIGNALS_METHOD = '@W';
 export const UNWATCH_SIGNALS_METHOD = '@U';
-/** Client → server: release these handle ids (coalesced). */
-export const RELEASE_HANDLES_METHOD = '@H-';
+/** Client → server: drop these handle ids (coalesced). "D" as in dereference. */
+export const RELEASE_HANDLES_METHOD = '@D';
 /** Server → client: a previously-pending promise handle has resolved. */
 export const PROMISE_RESOLVE_METHOD = '@P';
 /** Server → client: a previously-pending promise handle has rejected. */
-export const PROMISE_REJECT_METHOD = '@PE';
+export const PROMISE_REJECT_METHOD = '@E';
 /**
  * Every structured reference on the wire uses this field name.
  * The first character of the id is the kind: s=signal, o=object/model,

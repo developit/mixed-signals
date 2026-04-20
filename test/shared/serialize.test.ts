@@ -50,7 +50,7 @@ describe('Serializer: basics', () => {
       },
     });
     expect(out[HANDLE_MARKER]).toMatch(/^o\d+$/);
-    expect(out.sh[0]).toEqual(['count']); // next is omitted
+    expect(out.sh).toEqual({count: 0}); // next is omitted
     expect(handles).toHaveLength(1); // only the object itself
   });
 
@@ -104,10 +104,7 @@ describe('Serializer: models and classes (tier 2)', () => {
     const first = ser.serialize(instance, {peerId: 'c1'});
     expect(first[HANDLE_MARKER]).toMatch(/^o\d+$/);
     expect(first.s).toBeDefined();
-    expect(first.sh).toEqual([
-      ['a', 'b'],
-      [1, 1],
-    ]);
+    expect(first.sh).toEqual({a: 1, b: 1});
     expect(first.mn).toEqual([expect.any(Number), 'M']);
     expect(first.n).toBeDefined();
     expect(first.d).toHaveLength(2);
@@ -132,7 +129,7 @@ describe('Serializer: models and classes (tier 2)', () => {
     // No model name (ctor isn't stamped)
     expect(out.mn).toBeUndefined();
     // `rename` is a prototype method; it is NOT in the shape.
-    expect(out.sh[0]).toEqual(['id']);
+    expect(out.sh).toEqual({id: 1});
   });
 
   it('class with no methods stays pure JSON', () => {
@@ -154,7 +151,7 @@ describe('Serializer: models and classes (tier 2)', () => {
       add(_x: number) {},
     }));
     const {out} = serialize(new M());
-    expect(out.sh[0]).toEqual(['count']);
+    expect(out.sh).toEqual({count: 1});
     expect(out.d).toHaveLength(1);
   });
 });

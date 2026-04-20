@@ -102,7 +102,16 @@ export class Hydrator {
 
     // New handle. Install shape / model-name preludes first.
     if (SHAPE_FIELD in marker) {
-      const [keys, kinds] = marker[SHAPE_FIELD] as [string[], SlotKind[]];
+      // Shape wire format: `{key: kind, …}`. ECMAScript guarantees
+      // string-key insertion order round-trips through JSON.parse, so the
+      // data array's iᵗʰ slot matches the iᵗʰ key here.
+      const wireShape = marker[SHAPE_FIELD] as Record<string, SlotKind>;
+      const keys: string[] = [];
+      const kinds: SlotKind[] = [];
+      for (const k in wireShape) {
+        keys.push(k);
+        kinds.push(wireShape[k]);
+      }
       this.shapes.set(marker[SHAPE_ID_FIELD], {keys, kinds});
     }
     if (MODEL_NAME_FIELD in marker) {
