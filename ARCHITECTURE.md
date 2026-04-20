@@ -1,9 +1,9 @@
 # mixed-signals
 
-General‑purpose RPC built around three lifecycle tiers and one wire marker.
+General-purpose RPC built around three lifecycle tiers and one wire marker.
 Signals, Models, plain objects, functions, and Promises all cross the
 transport with identity and the *minimum* lifecycle machinery their kind
-requires — no more, no less.
+requires - no more, no less.
 
 ---
 
@@ -13,13 +13,13 @@ requires — no more, no less.
 | ------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
 | **Transport**      | `{ send(str), onMessage(cb), ready? }`. WebSocket, postMessage, MessagePort, stdin/stdout all fit.                           |
 | **Handle**         | Any value with wire identity: Signal, object (Model or class instance with methods), function, Promise.                      |
-| **Kind**           | Single‑char prefix on every handle id. `s`=signal, `o`=object, `f`=function, `p`=promise.                                    |
-| **Shape**          | Cached per‑client description of an `o` handle's data keys + slot kinds. Inline once, referenced by numeric id afterward.    |
-| **Brand**          | Hidden registered symbol on every hydrated value. Lets the serializer emit `{@H:id}` when a value round‑trips to its owner. |
-| **Handles**        | Single server registry: id ↔ value, shape cache, model‑name cache, per‑client refcounts (for `o` / `f` only).               |
-| **Reflection**     | Signal subscription manager on the server: lazy fan‑out, per‑client delta tracking, `@S` push.                               |
-| **Hydrator**       | Client‑side counterpart. Builds Proxies, signals, callables, promises from `@H` markers.                                     |
-| **Retention**      | Server policy for reclaiming tier‑2 handles with no holders. Default `ttl` 30s; also `disconnect` and `weak`.                |
+| **Kind**           | Single-char prefix on every handle id. `s`=signal, `o`=object, `f`=function, `p`=promise.                                    |
+| **Shape**          | Cached per-client description of an `o` handle's data keys + slot kinds. Inline once, referenced by numeric id afterward.    |
+| **Brand**          | Hidden registered symbol on every hydrated value. Lets the serializer emit `{@H:id}` when a value round-trips to its owner. |
+| **Handles**        | Single server registry: id ↔ value, shape cache, model-name cache, per-client refcounts (for `o` / `f` only).               |
+| **Reflection**     | Signal subscription manager on the server: lazy fan-out, per-client delta tracking, `@S` push.                               |
+| **Hydrator**       | Client-side counterpart. Builds Proxies, signals, callables, promises from `@H` markers.                                     |
+| **Retention**      | Server policy for reclaiming tier-2 handles with no holders. Default `ttl` 30s; also `disconnect` and `weak`.                |
 
 ---
 
@@ -27,34 +27,34 @@ requires — no more, no less.
 
 | Kind | Tier | How release is signaled | GC required? | Works on old engines |
 |------|------|-------------------------|--------------|----------------------|
-| Signal (`s`) | 1 — subscription | `@W` / `@U` notifications | No | Always |
-| Object/Function (`o`/`f`) | 2 — refcounted | `@H-` batched from `FinalizationRegistry` + optional `Symbol.dispose` | Yes (with server policy as fallback) | Degrades to policy‑only |
-| Promise (`p`) | 3 — one‑shot | `@P` / `@PE` settlement frame | No | Always |
+| Signal (`s`) | 1 - subscription | `@W` / `@U` notifications | No | Always |
+| Object/Function (`o`/`f`) | 2 — refcounted | `@D` batched from `FinalizationRegistry` + optional `Symbol.dispose` | Yes (with server policy as fallback) | Degrades to policy‐only |
+| Promise (`p`) | 3 — one‐shot | `@P` / `@E` settlement frame | No | Always |
 
 **Tier 1 (signals)** is the cleanest case. `signal(v, {watched, unwatched})`
-gives the server deterministic, engine‑guaranteed hooks for "first reader"
-and "last reader." Subscription *is* retention — the server only holds a
-live `.subscribe(...)` while at least one client is `@W`‑watching. Signals
-are never registered with `FinalizationRegistry`, never appear in `@H-`
+gives the server deterministic, engine-guaranteed hooks for "first reader"
+and "last reader." Subscription *is* retention - the server only holds a
+live `.subscribe(...)` while at least one client is `@W`-watching. Signals
+are never registered with `FinalizationRegistry`, never appear in `@D`
 release batches, never carry a refcount.
 
-**Tier 2 (objects, functions)** has no built‑in signal like `watched`, so
+**Tier 2 (objects, functions)** has no built-in signal like `watched`, so
 the client uses `FinalizationRegistry` to observe when a Proxy or callable
-stub becomes unreachable and sends a coalesced `@H-` batch. The server
+stub becomes unreachable and sends a coalesced `@D` batch. The server
 decrements refcounts; once they hit zero across all clients, the retention
 policy decides when to free the entry. `Symbol.dispose` on the Proxy is a
-deterministic opt‑in — `using proxy = …` or a manual dispose call
-short‑circuits GC.
+deterministic opt-in - `using proxy = ...` or a manual dispose call
+short-circuits GC.
 
-**Tier 3 (promises)** has an explicit end‑of‑life: it settles exactly once.
+**Tier 3 (promises)** has an explicit end-of-life: it settles exactly once.
 Promises get a pid from a tiny counter on the server; a `.then/.catch`
-handler is attached; when the Promise settles, one `@P` or `@PE` frame
-fires. No refcount. No release. Worst case — client stopped caring — is
+handler is attached; when the Promise settles, one `@P` or `@E` frame
+fires. No refcount. No release. Worst case - client stopped caring - is
 one wasted frame per promise. O(1), fine.
 
 **Plain objects aren't handles.** A value with no methods and no identity
 stamping has no reason to be tracked: the client can't subscribe to updates
-on it, can't reach methods that aren't there, and pass‑by‑value is exactly
+on it, can't reach methods that aren't there, and pass-by-value is exactly
 right. Plain objects are inlined as pure JSON, and the recursion still
 picks up any nested Signals / Models / functions / Promises inside.
 
@@ -65,23 +65,23 @@ picks up any nested Signals / Models / functions / Promises inside.
 An object becomes an `o` handle iff:
 
 1. It was stamped by `createModel(name, factory)` (Model), **or**
-2. It has at least one non‑`_`‑prefixed method anywhere in its prototype
+2. It has at least one non-`_`-prefixed method anywhere in its prototype
    chain, up to (but not including) `Object.prototype`.
 
 Otherwise it's plain JSON. Arrays and values carrying `.toJSON()` (Dates,
-user‑defined opt‑outs) always serialize via their `toJSON`, matching
+user-defined opt-outs) always serialize via their `toJSON`, matching
 `JSON.stringify`'s own rules.
 
-Methods are **never** placed in the shape or data array — they're dispatched
+Methods are **never** placed in the shape or data array - they're dispatched
 through the Proxy trap (`proxy.foo(...)` → `M<id>:o17#foo:args`). Two
 classes with identical state keys but different methods therefore share a
-shape; calls to non‑existent methods surface a "Method not found" reject.
+shape; calls to non-existent methods surface a "Method not found" reject.
 
 ---
 
 ## Wire protocol
 
-Framing: `<type><corrId>:<method>:<payload>` — `M` call, `N` notification,
+Framing: `<type><corrId>:<method>:<payload>` - `M` call, `N` notification,
 `R` result, `E` error. Unchanged from the previous version.
 
 ### Reserved methods
@@ -92,9 +92,9 @@ Framing: `<type><corrId>:<method>:<payload>` — `M` call, `N` notification,
 |  `@W`  | c→s | `id,id,...`                 | subscribe to these signal ids           |
 |  `@U`  | c→s | `id,id,...`                 | unsubscribe                             |
 |  `@S`  | s→c | `id,value[,mode]`           | signal update (optional delta mode)     |
-|  `@H-` | c→s | `id,id,...`                 | release `o`/`f` handles (refcount --)   |
+|  `@D`  | c→s | `id,id,...`                 | drop `o`/`f` handles (refcount --)      |
 |  `@P`  | s→c | `pid,value`                 | promise resolved                        |
-|  `@PE` | s→c | `pid,{message}`             | promise rejected                        |
+|  `@E`  | s→c | `pid,{message}`             | promise rejected                        |
 
 ### The `@H` marker
 
@@ -106,7 +106,7 @@ reuse cached ids.
 {"@H":"s42","v":0}                       // signal, inline value (first time)
 {"@H":"s42"}                             // signal, bare reference
 {"@H":"o17",                             // object, first time:
- "sh":[["count","name"],[1,1]],          //   shape inline — keys + kinds (1=signal, 0=other)
+ "sh":{"count":1,"name":1},              //   shape inline — {key: kind} (1=signal, 0=other)
  "s":5,                                  //   shape id (for future short form)
  "mn":[3,"Counter"],                     //   model-name inline, id=3, name="Counter"
  "n":3,                                  //   model-name id
@@ -115,7 +115,7 @@ reuse cached ids.
 {"@H":"o17","s":5,"n":3,"d":[…]}         // object, later: no shape / name preludes
 {"@H":"o17"}                             // object, bare reference
 {"@H":"f7"}                              // function — callable via M…:f7:args
-{"@H":"p11"}                             // promise — settled later via @P/@PE
+{"@H":"p11"}                             // promise — settled later via @P/@E
 ```
 
 Short refs work because the receiver has hydrated the body on a previous
@@ -128,12 +128,12 @@ per client.
 | ----------------- | ------------------------------------------------------------- |
 | `"foo.bar.baz"`   | dotted path on the server root                                |
 | `"<id>#method"`   | method on a specific handle (Model / class instance / literal with methods) |
-| `"<id>"` (for `f*`) | bare function‑handle call                                    |
+| `"<id>"` (for `f*`) | bare function-handle call                                    |
 
 ### Client → server values
 
 Any Proxy / Signal / callable / Promise the client received carries a
-non‑enumerable registered `Symbol.for('mixed-signals.remote')` brand. The
+non-enumerable registered `Symbol.for('mixed-signals.remote')` brand. The
 client's outbound `JSON.stringify` replacer detects the brand and emits
 `{"@H":"<id>"}`; the server's inbound reviver resolves the id back to the
 original live value. Identity is preserved end to end with no user API.
@@ -161,22 +161,22 @@ const rpc = new RPC(new Counter());
 
 ### 1. Connect + root handshake
 
-Server sends the root on connect. Shape + model‑name are inline on first
+Server sends the root on connect. Shape + model-name are inline on first
 use for this client.
 
 ```
-S → C   N:@R:{"@H":"o0","sh":[["count","name"],[1,1]],"s":1,
+S → C   N:@R:{"@H":"o0","sh":{"count":1,"name":1},"s":1,
                 "mn":[1,"Counter"],"n":1,
                 "d":[{"@H":"s1","v":0},{"@H":"s2","v":"default"}]}
 ```
 
-On the client, the hydrator registers shape id 1 and model‑name id 1 in
-its per‑connection caches, builds a Proxy over a spine of two live
+On the client, the hydrator registers shape id 1 and model-name id 1 in
+its per-connection caches, builds a Proxy over a spine of two live
 Signals, and `rpc.root` resolves.
 
 ### 2. Subscribe + server push with delta
 
-The UI reads `counter.count.value`. `watched` fires, the watch‑batch
+The UI reads `counter.count.value`. `watched` fires, the watch-batch
 flushes after ~1ms:
 
 ```
@@ -226,7 +226,7 @@ C → S   M2:o0#rename:"hi"
 S → C   R2:{"ok":true}       ← plain JSON, no handle needed
 ```
 
-### 4. Non‑Model class auto‑upgrades
+### 4. Non-Model class auto-upgrades
 
 ```ts
 class Project {
@@ -238,11 +238,11 @@ const rpc = new RPC({project: new Project()});
 
 The root `{project}` is plain data, no methods of its own → pure JSON at
 the outer level. `project` is a class instance with a method → upgrades to
-an `o` handle, **without** a model‑name prelude:
+an `o` handle, **without** a model-name prelude:
 
 ```
 S → C   N:@R:{"project":{"@H":"o1",
-                  "sh":[["id"],[1]],"s":1,
+                  "sh":{"id":1},"s":1,
                   "d":[{"@H":"s1","v":"42"}]}}
 ```
 
@@ -262,8 +262,8 @@ C → S   M1:getUser:7
 S → C   R1:{"id":7,"name":"jason","email":"x@y.z"}
 ```
 
-Pure JSON. No id allocated, no refcount, no cleanup — the return is
-pass‑by‑value exactly as you'd expect.
+Pure JSON. No id allocated, no refcount, no cleanup - the return is
+pass-by-value exactly as you'd expect.
 
 ### 6. One method changes everything
 
@@ -281,7 +281,7 @@ getUser(id) {
 
 ```
 C → S   M1:getUser:7
-S → C   R1:{"@H":"o2","sh":[["id","name"],[0,0]],"s":3,
+S → C   R1:{"@H":"o2","sh":{"id":0,"name":0},"s":3,
             "d":[7,"jason"]}
 ```
 
@@ -299,7 +299,7 @@ S → C   R2:{"@H":"o2"}      ← full body already known on this client
 ```
 
 The client's hydrator looks `o2` up in its `Map<id, WeakRef>` and returns
-the existing Proxy — reference identity preserved.
+the existing Proxy - reference identity preserved.
 
 ### 8. Function handle
 
@@ -335,7 +335,7 @@ settles it.
 
 Promise handles never go through the refcount system. They allocate a pid
 from a small counter, fire once, and are done. A rejection looks the same
-but with `@PE` and a `{message}` payload.
+but with `@E` and a `{message}` payload.
 
 ### 10. Passing a received Proxy back as an argument
 
@@ -366,7 +366,7 @@ When the engine runs GC, `FinalizationRegistry` fires on the token. The
 client's release batch coalesces for ~16ms, then:
 
 ```
-C → S   N:@H-:o17
+C → S   N:@D:o17
 ```
 
 Server decrements the refcount for `o17` under client `c1`. If the count
@@ -376,7 +376,7 @@ across all clients reaches zero:
 - `retention: ttl` → mark for sweep; drop after `idleMs` of no activity
 - `retention: weak` → drop immediately
 
-`Symbol.dispose` on the Proxy short‑circuits this: `proxy[Symbol.dispose]()`
+`Symbol.dispose` on the Proxy short-circuits this: `proxy[Symbol.dispose]()`
 schedules an immediate release without waiting for GC.
 
 ### 12. Disconnect cleanup
@@ -387,7 +387,7 @@ Transport closes. Server runs `removeClient(c1)`:
   unhooks the underlying `sig.subscribe(...)` for signals no other client
   is watching.
 - `handles.releaseAllForClient(c1)` decrements every `o`/`f` refcount,
-  and scans `c1`'s sent‑set for signals no other client has seen — those
+  and scans `c1`'s sent-set for signals no other client has seen - those
   get marked orphaned too.
 - Retention runs; by default (`ttl`) an orphan sweep is scheduled. Under
   `disconnect`, orphans are dropped immediately (except the root).
@@ -413,7 +413,7 @@ Transport closes. Server runs `removeClient(c1)`:
 
  o/f proxy unreachable
    FinalizationRegistry fires
-     └─▶ scheduleRelease(id) ─ 16ms ─▶ N:@H-:o17,f11
+     └─▶ scheduleRelease(id) ─ 16ms ─▶ N:@D:o17,f11
                                        refcount-- per client
 
  client disconnects
@@ -441,13 +441,13 @@ mixed-signals/
 ├── server/
 │   ├── rpc.ts           multi-client RPC host + retention + routing
 │   ├── reflection.ts    signal subscriptions, delta diffing, @S push
-│   ├── model.ts         createModel(name, factory) — stamps MODEL_NAME_SYMBOL
+│   ├── model.ts         createModel(name, factory) - stamps MODEL_NAME_SYMBOL
 │   ├── forwarding.ts    broker chain: prefix/unprefix @H ids
 │   ├── memory-transport.ts
 │   └── index.ts
 └── client/
     ├── rpc.ts           RPC client, outbound brand-aware replacer
-    ├── reflection.ts    outbound batching (@W/@U/@H-), promise settlement
+    ├── reflection.ts    outbound batching (@W/@U/@D), promise settlement
     ├── model.ts         deprecated no-op shim for createReflectedModel
     └── index.ts
 ```
@@ -459,20 +459,20 @@ Two bundles (`./server`, `./client`). One peer dep:
 
 ## Invariants
 
-- **Handle identity** — one server value = one handle id for its lifetime
-  in the registry. Re‑serializing the same value yields the same id.
-- **At‑most‑once body emission per (client, handle)** —
+- **Handle identity** - one server value = one handle id for its lifetime
+  in the registry. Re-serializing the same value yields the same id.
+- **At-most-once body emission per (client, handle)** -
   `hasSentHandle(clientId, id)` gates full emission; repeats are bare
   `{@H:id}`.
-- **Refcount symmetry (tier 2 only)** — exactly one retain per client per
-  handle, exactly one release per `@H-`. Short refs do not retain again.
-- **Tier 1 is subscription‑driven** — signals never appear in refcount
-  maps, in `FinalizationRegistry` registrations, or in `@H-` frames.
-- **Tier 3 is fire‑and‑forget** — promise pids are counter‑allocated, never
+- **Refcount symmetry (tier 2 only)** - exactly one retain per client per
+  handle, exactly one release per `@D`. Short refs do not retain again.
+- **Tier 1 is subscription-driven** - signals never appear in refcount
+  maps, in `FinalizationRegistry` registrations, or in `@D` frames.
+- **Tier 3 is fire-and-forget** - promise pids are counter-allocated, never
   refcounted, never released. A dangling pending Promise on the client is
   O(1) cost and converges naturally when the server settles it.
-- **Thenable guard** — Proxy traps for `then` / `catch` / `finally` return
-  `undefined` so live‑remote objects aren't mistaken for promises.
-- **No push without watch** — a server Signal with zero watchers has zero
+- **Thenable guard** - Proxy traps for `then` / `catch` / `finally` return
+  `undefined` so live-remote objects aren't mistaken for promises.
+- **No push without watch** - a server Signal with zero watchers has zero
   `.subscribe(...)` callbacks attached.
-- **Transport‑agnostic** — `Transport = { send(str), onMessage(cb), ready? }`.
+- **Transport-agnostic** - `Transport = { send(str), onMessage(cb), ready? }`.

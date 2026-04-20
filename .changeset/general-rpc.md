@@ -11,10 +11,10 @@ machinery their kind requires.
 
 - **Tier 1 — Signals.** Subscription is retention. `watched`/`unwatched` on
   `@preact/signals-core` drives `@W`/`@U` directly. No `FinalizationRegistry`,
-  no `@H-` release frames, no refcount. Works on every JS engine.
+  no `@D` release frames, no refcount. Works on every JS engine.
 - **Tier 2 — Objects & Functions.** The only population that actually needs
   GC-observed refcounting. Client registers Proxies / callables with
-  `FinalizationRegistry`; unreachable handles produce coalesced `@H-`
+  `FinalizationRegistry`; unreachable handles produce coalesced `@D`
   release batches. Server retention policy (`ttl` default 30s, `disconnect`,
   `weak`) governs final cleanup. `Symbol.dispose` on Proxies is a
   deterministic opt-in that short-circuits GC.

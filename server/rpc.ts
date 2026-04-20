@@ -156,7 +156,7 @@ export class RPC {
         const message = parseWireMessage(raw);
         if (!message || message.type === 'result' || message.type === 'error')
           return;
-        // Only call-paths carry rpc-controlled messages; @W/@U/@H- payloads
+        // Only call-paths carry rpc-controlled messages; @W/@U/@D payloads
         // are plain scalars and the reviver is a no-op for them.
         const params = parseWireParams(message.payload, reviver);
         const messageId = message.type === 'call' ? message.id : undefined;

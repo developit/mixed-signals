@@ -128,7 +128,7 @@ calls on first access.
 | plain object with at least one method       | `o`  | 2    | same                               | same, no `typeName`                                  |
 | plain object of pure data (no methods)      | —    | —    | none — pass-by-value                | plain JS object                                      |
 | function                                    | `f`  | 2    | refcount + `FinalizationRegistry`  | callable `Proxy` that RPCs to the server             |
-| `Promise` (pending)                         | `p`  | 3    | one-shot `@P`/`@PE` settlement     | live `Promise`                                       |
+| `Promise` (pending)                         | `p`  | 3    | one-shot `@P`/`@E` settlement      | live `Promise`                                       |
 | `Promise` (already settled)                 | —    | —    | none                               | the resolved value inline                            |
 
 ### What each tier means for you
@@ -137,7 +137,7 @@ calls on first access.
   on every JS engine. The server only holds a live `.subscribe(...)` while
   a client is `@W`-watching.
 - **Tier 2 (objects, functions)** — the client's `FinalizationRegistry`
-  observes unreachable Proxies / callables and batches `@H-` release
+  observes unreachable Proxies / callables and batches `@D` release
   frames. Server decrements refcounts; retention policy handles cleanup
   once they hit zero.
 - **Tier 3 (promises)** — one settlement frame, no refcount, no release.
@@ -172,7 +172,7 @@ new RPC(root, { retention: { kind: "weak" } });
   owns the lifecycle and RPC is just reflecting live objects.
 
 No manual disposal API. On environments with `FinalizationRegistry`,
-clients send `@H-` release frames as Proxies become unreachable. On older
+clients send `@D` release frames as Proxies become unreachable. On older
 engines, the chosen retention policy is the sole cleanup mechanism.
 
 ### Deterministic dispose via `Symbol.dispose`
@@ -181,7 +181,7 @@ engines, the chosen retention policy is the sole cleanup mechanism.
 {
   using project = await rpc.root.getProject('42');
   // … use project
-} // on scope exit, Symbol.dispose fires → immediate @H- release
+} // on scope exit, Symbol.dispose fires → immediate @D release
 ```
 
 Or explicitly: `project[Symbol.dispose]()`. Short-circuits GC and is

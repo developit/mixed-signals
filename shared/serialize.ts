@@ -10,7 +10,7 @@ import {
   SHAPE_ID_FIELD,
   SIGNAL_VALUE_FIELD,
 } from './protocol.ts';
-import {type Shape, shapeSignature} from './shapes.ts';
+import {type Shape, type SlotKind, shapeSignature} from './shapes.ts';
 
 /**
  * Brand stamped onto server-side Model constructors by our wrapped
@@ -32,7 +32,7 @@ export interface SerializeHooks {
   onHandleEmitted?(id: string): void;
   /**
    * Called once per Promise we give a pid to. Caller should attach settlement
-   * listeners that send a later frame (@P / @PE) with the resolved value.
+   * listeners that send a later frame (@P / @E) with the resolved value.
    */
   onPromiseEmitted?(id: string, promise: Promise<any>): void;
   /** Called on every function we emit. */
@@ -271,7 +271,16 @@ export class Serializer {
     const data = this.emitShapedData(obj, shape, hooks);
 
     const out: Record<string, any> = {[HANDLE_MARKER]: id};
-    if (sendShape) out[SHAPE_FIELD] = [shape.keys, shape.kinds];
+    if (sendShape) {
+      // Shape wire format: `{key: kind, …}`. JSON preserves string-key
+      // insertion order, so the hydrator reconstructs keys[] / kinds[]
+      // via the same ordering used when emitting the data array.
+      const wireShape: Record<string, SlotKind> = {};
+      for (let i = 0; i < shape.keys.length; i++) {
+        wireShape[shape.keys[i]] = shape.kinds[i];
+      }
+      out[SHAPE_FIELD] = wireShape;
+    }
     out[SHAPE_ID_FIELD] = shapeId;
     if (modelNameId !== undefined) {
       if (sendModelName !== undefined) {
