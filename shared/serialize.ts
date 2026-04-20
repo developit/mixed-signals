@@ -2,21 +2,19 @@ import {Signal} from '@preact/signals-core';
 import {BRAND_REMOTE, type RemoteBrand} from './brand.ts';
 import type {Handles} from './handles.ts';
 import {
+  CLASS_FIELD,
   DATA_FIELD,
   HANDLE_MARKER,
-  MODEL_NAME_FIELD,
-  MODEL_NAME_ID_FIELD,
-  SHAPE_FIELD,
-  SHAPE_ID_FIELD,
+  PROPS_FIELD,
   SIGNAL_VALUE_FIELD,
 } from './protocol.ts';
-import {type Shape, type SlotKind, shapeSignature} from './shapes.ts';
 
 /**
  * Brand stamped onto server-side Model constructors by our wrapped
  * `createModel(name, factory)`. Its presence on a constructor marks the
- * object as a "named" model — the serializer uses it to decide whether to
- * emit a model-name prelude.
+ * object as a "named" model — the serializer writes the name into the
+ * class prelude so the receiver can surface it as `typeName` and expose
+ * a matching constructor via `rpc.classOf(name)`.
  */
 export const MODEL_NAME_SYMBOL: unique symbol = Symbol.for(
   'mixed-signals.modelName',
@@ -85,23 +83,17 @@ function hasBehavior(obj: object): boolean {
 }
 
 /**
- * Build an object's wire shape. Enumerates own enumerable keys, skipping
- * `_`-prefixed and function-valued keys (methods live on the handle, not on
- * the data spine). Each remaining slot is tagged "signal" or "handle/plain",
- * which lets the hydrator install live Signals in the right spots.
+ * Enumerate an object's wire-data keys: own enumerable, not `_`-prefixed,
+ * not function-valued. Methods live on the Proxy trap, never on the spine.
  */
-function shapeOfHandleObject(obj: Record<string, unknown>): Shape {
-  const keys: string[] = [];
-  const kinds: number[] = [];
+function dataKeysOf(obj: Record<string, unknown>): string[] {
+  const out: string[] = [];
   for (const key of Object.keys(obj)) {
     if (key[0] === '_') continue;
-    const v = obj[key];
-    if (typeof v === 'function') continue; // methods → trap-dispatched
-    keys.push(key);
-    // 1 = signal, 0 = everything else (handle or plain JSON, re-walked)
-    kinds.push(v instanceof Signal ? 1 : 0);
+    if (typeof obj[key] === 'function') continue;
+    out.push(key);
   }
-  return {keys, kinds: kinds as Shape['kinds']};
+  return out;
 }
 
 export class Serializer {
@@ -237,10 +229,7 @@ export class Serializer {
     // (some earlier call gave them identity) even if they'd otherwise look
     // plain now.
     const upgrade = !!known || hasBehavior(obj);
-
-    if (!upgrade) {
-      return this.emitPlainObject(obj, hooks);
-    }
+    if (!upgrade) return this.emitPlainObject(obj, hooks);
 
     const id = known ?? this.allocateObjectId(obj);
 
@@ -252,44 +241,81 @@ export class Serializer {
     hooks.onHandleEmitted?.(id);
     this.handles.markHandleSent(hooks.peerId, id);
 
-    const shape = shapeOfHandleObject(obj);
-    const signature = shapeSignature(shape);
-    const shapeId = this.handles.shapeIdFor(ctor, signature, shape);
-    const sendShape = !this.handles.hasShape(hooks.peerId, shapeId);
-    if (sendShape) this.handles.markShapeSent(hooks.peerId, shapeId);
+    // Stable-ctor objects (Models, user classes) use the cached-class form
+    // with a positional `d` array. Anonymous / plain-Object ctors use the
+    // ad-hoc keyed form — we gain nothing from caching a class for them
+    // and lose readability.
+    const cacheable = !!ctor && ctor !== Object;
+    if (cacheable)
+      return this.emitClassInstance(obj, id, ctor, modelName ?? null, hooks);
+    return this.emitAdHocObject(obj, id, hooks);
+  }
 
-    let sendModelName: number | undefined;
-    let modelNameId: number | undefined;
-    if (modelName && ctor) {
-      modelNameId = this.handles.modelNameIdFor(ctor, modelName);
-      if (!this.handles.hasModelName(hooks.peerId, modelNameId)) {
-        sendModelName = modelNameId;
-        this.handles.markModelNameSent(hooks.peerId, modelNameId);
+  private emitClassInstance(
+    obj: Record<string, unknown>,
+    id: string,
+    ctor: object,
+    modelName: string | null,
+    hooks: SerializeHooks,
+  ): any {
+    const keys = dataKeysOf(obj);
+    // Delimiter: `,` separates keys in the `p` field. We cannot accept keys
+    // that contain a comma on the cached-class path. Same for `#` on names.
+    for (const k of keys) {
+      if (k.includes(',')) {
+        throw new Error(
+          `Cannot serialize class ${modelName ?? '(anonymous)'}: property name "${k}" contains ',' — cached classes require identifier-like property names. Use a plain object if you need arbitrary keys.`,
+        );
       }
     }
+    if (modelName?.includes('#')) {
+      throw new Error(
+        `Invalid model name "${modelName}" — must not contain '#'.`,
+      );
+    }
 
-    const data = this.emitShapedData(obj, shape, hooks);
+    const signature = `${modelName ?? ''}|${keys.join(',')}`;
+    const classId = this.handles.classIdFor(ctor, signature, modelName, keys);
+    const sendClassDef = !this.handles.hasClass(hooks.peerId, classId);
+    if (sendClassDef) this.handles.markClassSent(hooks.peerId, classId);
+
+    // Positional data — order matches `keys`.
+    const data = new Array(keys.length);
+    for (let i = 0; i < keys.length; i++) {
+      const w = this.walk(obj[keys[i]], hooks);
+      data[i] = w === undefined ? null : w;
+    }
 
     const out: Record<string, any> = {[HANDLE_MARKER]: id};
-    if (sendShape) {
-      // Shape wire format: `{key: kind, …}`. JSON preserves string-key
-      // insertion order, so the hydrator reconstructs keys[] / kinds[]
-      // via the same ordering used when emitting the data array.
-      const wireShape: Record<string, SlotKind> = {};
-      for (let i = 0; i < shape.keys.length; i++) {
-        wireShape[shape.keys[i]] = shape.kinds[i];
-      }
-      out[SHAPE_FIELD] = wireShape;
-    }
-    out[SHAPE_ID_FIELD] = shapeId;
-    if (modelNameId !== undefined) {
-      if (sendModelName !== undefined) {
-        out[MODEL_NAME_FIELD] = [modelNameId, modelName];
-      }
-      out[MODEL_NAME_ID_FIELD] = modelNameId;
+    if (sendClassDef) {
+      // First time this peer sees this class: send string form so the
+      // receiver installs the class def on the same frame. "<id>#<name>" for
+      // named classes, "<id>" for anonymous stable ctors.
+      out[CLASS_FIELD] = modelName ? `${classId}#${modelName}` : `${classId}`;
+      out[PROPS_FIELD] = keys.join(',');
+    } else {
+      out[CLASS_FIELD] = classId;
     }
     out[DATA_FIELD] = data;
     return out;
+  }
+
+  private emitAdHocObject(
+    obj: Record<string, unknown>,
+    id: string,
+    hooks: SerializeHooks,
+  ): any {
+    // Keyed data — no class caching. Keys are whatever the object has; no
+    // restrictions on the characters in them.
+    const d: Record<string, any> = {};
+    for (const key of Object.keys(obj)) {
+      if (key[0] === '_') continue;
+      const v = obj[key];
+      if (typeof v === 'function') continue;
+      const walked = this.walk(v, hooks);
+      if (walked !== undefined) d[key] = walked;
+    }
+    return {[HANDLE_MARKER]: id, [DATA_FIELD]: d};
   }
 
   private allocateObjectId(obj: object): string {
@@ -302,7 +328,7 @@ export class Serializer {
     obj: Record<string, unknown>,
     hooks: SerializeHooks,
   ): any {
-    // Pure JSON: emit inline, no id, no shape. Nested Signals/Models/etc.
+    // Pure JSON: emit inline, no id, no class. Nested Signals/Models/etc.
     // still get `@H` markers through the walk. `_`-prefixed keys stripped.
     const out: Record<string, any> = {};
     for (const key of Object.keys(obj)) {
@@ -311,23 +337,5 @@ export class Serializer {
       if (v !== undefined) out[key] = v;
     }
     return out;
-  }
-
-  private emitShapedData(
-    obj: Record<string, unknown>,
-    shape: Shape,
-    hooks: SerializeHooks,
-  ): any[] {
-    const data = new Array(shape.keys.length);
-    for (let i = 0; i < shape.keys.length; i++) {
-      const key = shape.keys[i];
-      const v = obj[key];
-      // Shape kinds are 1 for signal, 0 otherwise — either way we recurse.
-      // The kind byte is for the hydrator's slot wiring; serialization just
-      // walks the value and lets each handle kind self-describe.
-      const walked = this.walk(v, hooks);
-      data[i] = walked === undefined ? null : walked;
-    }
-    return data;
   }
 }

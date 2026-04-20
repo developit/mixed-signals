@@ -72,10 +72,10 @@ Otherwise it's plain JSON. Arrays and values carrying `.toJSON()` (Dates,
 user-defined opt-outs) always serialize via their `toJSON`, matching
 `JSON.stringify`'s own rules.
 
-Methods are **never** placed in the shape or data array - they're dispatched
-through the Proxy trap (`proxy.foo(...)` → `M<id>:o17#foo:args`). Two
-classes with identical state keys but different methods therefore share a
-shape; calls to non-existent methods surface a "Method not found" reject.
+Methods are **never** placed in the wire data - they're dispatched through
+the Proxy trap (`proxy.foo(...)` → `M<id>:o17#foo:args`). Two classes with
+identical state keys but different methods therefore share a class id.
+Calls to non-existent methods surface a "Method not found" reject.
 
 ---
 
@@ -98,29 +98,56 @@ Framing: `<type><corrId>:<method>:<payload>` - `M` call, `N` notification,
 
 ### The `@H` marker
 
-Every structural reference looks like this. First emission carries
-shape/name preludes inline; subsequent emissions (to the same client)
-reuse cached ids.
+Every structural reference carries a single top-level marker. All
+reserved fields are short letters:
+
+| field | meaning |
+|:---:|---|
+| `@H` | handle id, kind-prefixed (s/o/f/p) |
+| `c`  | class reference — string `"<id>#<name>"` or `"<id>"` on first emission, numeric id afterward |
+| `p`  | property list (first emission of a class only) — comma-separated keys in `d` order |
+| `d`  | data payload — positional array for cached classes, keyed object for ad-hoc handles |
+| `v`  | inline signal value (inside `@H:s*` only) |
 
 ```json
-{"@H":"s42","v":0}                       // signal, inline value (first time)
-{"@H":"s42"}                             // signal, bare reference
-{"@H":"o17",                             // object, first time:
- "sh":{"count":1,"name":1},              //   shape inline — {key: kind} (1=signal, 0=other)
- "s":5,                                  //   shape id (for future short form)
- "mn":[3,"Counter"],                     //   model-name inline, id=3, name="Counter"
- "n":3,                                  //   model-name id
- "d":[{"@H":"s1","v":0},                 //   data in shape-key order
+{"@H":"s42","v":0}                               // signal, inline value (first time)
+{"@H":"s42"}                                     // signal, bare reference
+
+{"@H":"o17",                                     // cached-class instance, first time:
+ "c":"1#Counter",                                //   class id + name (stringified)
+ "p":"count,name",                               //   property list
+ "d":[{"@H":"s1","v":0},                         //   positional data
       {"@H":"s2","v":"default"}]}
-{"@H":"o17","s":5,"n":3,"d":[…]}         // object, later: no shape / name preludes
-{"@H":"o17"}                             // object, bare reference
-{"@H":"f7"}                              // function — callable via M…:f7:args
-{"@H":"p11"}                             // promise — settled later via @P/@E
+
+{"@H":"o18",                                     // later instance of same class:
+ "c":1,                                          //   numeric ref; no p needed
+ "d":[{"@H":"s3","v":5},{"@H":"s4","v":"y"}]}
+
+{"@H":"o19",                                     // ad-hoc object (ctor === Object):
+ "d":{"count":{"@H":"s5","v":0},"ttl":60}}       //   keyed data, no c/p
+
+{"@H":"o17"}                                     // same instance reuse — bare
+{"@H":"f7"}                                      // function — callable via M…:f7:args
+{"@H":"p11"}                                     // promise — settled later via @P/@E
 ```
 
-Short refs work because the receiver has hydrated the body on a previous
-emission. The serializer tracks "did I tell this client about this id yet?"
-per client.
+Short refs work because the receiver has already hydrated the body on a
+previous emission. The serializer tracks "did I tell this client about
+this id yet?" per client; the class-id cache is independent of the
+handle-id cache. On the client, each (class id) gets a synthetic ctor,
+and every instance is built as `Object.create(ctor.prototype)` so
+`value instanceof rpc.classOf('Counter')` works.
+
+**Cacheable vs ad-hoc** is decided by `ctor === Object`:
+
+- `new Counter()`, `new Project()`, `createModel`-backed factories →
+  cacheable → `c` + `p` (first) / `c` (later) + positional `d`.
+- `{foo: 1, bar() {}}`, `Object.create(null)` with methods → ad-hoc →
+  no `c` or `p`, keyed `d`.
+
+Cached classes have one constraint: property names cannot contain `,`
+(the `p` delimiter). The serializer throws a clear error at emit time
+if that happens. Use a plain object if you need arbitrary keys.
 
 ### Method routing
 
@@ -161,18 +188,19 @@ const rpc = new RPC(new Counter());
 
 ### 1. Connect + root handshake
 
-Server sends the root on connect. Shape + model-name are inline on first
-use for this client.
+Server sends the root on connect. The class def is inline on first use
+for this client (string `c`, full `p`).
 
 ```
-S → C   N:@R:{"@H":"o0","sh":{"count":1,"name":1},"s":1,
-                "mn":[1,"Counter"],"n":1,
+S → C   N:@R:{"@H":"o0","c":"1#Counter","p":"count,name",
                 "d":[{"@H":"s1","v":0},{"@H":"s2","v":"default"}]}
 ```
 
-On the client, the hydrator registers shape id 1 and model-name id 1 in
-its per-connection caches, builds a Proxy over a spine of two live
-Signals, and `rpc.root` resolves.
+On the client, the hydrator allocates a synthetic `Counter` ctor, caches
+it as class id 1, builds a `Proxy` over `Object.create(ctor.prototype)`
+filled with two live Signals, and `rpc.root` resolves. `rpc.classOf('Counter')`
+now returns that ctor so `rpc.root instanceof rpc.classOf('Counter')`
+evaluates true.
 
 ### 2. Subscribe + server push with delta
 
@@ -236,18 +264,23 @@ class Project {
 const rpc = new RPC({project: new Project()});
 ```
 
-The root `{project}` is plain data, no methods of its own → pure JSON at
-the outer level. `project` is a class instance with a method → upgrades to
-an `o` handle, **without** a model-name prelude:
+The root `{project}` has no methods of its own, but it IS exposed via
+`createRoot` which gives it `o0` identity — so it goes out as an ad-hoc
+handle with keyed `d`. `project` is a stable-ctor class instance with a
+method → cacheable class, but **no** `#<name>` (the ctor wasn't
+`createModel`-stamped):
 
 ```
-S → C   N:@R:{"project":{"@H":"o1",
-                  "sh":{"id":1},"s":1,
-                  "d":[{"@H":"s1","v":"42"}]}}
+S → C   N:@R:{"@H":"o0","d":{"project":{"@H":"o1",
+                    "c":"2","p":"id",
+                    "d":[{"@H":"s1","v":"42"}]}}}
 ```
 
-No `mn`, no `n`. The client's Proxy still dispatches methods:
-`project.rename('new')` → `M1:o1#rename:"new"`.
+The `c:"2"` (no `#`) tells the client "cached class, anonymous." The
+client's Proxy still dispatches methods: `project.rename('new')` →
+`M1:o1#rename:"new"`. `instanceof` works if the user grabs the ctor via
+`client.classOf` — but without a name there's nothing to look up, so
+the class identity is purely a serialization detail in this case.
 
 ### 5. Plain data: no handle at all
 
@@ -281,12 +314,12 @@ getUser(id) {
 
 ```
 C → S   M1:getUser:7
-S → C   R1:{"@H":"o2","sh":{"id":0,"name":0},"s":3,
-            "d":[7,"jason"]}
+S → C   R1:{"@H":"o2","d":{"id":7,"name":"jason"}}
 ```
 
-`refresh` is filtered out of the shape (methods aren't data); the result
-becomes an `o` handle; `result.refresh()` goes through the trap as
+`refresh` is filtered out of `d` (methods aren't data); the result is an
+ad-hoc `o` handle (keyed `d`, no `c` — the returned literal has
+`ctor === Object`); `result.refresh()` goes through the trap as
 `o2#refresh`.
 
 ### 7. Repeat emission → bare reference
@@ -432,8 +465,7 @@ Transport closes. Server runs `removeClient(c1)`:
 mixed-signals/
 ├── shared/
 │   ├── brand.ts         BRAND_REMOTE + RemoteBrand type
-│   ├── handles.ts       Handles registry (id↔value, shapes, names, refs)
-│   ├── shapes.ts        shape types + signature hash
+│   ├── handles.ts       Handles registry (id↔value, class cache, refs)
 │   ├── serialize.ts     Serializer: value → wire JSON with @H markers
 │   ├── hydrate.ts       Hydrator: wire JSON → Proxies / Signals / Promises
 │   ├── protocol.ts      frame parse/format, method-name constants
@@ -446,7 +478,7 @@ mixed-signals/
 │   ├── memory-transport.ts
 │   └── index.ts
 └── client/
-    ├── rpc.ts           RPC client, outbound brand-aware replacer
+    ├── rpc.ts           RPC client + outbound brand-aware replacer + classOf()
     ├── reflection.ts    outbound batching (@W/@U/@D), promise settlement
     ├── model.ts         deprecated no-op shim for createReflectedModel
     └── index.ts
@@ -460,7 +492,9 @@ Two bundles (`./server`, `./client`). One peer dep:
 ## Invariants
 
 - **Handle identity** - one server value = one handle id for its lifetime
-  in the registry. Re-serializing the same value yields the same id.
+  in the registry. Re-serializing the same value yields the same id. Every
+  client instance of a named class shares a synthetic ctor so `instanceof`
+  works across the connection.
 - **At-most-once body emission per (client, handle)** -
   `hasSentHandle(clientId, id)` gates full emission; repeats are bare
   `{@H:id}`.

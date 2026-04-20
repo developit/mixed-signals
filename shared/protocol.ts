@@ -16,19 +16,31 @@ export const PROMISE_RESOLVE_METHOD = '@P';
 export const PROMISE_REJECT_METHOD = '@E';
 /**
  * Every structured reference on the wire uses this field name.
- * The first character of the id is the kind: s=signal, o=object/model,
+ * The first character of the id is the kind: s=signal, o=object,
  * f=function, p=promise. See shared/brand.ts.
  */
 export const HANDLE_MARKER = '@H';
-/** Shape prelude, inline on first use of a shape. */
-export const SHAPE_FIELD = 'sh';
-/** Model-name prelude, inline on first use of a named ctor. */
-export const MODEL_NAME_FIELD = 'mn';
-/** Shape id reference (once the receiver has the shape). */
-export const SHAPE_ID_FIELD = 's';
-/** Model-name id reference. */
-export const MODEL_NAME_ID_FIELD = 'n';
-/** Data array (per-shape values). */
+/**
+ * Class reference. On first emission of a class to a peer, the value is a
+ * string `"<classId>#<className>"` (or `"<classId>"` for anonymous classes).
+ * On subsequent emissions it is the numeric class id. The client normalizes
+ * with `String(c)` and looks the class up in its per-connection registry.
+ *
+ * Present only on wire markers for *cached-class instances* (objects whose
+ * ctor is not `Object`). Ad-hoc objects (even ones with methods) omit `c`.
+ */
+export const CLASS_FIELD = 'c';
+/**
+ * Properties prelude for a new class: a comma-separated list of property
+ * names in the order they appear in the parallel `d` array. Property names
+ * on cached classes must not contain `,`.
+ */
+export const PROPS_FIELD = 'p';
+/**
+ * Data payload.
+ *   - Cached-class instance: positional array, ordered to match `p`.
+ *   - Ad-hoc object (no `c`): keyed object `{key: value}`.
+ */
 export const DATA_FIELD = 'd';
 /** Signal value (for kind=s, initial inline value). */
 export const SIGNAL_VALUE_FIELD = 'v';

@@ -121,6 +121,21 @@ export class RPCClient {
     });
   }
 
+  /**
+   * Resolve the constructor for a remote class by name. Every class instance
+   * the client has hydrated is built on a shared prototype, so you can use
+   * the returned function with `instanceof`:
+   *
+   *   const Counter = client.classOf('Counter');
+   *   value instanceof Counter;
+   *
+   * Returns `undefined` if no instance of a class with that name has been
+   * received yet.
+   */
+  classOf(name: string): (new () => any) | undefined {
+    return this.hydrator.classOf(name);
+  }
+
   notify(method: string, params?: any[]) {
     const message = formatNotificationMessage(method, params, outboundReplacer);
     if (this.transportReady) {

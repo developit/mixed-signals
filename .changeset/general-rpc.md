@@ -19,34 +19,49 @@ machinery their kind requires.
   `weak`) governs final cleanup. `Symbol.dispose` on Proxies is a
   deterministic opt-in that short-circuits GC.
 - **Tier 3 — Promises.** One-shot lifecycle. No refcount, no release path,
-  no Handles entry — just a pid counter and a settlement closure. Worst
-  case (client stops caring) is O(1) wasted frame.
+  no Handles entry — just a pid counter and a settlement closure.
 
 **Upgrade rule for objects:**
 
-An object becomes an `o` handle iff it's stamped by `createModel(name, \u2026)`
+An object becomes an `o` handle iff it's stamped by `createModel(name, …)`
 OR has at least one non-`_` method anywhere in its prototype chain (up to
 but not including `Object.prototype`). Otherwise it's plain JSON.
 
-Methods never appear in a handle's shape or data array — they're
-trap-dispatched as `<id>#method` on demand. Two classes with identical
-*state* but different *methods* share a shape.
+Methods never appear in a handle's shape or data — they're
+trap-dispatched as `<id>#method` on demand.
 
-**Other wire wins:**
+**Wire format:**
 
 - Unified `@H` marker with kind-tagged id (`s`/`o`/`f`/`p`).
-- Shape cache: first emission inline, subsequent bare refs.
-- Model-name cache: name crosses the wire once per client, then id refs.
+- Class cache per connection: first emission carries class def inline
+  (`c:"<id>#<name>"`, `p:"key1,key2"`); subsequent emissions use a numeric
+  `c` ref and skip `p`. Class name is folded into `c` with `#` separator.
+- `d` is a positional array for cached-class instances, a keyed object
+  for ad-hoc handles (plain objects with methods).
 - Brand-aware `JSON.stringify` replacer on the client: passing a hydrated
   value back to the server resolves to the original live object by id.
 - `.toJSON()` short-circuit: Date and user-defined opt-outs serialize
   as their plain representation, matching `JSON.stringify` semantics.
 
+**Client `instanceof` support:**
+
+Every cached class allocates a synthetic ctor on the client; instances
+are built as `Object.create(ctor.prototype)`. Use `client.classOf(name)`
+to get the ctor and check membership:
+
+```ts
+const Counter = client.classOf('Counter');
+value instanceof Counter; // true across all server-emitted Counters
+```
+
 **Breaking changes:**
 
-- `createModel(factory)` \u2192 `createModel(name, factory)` — name is required,
+- `createModel(factory)` → `createModel(name, factory)` — name is required,
   stamped on the constructor via a registered symbol.
 - `createReflectedModel(props, methods)` is a deprecated no-op.
 - `RPC#registerModel` / `RPCClient#registerModel` removed.
-- Wire protocol bumped. `@S` / `@M` markers replaced by unified `@H`. Both
-  peers must update together.
+- Wire protocol is incompatible with earlier versions. Both peers must
+  update together.
+- `shared/shapes.ts` and `SHAPE_FIELD` / `MODEL_NAME_FIELD` constants are
+  removed; kinds are no longer transmitted. All class metadata is carried
+  by the single `c` field.

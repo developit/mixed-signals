@@ -46,25 +46,27 @@ describe('Handles', () => {
     expect(h.get('o2')?.refs.size).toBe(1);
   });
 
-  it('shape registry dedupes by ctor and signature', () => {
+  it('class registry dedupes by ctor and signature', () => {
     const h = new Handles();
     class Ctor {}
-    const s1 = h.shapeIdFor(Ctor, 'a:1|b:0', {keys: ['a', 'b'], kinds: [1, 0]});
-    const s2 = h.shapeIdFor(Ctor, 'a:1|b:0', {keys: ['a', 'b'], kinds: [1, 0]});
-    expect(s1).toBe(s2);
-    const s3 = h.shapeIdFor(undefined, 'c:0', {keys: ['c'], kinds: [0]});
-    expect(s3).not.toBe(s1);
+    const c1 = h.classIdFor(Ctor, 'Counter|a,b', 'Counter', ['a', 'b']);
+    const c2 = h.classIdFor(Ctor, 'Counter|a,b', 'Counter', ['a', 'b']);
+    expect(c1).toBe(c2);
+    const c3 = h.classIdFor(undefined, '|c', null, ['c']);
+    expect(c3).not.toBe(c1);
+    expect(h.getClass(c1)?.keys).toEqual(['a', 'b']);
+    expect(h.getClass(c1)?.name).toBe('Counter');
   });
 
-  it('per-client shape-sent cache', () => {
+  it('per-client class-sent cache', () => {
     const h = new Handles();
-    expect(h.hasShape('c1', 5)).toBe(false);
-    h.markShapeSent('c1', 5);
-    expect(h.hasShape('c1', 5)).toBe(true);
-    expect(h.hasShape('c2', 5)).toBe(false);
+    expect(h.hasClass('c1', 5)).toBe(false);
+    h.markClassSent('c1', 5);
+    expect(h.hasClass('c1', 5)).toBe(true);
+    expect(h.hasClass('c2', 5)).toBe(false);
     // Disconnect clears
     h.releaseAllForClient('c1');
-    expect(h.hasShape('c1', 5)).toBe(false);
+    expect(h.hasClass('c1', 5)).toBe(false);
   });
 
   it('per-client handle-sent cache drives short-reference emission', () => {

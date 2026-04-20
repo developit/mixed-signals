@@ -42,7 +42,7 @@ describe('Serializer: basics', () => {
     expect(signals).toHaveLength(1);
   });
 
-  it('plain data object with a method upgrades to an o handle', () => {
+  it('plain data with a method upgrades to an ad-hoc o handle (keyed d, no c)', () => {
     const {out, handles} = serialize({
       count: 5,
       next() {
@@ -50,8 +50,11 @@ describe('Serializer: basics', () => {
       },
     });
     expect(out[HANDLE_MARKER]).toMatch(/^o\d+$/);
-    expect(out.sh).toEqual({count: 0}); // next is omitted
-    expect(handles).toHaveLength(1); // only the object itself
+    expect(out.c).toBeUndefined();
+    expect(out.p).toBeUndefined();
+    // `d` is a keyed object for ad-hoc handles; `next` is omitted.
+    expect(out.d).toEqual({count: 5});
+    expect(handles).toHaveLength(1);
   });
 
   it('arrays are emitted as arrays with recursed items', () => {
@@ -91,8 +94,8 @@ describe('Serializer: signals (tier 1)', () => {
   });
 });
 
-describe('Serializer: models and classes (tier 2)', () => {
-  it('Models emit shape + data inline on first use, only @H on reuse', () => {
+describe('Serializer: cached classes (Models, user classes)', () => {
+  it('first emission: c is "<id>#<name>" string, p is comma-separated keys, d is positional', () => {
     const M = createModel<{
       a: ReturnType<typeof signal<number>>;
       b: ReturnType<typeof signal<string>>;
@@ -102,34 +105,62 @@ describe('Serializer: models and classes (tier 2)', () => {
     const h = new Handles();
     const ser = new Serializer(h);
     const first = ser.serialize(instance, {peerId: 'c1'});
+
     expect(first[HANDLE_MARKER]).toMatch(/^o\d+$/);
-    expect(first.s).toBeDefined();
-    expect(first.sh).toEqual({a: 1, b: 1});
-    expect(first.mn).toEqual([expect.any(Number), 'M']);
-    expect(first.n).toBeDefined();
+    expect(typeof first.c).toBe('string');
+    expect(first.c).toMatch(/^\d+#M$/);
+    expect(first.p).toBe('a,b');
+    expect(Array.isArray(first.d)).toBe(true);
     expect(first.d).toHaveLength(2);
+  });
+
+  it('subsequent emission: c becomes numeric, p is omitted, d stays positional', () => {
+    const M = createModel('M', () => ({a: signal(1), b: signal('x')}));
+    const instance = new M();
+    const h = new Handles();
+    const ser = new Serializer(h);
+    const first = ser.serialize(instance, {peerId: 'c1'});
+    const classIdFromString = Number.parseInt(
+      (first.c as string).split('#')[0],
+      10,
+    );
 
     const second = ser.serialize(instance, {peerId: 'c1'});
     expect(second[HANDLE_MARKER]).toBe(first[HANDLE_MARKER]);
-    expect(second.sh).toBeUndefined();
-    expect(second.mn).toBeUndefined();
-    expect(second.s).toBeUndefined();
+    // Same-instance reuse: short reference, no c/p/d at all.
+    expect(second.c).toBeUndefined();
+    expect(second.p).toBeUndefined();
     expect(second.d).toBeUndefined();
+
+    // Different instance of the same class — class cache hits:
+    const third = ser.serialize(new M(), {peerId: 'c1'});
+    expect(third.c).toBe(classIdFromString);
+    expect(third.p).toBeUndefined();
+    expect(third.d).toHaveLength(2);
   });
 
-  it('class with prototype methods auto-upgrades to an o handle (no createModel needed)', () => {
+  it('non-createModel class auto-upgrades and caches by ctor', () => {
     class Project {
       id = signal('1');
       rename(next: string) {
         this.id.value = next;
       }
     }
-    const {out} = serialize(new Project());
-    expect(out[HANDLE_MARKER]).toMatch(/^o\d+$/);
-    // No model name (ctor isn't stamped)
-    expect(out.mn).toBeUndefined();
-    // `rename` is a prototype method; it is NOT in the shape.
-    expect(out.sh).toEqual({id: 1});
+    const h = new Handles();
+    const ser = new Serializer(h);
+    const first = ser.serialize(new Project(), {peerId: 'c1'});
+
+    expect(first[HANDLE_MARKER]).toMatch(/^o\d+$/);
+    // Anonymous (no createModel name) but stable ctor → c is "<id>" only.
+    expect(typeof first.c).toBe('string');
+    expect(first.c).toMatch(/^\d+$/);
+    expect(first.p).toBe('id');
+    expect(first.d).toHaveLength(1);
+
+    // Second instance — class cache hits, numeric c:
+    const second = ser.serialize(new Project(), {peerId: 'c1'});
+    expect(typeof second.c).toBe('number');
+    expect(second.p).toBeUndefined();
   });
 
   it('class with no methods stays pure JSON', () => {
@@ -144,15 +175,26 @@ describe('Serializer: models and classes (tier 2)', () => {
     expect(out).toEqual({x: 3, y: 4});
   });
 
-  it('methods are omitted from shape and data; they are trap-dispatched', () => {
+  it('methods are omitted from p and d; they are trap-dispatched', () => {
     const M = createModel('Thing', () => ({
       count: signal(0),
       increment() {},
       add(_x: number) {},
     }));
     const {out} = serialize(new M());
-    expect(out.sh).toEqual({count: 1});
+    expect(out.p).toBe('count');
     expect(out.d).toHaveLength(1);
+  });
+
+  it('a class with a comma in a property name throws a clear error', () => {
+    // Hand-build a class-ctor with a weird own key so we hit the cached-class path.
+    class Weird {
+      constructor() {
+        (this as any)['foo,bar'] = 1;
+      }
+      method() {}
+    }
+    expect(() => serialize(new Weird())).toThrow(/contains ','/);
   });
 });
 
