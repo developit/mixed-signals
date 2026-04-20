@@ -229,6 +229,13 @@ client as `typeOfRemote(proxy) === name`.
   - `notify(method: string, params?: any[]) => void`
   - `onNotification(cb: (method: string, params: any[]) => void) => () => void`
   - `reconnect(transport: Transport) => void`
+  - `classOf(name: string) => (new () => any) | undefined` — returns the
+    synthetic constructor for a named remote class. Use with `instanceof`:
+    ```ts
+    const Counter = client.classOf('Counter');
+    if (proxy instanceof Counter) { … }
+    ```
+    Returns `undefined` if no instance of that class has been received yet.
 - Properties:
   - `ready: Promise<void>`
   - `root: any`

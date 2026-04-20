@@ -1,6 +1,5 @@
 import type {Signal} from '@preact/signals-core';
 import type {HandleKind} from './brand.ts';
-import type {Shape} from './shapes.ts';
 
 /**
  * Single registry of everything that crosses the wire with identity. Used on
@@ -13,9 +12,9 @@ import type {Shape} from './shapes.ts';
  *   - Per-client refcounting so the same object passed to N clients is tracked
  *     independently. Once all clients release a handle and policy permits, the
  *     handle itself is dropped.
- *   - Shape cache that is *per-peer* (per-client on the server). Shapes are
- *     never released during a connection's lifetime — they're trivially small
- *     and cache benefits compound.
+ *   - Class cache per connection: each (ctor or shape-signature) gets a stable
+ *     numeric id, emitted inline the first time a peer sees it and by bare id
+ *     afterwards.
  */
 
 type ClientId = string;
@@ -33,26 +32,30 @@ export interface HandleEntry {
   refs: Map<ClientId, number>;
 }
 
+/** Describes a cached class (ctor or plain-object shape). */
+export interface ClassDef {
+  id: number;
+  /** Stamped name for a createModel-backed ctor, else null. */
+  name: string | null;
+  /** Ordered property names; position matches the positional `d` array. */
+  keys: string[];
+}
+
 export class Handles {
   private entries = new Map<string, HandleEntry>();
   private byValue = new WeakMap<object, string>();
   private counters: Record<HandleKind, number> = {s: 0, o: 0, f: 0, p: 0};
 
   // Per-client caches. Decoupled from entries so disconnect cleanup is O(caches).
-  private shapesByClient = new Map<ClientId, Map<number, true>>();
-  private modelNamesByClient = new Map<ClientId, Map<number, true>>();
+  private classesByClient = new Map<ClientId, Set<number>>();
   /** Tracks whether a client has already received the full payload for a handle. */
   private sentHandlesByClient = new Map<ClientId, Set<string>>();
 
-  // Shape / model-name registry shared across clients.
-  private shapeIdByCtor = new WeakMap<object, number>();
-  private shapeIdBySig = new Map<string, number>();
-  private shapes = new Map<number, Shape>();
-  private nextShapeId = 1;
-
-  private modelNameIdByCtor = new WeakMap<object, number>();
-  private modelNames = new Map<number, string>();
-  private nextModelNameId = 1;
+  // Class registry shared across clients.
+  private classIdByCtor = new WeakMap<object, number>();
+  private classIdBySig = new Map<string, number>();
+  private classDefs = new Map<number, ClassDef>();
+  private nextClassId = 1;
 
   /** Allocate a new id with the given kind. */
   allocateId(kind: HandleKind): string {
@@ -175,8 +178,7 @@ export class Handles {
     }
     // Snapshot this client's sent set before we drop it.
     const sent = this.sentHandlesByClient.get(clientId);
-    this.shapesByClient.delete(clientId);
-    this.modelNamesByClient.delete(clientId);
+    this.classesByClient.delete(clientId);
     this.sentHandlesByClient.delete(clientId);
     // Tier 1: signals the departing client saw, that no remaining client
     // has seen, are orphaned too.
@@ -215,83 +217,54 @@ export class Handles {
     this.sentHandlesByClient.get(clientId)?.delete(id);
   }
 
-  // ───── shape cache ────────────────────────────────────────────────────────
+  // ───── class cache ────────────────────────────────────────────────────────
 
   /**
-   * Look up (or allocate) a shape id.
+   * Look up (or allocate) a class id for a given ctor / signature / class def.
    *
-   * The signature is always authoritative. The ctor cache is a micro-opt
-   * for Models where every instance shares a shape — but plain objects all
-   * have `Object` as their ctor yet may have wildly different shapes, so we
-   * only use the ctor cache when the ctor is not `Object`.
+   * The ctor cache is the primary key for stable classes (Models,
+   * user-defined classes with methods). Plain-object cases without a stable
+   * ctor never reach this path — they're emitted in the ad-hoc keyed form.
+   * `ctor === Object` is explicitly skipped; the signature cache catches
+   * anonymous-ctor-less cases if the caller does use them.
    */
-  shapeIdFor(
+  classIdFor(
     ctor: object | undefined,
     signature: string,
-    shape: Shape,
+    name: string | null,
+    keys: string[],
   ): number {
     const useCtorCache = ctor && ctor !== Object;
     if (useCtorCache) {
-      const hit = this.shapeIdByCtor.get(ctor);
+      const hit = this.classIdByCtor.get(ctor);
       if (hit !== undefined) return hit;
     }
-    let id = this.shapeIdBySig.get(signature);
+    let id = this.classIdBySig.get(signature);
     if (id === undefined) {
-      id = this.nextShapeId++;
-      this.shapeIdBySig.set(signature, id);
-      this.shapes.set(id, shape);
+      id = this.nextClassId++;
+      this.classIdBySig.set(signature, id);
+      this.classDefs.set(id, {id, name, keys});
     }
-    if (useCtorCache) this.shapeIdByCtor.set(ctor, id);
+    if (useCtorCache) this.classIdByCtor.set(ctor, id);
     return id;
   }
 
-  getShape(id: number): Shape | undefined {
-    return this.shapes.get(id);
+  getClass(id: number): ClassDef | undefined {
+    return this.classDefs.get(id);
   }
 
-  /** Has the given client already seen this shape inline? */
-  hasShape(clientId: ClientId, shapeId: number): boolean {
-    return this.shapesByClient.get(clientId)?.has(shapeId) ?? false;
+  /** Has the given client already seen this class inline? */
+  hasClass(clientId: ClientId, classId: number): boolean {
+    return this.classesByClient.get(clientId)?.has(classId) ?? false;
   }
 
-  markShapeSent(clientId: ClientId, shapeId: number) {
-    let m = this.shapesByClient.get(clientId);
-    if (!m) {
-      m = new Map();
-      this.shapesByClient.set(clientId, m);
+  markClassSent(clientId: ClientId, classId: number) {
+    let s = this.classesByClient.get(clientId);
+    if (!s) {
+      s = new Set();
+      this.classesByClient.set(clientId, s);
     }
-    m.set(shapeId, true);
-  }
-
-  // ───── model-name cache ───────────────────────────────────────────────────
-
-  /** Allocate (or reuse) a model-name id for a ctor. */
-  modelNameIdFor(ctor: object, name: string): number {
-    let id = this.modelNameIdByCtor.get(ctor);
-    if (id === undefined) {
-      id = this.nextModelNameId++;
-      this.modelNameIdByCtor.set(ctor, id);
-      this.modelNames.set(id, name);
-    }
-    return id;
-  }
-
-  getModelName(id: number): string | undefined {
-    return this.modelNames.get(id);
-  }
-
-  /** Has the given client already seen this model name inline? */
-  hasModelName(clientId: ClientId, nameId: number): boolean {
-    return this.modelNamesByClient.get(clientId)?.has(nameId) ?? false;
-  }
-
-  markModelNameSent(clientId: ClientId, nameId: number) {
-    let m = this.modelNamesByClient.get(clientId);
-    if (!m) {
-      m = new Map();
-      this.modelNamesByClient.set(clientId, m);
-    }
-    m.set(nameId, true);
+    s.add(classId);
   }
 }
 

@@ -424,6 +424,43 @@ describe('Integration: functions and promises', () => {
   });
 });
 
+describe('Integration: classOf + instanceof', () => {
+  it('client.classOf(name) returns a ctor usable with instanceof', async () => {
+    vi.useFakeTimers();
+    const Item = createModel<{label: Signal<string>}>('Item', () => ({
+      label: signal(''),
+    }));
+    const rpc = new RPC({
+      make(label: string) {
+        const it = new Item();
+        it.label.value = label;
+        return it;
+      },
+    });
+    const {client, flush} = connect(rpc, 'c1');
+    await flush();
+    await client.ready;
+
+    // Before we've seen an instance, classOf is undefined.
+    expect(client.classOf('Item')).toBeUndefined();
+
+    const p = client.root.make('one');
+    await flush();
+    const first = await p;
+
+    const Item$ = client.classOf('Item');
+    expect(Item$).toBeDefined();
+    expect(first).toBeInstanceOf(Item$!);
+
+    // A second instance of the same class is instanceof the same ctor.
+    const q = client.root.make('two');
+    await flush();
+    const second = await q;
+    expect(second).toBeInstanceOf(Item$!);
+    expect(second.constructor).toBe(Item$);
+  });
+});
+
 describe('Integration: tiered lifecycle', () => {
   it('non-Model class with methods auto-upgrades; methods route through the trap', async () => {
     vi.useFakeTimers();

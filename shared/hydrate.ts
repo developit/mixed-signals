@@ -1,15 +1,12 @@
 import {type Signal, signal} from '@preact/signals-core';
 import {BRAND_REMOTE, type HandleKind, type RemoteBrand} from './brand.ts';
 import {
+  CLASS_FIELD,
   DATA_FIELD,
   HANDLE_MARKER,
-  MODEL_NAME_FIELD,
-  MODEL_NAME_ID_FIELD,
-  SHAPE_FIELD,
-  SHAPE_ID_FIELD,
+  PROPS_FIELD,
   SIGNAL_VALUE_FIELD,
 } from './protocol.ts';
-import {type Shape, SLOT_SIGNAL, type SlotKind} from './shapes.ts';
 
 /**
  * Minimal public surface the hydrator uses to do its job. The concrete RPC
@@ -37,16 +34,50 @@ export interface HydrateEnv {
   ): void;
 }
 
+/**
+ * Per-connection record of a cached class the hydrator has seen. `ctor` is
+ * a synthetic function we mint for each class so that `instanceof` checks
+ * work on the client: every instance we hydrate for this class is built as
+ * `Object.create(ctor.prototype)`.
+ */
+export interface RemoteClass {
+  id: number;
+  name: string | null;
+  keys: string[];
+  ctor: new () => any;
+}
+
 const HAS_FINALIZATION_REGISTRY = typeof FinalizationRegistry !== 'undefined';
+
+/**
+ * Mint a named-at-runtime "class" function whose prototype is what we use
+ * for remote instances. We don't want user code to construct these directly
+ * (there's no local value to back it), so the ctor throws when called.
+ */
+function makeRemoteClass(name: string | null): new () => any {
+  const display = name ?? 'RemoteObject';
+  // Use a computed property on an object literal to pin the function name —
+  // gives users a sensible `proxy.constructor.name` and `instanceof` target.
+  const holder = {
+    [display]: class {
+      constructor() {
+        throw new Error(
+          `${display} is a remote class; construct values on the server.`,
+        );
+      }
+    },
+  } as Record<string, new () => any>;
+  return holder[display];
+}
 
 export class Hydrator {
   private env: HydrateEnv;
   /** id → WeakRef<object> for reuse. */
   private handles = new Map<string, WeakRef<object> | object>();
-  /** Shape cache (per connection). */
-  private shapes = new Map<number, Shape>();
-  /** Model-name cache (per connection). */
-  private modelNames = new Map<number, string>();
+  /** Class cache (per connection), keyed by numeric class id. */
+  private classes = new Map<number, RemoteClass>();
+  /** Secondary index for `classOf(name)` lookups. */
+  private classesByName = new Map<string, RemoteClass>();
   /** Registry that fires when a proxy becomes unreachable. */
   private finalization?: FinalizationRegistry<string>;
 
@@ -71,8 +102,8 @@ export class Hydrator {
   /** Reset everything (used on reconnect). */
   reset() {
     this.handles.clear();
-    this.shapes.clear();
-    this.modelNames.clear();
+    this.classes.clear();
+    this.classesByName.clear();
     // Old finalizers will fire eventually; they'll find nothing to release
     // and drop on the floor, which is safe.
   }
@@ -83,6 +114,15 @@ export class Hydrator {
     if (HANDLE_MARKER in val) return this.hydrate(val);
     return val;
   };
+
+  /**
+   * Resolve the remote class constructor by name. Returns `undefined` if the
+   * client has never received an instance of a class with that name. Useful
+   * for `instanceof` checks in user code.
+   */
+  classOf(name: string): (new () => any) | undefined {
+    return this.classesByName.get(name)?.ctor;
+  }
 
   // ───── entry point ────────────────────────────────────────────────────────
 
@@ -98,25 +138,6 @@ export class Hydrator {
       // Full body on a known id — update the spine in place.
       this.updateExisting(existing, kind, marker);
       return existing;
-    }
-
-    // New handle. Install shape / model-name preludes first.
-    if (SHAPE_FIELD in marker) {
-      // Shape wire format: `{key: kind, …}`. ECMAScript guarantees
-      // string-key insertion order round-trips through JSON.parse, so the
-      // data array's iᵗʰ slot matches the iᵗʰ key here.
-      const wireShape = marker[SHAPE_FIELD] as Record<string, SlotKind>;
-      const keys: string[] = [];
-      const kinds: SlotKind[] = [];
-      for (const k in wireShape) {
-        keys.push(k);
-        kinds.push(wireShape[k]);
-      }
-      this.shapes.set(marker[SHAPE_ID_FIELD], {keys, kinds});
-    }
-    if (MODEL_NAME_FIELD in marker) {
-      const [nameId, name] = marker[MODEL_NAME_FIELD] as [number, string];
-      this.modelNames.set(nameId, name);
     }
 
     switch (kind) {
@@ -200,28 +221,70 @@ export class Hydrator {
     }
   }
 
-  // ───── object / model ─────────────────────────────────────────────────────
+  // ───── object / class instance ────────────────────────────────────────────
+
+  /**
+   * Install a class def seen for the first time on the wire. Accepts either
+   * the string form `"<id>#<name>"` / `"<id>"` (first emission) or does
+   * nothing if the class is already known by the numeric id path.
+   */
+  private ensureClass(cField: unknown, propsField: unknown): RemoteClass {
+    const asString = typeof cField === 'string';
+    let classId: number;
+    let name: string | null = null;
+    if (asString) {
+      const s = cField as string;
+      const hashIdx = s.indexOf('#');
+      classId = Number.parseInt(hashIdx === -1 ? s : s.slice(0, hashIdx), 10);
+      if (hashIdx !== -1) name = s.slice(hashIdx + 1);
+    } else {
+      classId = cField as number;
+    }
+    const existing = this.classes.get(classId);
+    if (existing) return existing;
+    // First-time emission: must carry `p` (property list).
+    const propsStr = typeof propsField === 'string' ? propsField : '';
+    const keys = propsStr === '' ? [] : propsStr.split(',');
+    const cls: RemoteClass = {
+      id: classId,
+      name,
+      keys,
+      ctor: makeRemoteClass(name),
+    };
+    this.classes.set(classId, cls);
+    if (name) this.classesByName.set(name, cls);
+    return cls;
+  }
 
   private createObject(id: string, marker: any): any {
-    const shapeId: number = marker[SHAPE_ID_FIELD];
-    const shape = this.shapes.get(shapeId);
-    if (!shape) {
-      throw new Error(
-        `Missing shape ${shapeId} for handle ${id} (prelude was not sent).`,
-      );
-    }
-    const nameId: number | undefined = marker[MODEL_NAME_ID_FIELD];
-    const typeName =
-      nameId !== undefined ? this.modelNames.get(nameId) : undefined;
+    const hasClass = CLASS_FIELD in marker;
+    let cls: RemoteClass | undefined;
+    let typeName: string | undefined;
 
-    const data: any[] = marker[DATA_FIELD] ?? [];
-    const spine: Record<string | symbol, any> = Object.create(null);
-    for (let i = 0; i < shape.keys.length; i++) {
-      spine[shape.keys[i]] = this.reviveSlot(shape.kinds[i], data[i]);
+    let target: Record<string | symbol, any>;
+    const dField = marker[DATA_FIELD];
+
+    if (hasClass) {
+      // Cached-class instance: positional `d` aligned to `cls.keys`.
+      cls = this.ensureClass(marker[CLASS_FIELD], marker[PROPS_FIELD]);
+      typeName = cls.name ?? undefined;
+      target = Object.create(cls.ctor.prototype);
+      const data: any[] = Array.isArray(dField) ? dField : [];
+      for (let i = 0; i < cls.keys.length; i++) {
+        target[cls.keys[i]] = this.reviveSlot(data[i]);
+      }
+    } else {
+      // Ad-hoc object: keyed `d`. No class, no typeName, no `instanceof`.
+      target = Object.create(null);
+      if (dField && typeof dField === 'object') {
+        for (const key in dField) {
+          target[key] = this.reviveSlot(dField[key]);
+        }
+      }
     }
 
     const brand: RemoteBrand = {id, kind: 'o', typeName, owner: 'server'};
-    spine[BRAND_REMOTE] = brand;
+    target[BRAND_REMOTE] = brand;
 
     const methodCache = new Map<string, (...args: any[]) => any>();
     const env = this.env;
@@ -231,7 +294,7 @@ export class Hydrator {
       disposed = true;
       env.scheduleRelease(id);
     };
-    const proxy = new Proxy(spine, {
+    const proxy = new Proxy(target, {
       get(target, key) {
         if (key === BRAND_REMOTE) return target[BRAND_REMOTE];
         if (typeof key === 'symbol') {
@@ -298,7 +361,7 @@ export class Hydrator {
     return proxy;
   }
 
-  private reviveSlot(_kind: SlotKind, data: any): any {
+  private reviveSlot(data: any): any {
     if (data === null || data === undefined) return data;
     // If the JSON reviver already ran, this slot holds a real hydrated value
     // (Signal, Proxy, Promise, function). Those carry `BRAND_REMOTE`; skip.
@@ -326,26 +389,31 @@ export class Hydrator {
       return;
     }
     if (kind === 'o') {
-      const shapeId: number = marker[SHAPE_ID_FIELD];
-      const shape = this.shapes.get(shapeId);
-      if (!shape) return; // re-hydration without known shape is a no-op
-      const data: any[] = marker[DATA_FIELD] ?? [];
-      for (let i = 0; i < shape.keys.length; i++) {
-        const key = shape.keys[i];
-        const slotKind = shape.kinds[i];
-        if (slotKind === SLOT_SIGNAL) {
-          // Signal slots are already live on the spine. Only update them if
-          // the server sent a new value (data[i] is {@H,v:...}).
-          const inner = data[i];
+      const hasClass = CLASS_FIELD in marker;
+      const dField = marker[DATA_FIELD];
+      if (hasClass) {
+        const cls = this.ensureClass(marker[CLASS_FIELD], marker[PROPS_FIELD]);
+        const data: any[] = Array.isArray(dField) ? dField : [];
+        for (let i = 0; i < cls.keys.length; i++) {
+          const key = cls.keys[i];
+          const slot = existing[key];
+          const incoming = data[i];
           if (
-            inner &&
-            typeof inner === 'object' &&
-            SIGNAL_VALUE_FIELD in inner
+            slot &&
+            typeof slot === 'object' &&
+            (slot as any)[BRAND_REMOTE]?.kind === 's' &&
+            incoming &&
+            typeof incoming === 'object' &&
+            SIGNAL_VALUE_FIELD in incoming
           ) {
-            existing[key].value = inner[SIGNAL_VALUE_FIELD];
+            (slot as Signal<any>).value = incoming[SIGNAL_VALUE_FIELD];
+          } else {
+            existing[key] = this.reviveSlot(incoming);
           }
-        } else {
-          existing[key] = this.reviveSlot(slotKind, data[i]);
+        }
+      } else if (dField && typeof dField === 'object') {
+        for (const key in dField) {
+          existing[key] = this.reviveSlot(dField[key]);
         }
       }
     }
