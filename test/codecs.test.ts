@@ -1,195 +1,162 @@
 import {describe, expect, it} from 'vitest';
-import {
-  decode,
-  decodeArrayBuffer,
-  decodeBigInt,
-  decodeDate,
-  decodeError,
-  decodeMap,
-  decodeRegExp,
-  decodeSet,
-  decodeTypedArray,
-  decodeURL,
-  encode,
-  encodeArrayBuffer,
-  encodeBigInt,
-  encodeDate,
-  encodeError,
-  encodeMap,
-  encodeRegExp,
-  encodeSet,
-  encodeTypedArray,
-  encodeURL,
-} from '../codecs/index.ts';
+import {decode, encode} from '../codecs/index.ts';
 
-describe('per-type codecs', () => {
+function roundTrip<T>(value: T): T {
+  const encoded = encode(value);
+  expect(encoded).toBeDefined();
+  // Encoded form should be plain-JSON-serializable (no live objects).
+  expect(JSON.stringify(encoded)).toBeTypeOf('string');
+  const parsed = JSON.parse(JSON.stringify(encoded));
+  const decoded = decode(parsed);
+  expect(decoded).toBeDefined();
+  return decoded as T;
+}
+
+describe('encode / decode — per-type round-trips', () => {
   it('Map', () => {
     const m = new Map<string, number>([
       ['a', 1],
       ['b', 2],
     ]);
-    const enc = encodeMap(m);
-    expect(enc).toEqual({'@T': 'map', d: [['a', 1], ['b', 2]]});
-    const dec = decodeMap(enc);
-    expect(dec).toBeInstanceOf(Map);
-    expect([...(dec as Map<string, number>).entries()]).toEqual([
+    const d = roundTrip(m);
+    expect(d).toBeInstanceOf(Map);
+    expect([...d.entries()]).toEqual([
       ['a', 1],
       ['b', 2],
     ]);
   });
 
   it('Set', () => {
-    const s = new Set([1, 2, 3]);
-    const enc = encodeSet(s);
-    expect(enc).toEqual({'@T': 'set', d: [1, 2, 3]});
-    const dec = decodeSet(enc);
-    expect(dec).toBeInstanceOf(Set);
-    expect([...(dec as Set<number>)]).toEqual([1, 2, 3]);
+    const s = new Set(['x', 'y', 'z']);
+    const d = roundTrip(s);
+    expect(d).toBeInstanceOf(Set);
+    expect([...d]).toEqual(['x', 'y', 'z']);
   });
 
   it('Date', () => {
-    const d = new Date('2026-01-01T00:00:00Z');
-    const enc = encodeDate(d);
-    expect((enc as any).d).toBe(d.getTime());
-    const dec = decodeDate(enc);
-    expect(dec).toBeInstanceOf(Date);
-    expect((dec as Date).getTime()).toBe(d.getTime());
+    const src = new Date('2026-01-01T00:00:00Z');
+    const d = roundTrip(src);
+    expect(d).toBeInstanceOf(Date);
+    expect(d.getTime()).toBe(src.getTime());
   });
 
-  it('RegExp', () => {
+  it('RegExp with flags', () => {
     const r = /foo.*bar/giu;
-    const enc = encodeRegExp(r);
-    const dec = decodeRegExp(enc);
-    expect(dec).toBeInstanceOf(RegExp);
-    expect((dec as RegExp).source).toBe('foo.*bar');
-    expect((dec as RegExp).flags).toBe('giu');
+    const d = roundTrip(r);
+    expect(d).toBeInstanceOf(RegExp);
+    expect(d.source).toBe('foo.*bar');
+    expect(d.flags).toBe('giu');
   });
 
-  it('Error preserves name, message, and stack', () => {
+  it('Error preserves name, message, stack', () => {
     const e = new TypeError('boom');
-    const enc = encodeError(e);
-    const dec = decodeError(enc) as Error;
-    expect(dec).toBeInstanceOf(Error);
-    expect(dec.name).toBe('TypeError');
-    expect(dec.message).toBe('boom');
-    expect(dec.stack).toBe(e.stack);
+    const d = roundTrip(e);
+    expect(d).toBeInstanceOf(Error);
+    expect(d.name).toBe('TypeError');
+    expect(d.message).toBe('boom');
+    expect(d.stack).toBe(e.stack);
   });
 
   it('URL', () => {
-    const u = new URL('https://example.com/path?x=1');
-    const enc = encodeURL(u);
-    const dec = decodeURL(enc) as URL;
-    expect(dec).toBeInstanceOf(URL);
-    expect(dec.href).toBe(u.href);
+    const u = new URL('https://example.com/path?x=1#frag');
+    const d = roundTrip(u);
+    expect(d).toBeInstanceOf(URL);
+    expect(d.href).toBe(u.href);
   });
 
   it('BigInt', () => {
-    const b = 12345678901234567890n;
-    const enc = encodeBigInt(b);
-    const dec = decodeBigInt(enc);
-    expect(dec).toBe(b);
+    const d = roundTrip(12345678901234567890n);
+    expect(d).toBe(12345678901234567890n);
   });
 
-  it('ArrayBuffer round-trips bytes', () => {
+  it('ArrayBuffer', () => {
     const ab = new ArrayBuffer(4);
     new Uint8Array(ab).set([1, 2, 3, 4]);
-    const enc = encodeArrayBuffer(ab);
-    const dec = decodeArrayBuffer(enc) as ArrayBuffer;
-    expect(dec).toBeInstanceOf(ArrayBuffer);
-    expect(new Uint8Array(dec)).toEqual(new Uint8Array([1, 2, 3, 4]));
+    const d = roundTrip(ab);
+    expect(d).toBeInstanceOf(ArrayBuffer);
+    expect(new Uint8Array(d)).toEqual(new Uint8Array([1, 2, 3, 4]));
   });
 
-  it('TypedArray: consolidated codec handles every subtype by ctor name', () => {
-    const cases: Array<[string, ArrayBufferView]> = [
-      ['Int8Array', new Int8Array([-1, 0, 127])],
-      ['Uint8Array', new Uint8Array([0, 128, 255])],
-      ['Uint8ClampedArray', new Uint8ClampedArray([0, 128, 255])],
-      ['Int16Array', new Int16Array([-1, 0, 32767])],
-      ['Uint16Array', new Uint16Array([0, 32768, 65535])],
-      ['Int32Array', new Int32Array([-1, 0, 2147483647])],
-      ['Uint32Array', new Uint32Array([0, 2147483648, 4294967295])],
-      ['Float32Array', new Float32Array([1.5, -2.25, 3.125])],
-      ['Float64Array', new Float64Array([Math.PI, Math.E])],
-      ['BigInt64Array', new BigInt64Array([1n, -1n, 9007199254740993n])],
-      ['BigUint64Array', new BigUint64Array([1n, 18446744073709551615n])],
-      ['DataView', new DataView(new Uint8Array([1, 2, 3, 4]).buffer)],
+  it('every TypedArray subtype + DataView via the consolidated tag', () => {
+    const cases: Array<[string, ArrayBufferView, (d: any) => unknown]> = [
+      ['Int8Array', new Int8Array([-1, 0, 127]), (d) => Array.from(d)],
+      ['Uint8Array', new Uint8Array([0, 128, 255]), (d) => Array.from(d)],
+      [
+        'Uint8ClampedArray',
+        new Uint8ClampedArray([0, 128, 255]),
+        (d) => Array.from(d),
+      ],
+      ['Int16Array', new Int16Array([-1, 0, 32767]), (d) => Array.from(d)],
+      ['Uint16Array', new Uint16Array([0, 32768, 65535]), (d) => Array.from(d)],
+      ['Int32Array', new Int32Array([-1, 0, 2147483647]), (d) => Array.from(d)],
+      [
+        'Uint32Array',
+        new Uint32Array([0, 2147483648, 4294967295]),
+        (d) => Array.from(d),
+      ],
+      [
+        'Float32Array',
+        new Float32Array([1.5, -2.25, 3.125]),
+        (d) => Array.from(d),
+      ],
+      ['Float64Array', new Float64Array([Math.PI, Math.E]), (d) => Array.from(d)],
+      [
+        'BigInt64Array',
+        new BigInt64Array([1n, -1n, 9007199254740993n]),
+        (d) => Array.from(d),
+      ],
+      [
+        'BigUint64Array',
+        new BigUint64Array([1n, 18446744073709551615n]),
+        (d) => Array.from(d),
+      ],
+      [
+        'DataView',
+        new DataView(new Uint8Array([1, 2, 3, 4]).buffer),
+        (d) => (d as DataView).byteLength,
+      ],
     ];
-    for (const [name, view] of cases) {
-      const enc = encodeTypedArray(view) as {t: string; d: string};
-      expect(enc.t).toBe(name);
-      const dec = decodeTypedArray(enc);
-      expect(dec).toBeInstanceOf(view.constructor as new () => ArrayBufferView);
-      if (dec instanceof DataView) {
-        expect(dec.byteLength).toBe(view.byteLength);
+    for (const [name, input, extract] of cases) {
+      const d = roundTrip(input);
+      expect(d.constructor.name).toBe(name);
+      if (input instanceof DataView) {
+        expect(extract(d)).toBe(4);
       } else {
-        // Numeric typed arrays — element-wise equality
-        expect((dec as any).length).toBe((view as any).length);
-        for (let i = 0; i < (view as any).length; i++) {
-          expect((dec as any)[i]).toBe((view as any)[i]);
-        }
+        expect(extract(d)).toEqual(Array.from(input as any));
       }
     }
   });
 
-  it('TypedArray codec preserves view window (byteOffset + byteLength)', () => {
+  it('TypedArray preserves byteOffset window', () => {
     const buf = new ArrayBuffer(16);
     new Uint8Array(buf).set([10, 20, 30, 40, 50, 60, 70, 80]);
     const view = new Uint8Array(buf, 2, 4); // [30, 40, 50, 60]
-    const dec = decodeTypedArray(encodeTypedArray(view)) as Uint8Array;
-    expect(Array.from(dec)).toEqual([30, 40, 50, 60]);
+    const d = roundTrip(view);
+    expect(Array.from(d)).toEqual([30, 40, 50, 60]);
   });
 });
 
-describe('undefined-is-pass-through semantics', () => {
-  it('encoders return undefined for non-matching values', () => {
-    expect(encodeMap('str')).toBeUndefined();
-    expect(encodeSet(42)).toBeUndefined();
-    expect(encodeTypedArray({})).toBeUndefined();
-    expect(encodeDate('2020-01-01')).toBeUndefined();
-    expect(encodeBigInt(1)).toBeUndefined();
-  });
-
-  it('decoders return undefined for non-tagged values', () => {
-    expect(decodeMap({})).toBeUndefined();
-    expect(decodeMap({'@T': 'wrong'})).toBeUndefined();
-    expect(decodeSet(null)).toBeUndefined();
-    expect(decodeTypedArray({})).toBeUndefined();
-  });
-});
-
-describe('composed encode/decode bundles', () => {
-  it('covers all default types in one call', () => {
-    expect(encode(new Map([['a', 1]]))).toMatchObject({'@T': 'map'});
-    expect(encode(new Set([1]))).toMatchObject({'@T': 'set'});
-    expect(encode(new Uint8Array([1, 2]))).toMatchObject({'@T': 'ta'});
-    expect(encode(new Date())).toMatchObject({'@T': 'date'});
-    expect(encode(/x/)).toMatchObject({'@T': 're'});
-    expect(encode(new URL('https://a.b'))).toMatchObject({'@T': 'url'});
-    expect(encode(1n)).toMatchObject({'@T': 'bi'});
-    expect(encode(new Error('x'))).toMatchObject({'@T': 'err'});
+describe('encode / decode — pass-through semantics', () => {
+  it('encode returns undefined for primitives and plain objects', () => {
     expect(encode('str')).toBeUndefined();
     expect(encode(42)).toBeUndefined();
+    expect(encode(true)).toBeUndefined();
+    expect(encode(null)).toBeUndefined();
+    expect(encode({a: 1})).toBeUndefined();
+    expect(encode([1, 2, 3])).toBeUndefined();
   });
 
-  it('decode round-trips everything the default encode handles', () => {
-    const cases: unknown[] = [
-      new Map([['a', 1]]),
-      new Set([1, 2]),
-      new Uint8Array([1, 2, 3]),
-      new Date('2026-01-01T00:00:00Z'),
-      /foo/g,
-      new URL('https://example.com'),
-      12345n,
-    ];
-    for (const input of cases) {
-      const enc = encode(input);
-      const dec = decode(enc);
-      // Compare observable shape; instanceof + key equality.
-      expect(dec?.constructor).toBe((input as object).constructor);
-    }
+  it('decode returns undefined for non-tagged values', () => {
+    expect(decode('str')).toBeUndefined();
+    expect(decode(null)).toBeUndefined();
+    expect(decode({})).toBeUndefined();
+    expect(decode({'@T': 'nope-not-a-tag', d: 1})).toBeUndefined();
+    expect(decode([1, 2, 3])).toBeUndefined();
   });
+});
 
-  it('composes with a user codec via `??`', () => {
+describe('encode / decode — composition with user codecs', () => {
+  it('user type can chain ahead of defaults via `??`', () => {
     class Money {
       constructor(
         public amount: number,
@@ -206,15 +173,34 @@ describe('composed encode/decode bundles', () => {
     const enc = (v: unknown) => encodeMoney(v) ?? encode(v);
     const dec = (v: unknown) => decodeMoney(v) ?? decode(v);
 
-    const price = new Money(9.99, 'USD');
-    const encoded = enc(price) as any;
-    expect(encoded['@T']).toBe('money');
-    const decoded = dec(encoded) as Money;
-    expect(decoded).toBeInstanceOf(Money);
-    expect(decoded.amount).toBe(9.99);
-    expect(decoded.currency).toBe('USD');
+    // User type round-trips via the user codec.
+    const priceEnc = enc(new Money(9.99, 'USD'));
+    const price = dec(priceEnc) as Money;
+    expect(price).toBeInstanceOf(Money);
+    expect(price.amount).toBe(9.99);
+    expect(price.currency).toBe('USD');
 
-    // Money still lets the defaults through for non-matches
-    expect(enc(new Set([1, 2]))).toMatchObject({'@T': 'set'});
+    // Defaults still flow through for non-matching values.
+    const mapEnc = enc(new Map([['k', 1]]));
+    const m = dec(mapEnc) as Map<string, number>;
+    expect(m).toBeInstanceOf(Map);
+    expect(m.get('k')).toBe(1);
+  });
+
+  it('subset-only encode/decode (user-written) interops with the library @T format', () => {
+    // A user who wants only Map + Set can write their own 6-liner; the `@T`
+    // tags they produce are interchangeable with this module's defaults.
+    const miniEnc = (v: unknown) =>
+      v instanceof Map
+        ? {'@T': 'map', d: Array.from(v.entries())}
+        : v instanceof Set
+          ? {'@T': 'set', d: Array.from(v)}
+          : undefined;
+
+    const m = miniEnc(new Map([['a', 1]]));
+    expect(decode(m)).toBeInstanceOf(Map);
+
+    const s = miniEnc(new Set([1, 2]));
+    expect(decode(s)).toBeInstanceOf(Set);
   });
 });

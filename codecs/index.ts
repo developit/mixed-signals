@@ -1,39 +1,60 @@
 /**
- * Per-type codecs for rich JS types that neither plain JSON nor the core
- * protocol round-trips on its own. Each codec is a pair of pure functions
- * with matching `undefined`-means-pass-through semantics, composable with
- * `??`:
+ * Default codecs for rich JS types that neither plain JSON nor the core
+ * protocol round-trips on its own: Map, Set, every TypedArray subtype,
+ * DataView, ArrayBuffer, Date, RegExp, Error, URL, BigInt.
  *
- *   import {encodeMap, encodeSet, decodeMap, decodeSet} from 'mixed-signals/codecs';
- *   const encode = (v) => encodeMap(v) ?? encodeSet(v);
- *   const decode = (v) => decodeMap(v) ?? decodeSet(v);
- *   const transport: StringTransport = { encode, decode, send, onMessage };
- *
- * Pre-composed `encode` / `decode` bundles re-export all default codecs in
- * one call for the common case:
+ * Usage:
  *
  *   import {encode, decode} from 'mixed-signals/codecs';
- *   const transport: StringTransport = { encode, decode, send, onMessage };
  *
- * Codecs operate at the object-tree level, between the library's serializer
- * (which emits `@H` markers for handles) and the library's stringify step
- * (which happens inside the string transport). A codec's `encode*` runs
- * top-down during the outbound walk; the library recurses into the returned
- * tagged body so nested signals / handles still get `@H`-emitted. `decode*`
- * runs bottom-up during the inbound walk, so by the time it sees
- * `{@T: 'map', d: [...]}`, the `d` entries have already been hydrated.
+ *   const transport: StringTransport = {
+ *     encode, decode,
+ *     send: (s) => webview.postMessage(s),
+ *     onMessage: (cb) => webview.addEventListener('message',
+ *       e => cb({toString: () => e.data})),
+ *   };
+ *
+ * `encode` runs top-down during the outbound serializer walk (before
+ * `emitObject` would mis-upgrade a built-in to an `@H` handle). `decode`
+ * runs bottom-up during `hydrateTree` (so by the time it sees `{@T: 'map',
+ * d: [...]}`, the `d` entries are already hydrated). Both use the
+ * `undefined`-means-pass-through convention so users compose with `??`:
+ *
+ *   const myEncode = (v) => encodeMoney(v) ?? encode(v);
+ *   const myDecode = (v) => decodeMoney(v) ?? decode(v);
+ *
+ * The `@T` tag format is part of the documented protocol; a user codec
+ * for a subset of built-ins just has to produce `{'@T': 'tag', d: body}`
+ * objects that `decode` knows how to resolve.
  */
-
-// ───── wire marker ───────────────────────────────────────────────────────
 
 /** Reserved field the library uses for codec-tagged values. */
 const T = '@T';
 
-// ───── base64 (dependency-free, works in Node 16+ / browsers / workers) ──
+// ───── base64: native toBase64/fromBase64 fast path + fallback ───────────
+
+// TC39 Stage 3 — Chrome 140+, Firefox 133+, Safari 18.2+. Native is ~5×
+// faster than the chunked btoa path and avoids an intermediate string.
+// TS lib hasn't caught up yet; cast around the missing type decl.
+type Uint8ArrayBase64Ext = Uint8Array & {toBase64(): string};
+type Uint8ArrayCtorBase64Ext = Uint8ArrayConstructor & {
+  fromBase64(s: string): Uint8Array;
+};
+
+const nativeToBase64 =
+  typeof (Uint8Array.prototype as Uint8ArrayBase64Ext).toBase64 === 'function'
+    ? (Uint8Array.prototype as Uint8ArrayBase64Ext).toBase64
+    : undefined;
+
+const nativeFromBase64 =
+  typeof (Uint8Array as Uint8ArrayCtorBase64Ext).fromBase64 === 'function'
+    ? (Uint8Array as Uint8ArrayCtorBase64Ext).fromBase64
+    : undefined;
 
 const CHUNK = 0x8000;
 
 function bytesToBase64(bytes: Uint8Array): string {
+  if (nativeToBase64) return nativeToBase64.call(bytes);
   // Chunked to avoid the argument-count limit on `String.fromCharCode`.
   let binary = '';
   for (let i = 0; i < bytes.length; i += CHUNK) {
@@ -46,20 +67,20 @@ function bytesToBase64(bytes: Uint8Array): string {
 }
 
 function base64ToBytes(b64: string): Uint8Array {
+  if (nativeFromBase64) return nativeFromBase64(b64);
   const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return bytes;
 }
 
-// ───── typed-array codec (consolidated) ──────────────────────────────────
+// ───── typed-array constructors (by name) ────────────────────────────────
 
 /**
- * Every TypedArray subtype and `DataView` share the same wire shape — bytes
- * as base64 plus the constructor name. Endianness is host-native; modern
+ * Every TypedArray subtype and `DataView` share one wire shape: bytes as
+ * base64 plus the constructor name. Endianness is host-native; modern
  * targets (x86/x64/ARM in their standard modes) are all little-endian so
- * this round-trips faithfully between any realistic peer pair. Cross-endian
- * RPC between different-endian hosts is not in scope.
+ * this round-trips faithfully between any realistic peer pair.
  */
 const TYPED_ARRAY_CTORS: Record<
   string,
@@ -90,150 +111,95 @@ const TYPED_ARRAY_CTORS: Record<
   DataView,
 };
 
-export const encodeTypedArray = (v: unknown) => {
-  if (!ArrayBuffer.isView(v)) return undefined;
-  const ctor = (v as {constructor: {name: string}}).constructor.name;
-  if (!(ctor in TYPED_ARRAY_CTORS)) return undefined;
-  const bytes = new Uint8Array(
-    (v as ArrayBufferView).buffer,
-    (v as ArrayBufferView).byteOffset,
-    (v as ArrayBufferView).byteLength,
-  );
-  return {[T]: 'ta', t: ctor, d: bytesToBase64(bytes)};
-};
-
-export const decodeTypedArray = (v: any) => {
-  if (v?.[T] !== 'ta') return undefined;
-  const Ctor = TYPED_ARRAY_CTORS[v.t];
-  if (!Ctor) return undefined;
-  const bytes = base64ToBytes(v.d);
-  if (Ctor === DataView) return new DataView(bytes.buffer);
-  if (Ctor === Uint8Array) return bytes;
-  // Other typed arrays share the buffer; length is in elements, not bytes.
-  return new (Ctor as Uint8ArrayConstructor)(
-    bytes.buffer,
-    bytes.byteOffset,
-    bytes.byteLength / (Ctor as typeof Uint8Array).BYTES_PER_ELEMENT,
-  );
-};
-
-// ───── ArrayBuffer ───────────────────────────────────────────────────────
-
-export const encodeArrayBuffer = (v: unknown) => {
-  if (!(v instanceof ArrayBuffer)) return undefined;
-  return {[T]: 'ab', d: bytesToBase64(new Uint8Array(v))};
-};
-
-export const decodeArrayBuffer = (v: any) => {
-  if (v?.[T] !== 'ab') return undefined;
-  return base64ToBytes(v.d).buffer;
-};
-
-// ───── Map ───────────────────────────────────────────────────────────────
-
-export const encodeMap = (v: unknown) =>
-  v instanceof Map ? {[T]: 'map', d: Array.from(v.entries())} : undefined;
-
-export const decodeMap = (v: any) =>
-  v?.[T] === 'map' ? new Map(v.d) : undefined;
-
-// ───── Set ───────────────────────────────────────────────────────────────
-
-export const encodeSet = (v: unknown) =>
-  v instanceof Set ? {[T]: 'set', d: Array.from(v)} : undefined;
-
-export const decodeSet = (v: any) =>
-  v?.[T] === 'set' ? new Set(v.d) : undefined;
-
-// ───── Date ──────────────────────────────────────────────────────────────
-
-// Date has a built-in `.toJSON()` so the serializer already handles the
-// outbound direction losslessly as an ISO string. A codec gives you a Date
-// instance on the other side instead of a string — useful if downstream
-// code does arithmetic on it. Registering `encodeDate` / `decodeDate` is
-// opt-in; without it you get the (also-fine) ISO-string round-trip.
-export const encodeDate = (v: unknown) =>
-  v instanceof Date ? {[T]: 'date', d: v.getTime()} : undefined;
-
-export const decodeDate = (v: any) =>
-  v?.[T] === 'date' ? new Date(v.d) : undefined;
-
-// ───── RegExp ────────────────────────────────────────────────────────────
-
-export const encodeRegExp = (v: unknown) =>
-  v instanceof RegExp ? {[T]: 're', d: v.source, f: v.flags} : undefined;
-
-export const decodeRegExp = (v: any) =>
-  v?.[T] === 're' ? new RegExp(v.d, v.f) : undefined;
-
-// ───── Error ─────────────────────────────────────────────────────────────
-
-// Rebuilds as a plain `Error` regardless of subclass; recovering the exact
-// class (TypeError etc.) cross-boundary would require a registry we don't
-// want. `.name` is preserved on the rebuilt instance for `err.name` checks.
-export const encodeError = (v: unknown) => {
-  if (!(v instanceof Error)) return undefined;
-  return {
-    [T]: 'err',
-    n: v.name,
-    m: v.message,
-    // `stack` is non-enumerable on most engines and not always meaningful
-    // across a process boundary; include it when present but don't require.
-    ...(v.stack ? {s: v.stack} : null),
-  };
-};
-
-export const decodeError = (v: any) => {
-  if (v?.[T] !== 'err') return undefined;
-  const e = new Error(v.m);
-  if (v.n) e.name = v.n;
-  if (v.s) e.stack = v.s;
-  return e;
-};
-
-// ───── URL ───────────────────────────────────────────────────────────────
-
-export const encodeURL = (v: unknown) =>
-  v instanceof URL ? {[T]: 'url', d: v.href} : undefined;
-
-export const decodeURL = (v: any) =>
-  v?.[T] === 'url' ? new URL(v.d) : undefined;
-
-// ───── BigInt ────────────────────────────────────────────────────────────
-
-export const encodeBigInt = (v: unknown) =>
-  typeof v === 'bigint' ? {[T]: 'bi', d: v.toString()} : undefined;
-
-export const decodeBigInt = (v: any) =>
-  v?.[T] === 'bi' ? BigInt(v.d) : undefined;
-
-// ───── default bundles ───────────────────────────────────────────────────
+// ───── encode / decode ───────────────────────────────────────────────────
 
 /**
- * Default encode chain covering every codec shipped in this module.
- * Compose with a user-defined codec via `??`:
- *
- *   const encode = (v) => encodeMoney(v) ?? encodeDefaults(v);
+ * Per-node outbound transform. Returns a `@T`-tagged object for any rich
+ * type this bundle knows about; otherwise `undefined` (pass through).
  */
-export const encode = (v: unknown) =>
-  encodeTypedArray(v) ??
-  encodeArrayBuffer(v) ??
-  encodeMap(v) ??
-  encodeSet(v) ??
-  encodeDate(v) ??
-  encodeRegExp(v) ??
-  encodeError(v) ??
-  encodeURL(v) ??
-  encodeBigInt(v);
+export const encode = (v: unknown): unknown => {
+  if (ArrayBuffer.isView(v)) {
+    const name = (v as {constructor: {name: string}}).constructor.name;
+    if (name in TYPED_ARRAY_CTORS) {
+      const view = v as ArrayBufferView;
+      const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+      return {[T]: 'ta', t: name, d: bytesToBase64(bytes)};
+    }
+  }
+  if (v instanceof ArrayBuffer) {
+    return {[T]: 'ab', d: bytesToBase64(new Uint8Array(v))};
+  }
+  if (v instanceof Map) {
+    return {[T]: 'map', d: Array.from(v.entries())};
+  }
+  if (v instanceof Set) {
+    return {[T]: 'set', d: Array.from(v)};
+  }
+  if (v instanceof Date) {
+    return {[T]: 'date', d: v.getTime()};
+  }
+  if (v instanceof RegExp) {
+    return {[T]: 're', d: v.source, f: v.flags};
+  }
+  if (v instanceof Error) {
+    const out: Record<string, unknown> = {[T]: 'err', n: v.name, m: v.message};
+    // `stack` is non-enumerable on most engines and not always meaningful
+    // across a process boundary; include when present.
+    if (v.stack) out.s = v.stack;
+    return out;
+  }
+  if (typeof URL !== 'undefined' && v instanceof URL) {
+    return {[T]: 'url', d: v.href};
+  }
+  if (typeof v === 'bigint') {
+    return {[T]: 'bi', d: v.toString()};
+  }
+  return undefined;
+};
 
-/** Default decode chain matching the `encode` bundle above. */
-export const decode = (v: unknown) =>
-  decodeTypedArray(v) ??
-  decodeArrayBuffer(v) ??
-  decodeMap(v) ??
-  decodeSet(v) ??
-  decodeDate(v) ??
-  decodeRegExp(v) ??
-  decodeError(v) ??
-  decodeURL(v) ??
-  decodeBigInt(v);
+/**
+ * Per-node inbound transform. Resolves `@T`-tagged objects produced by
+ * `encode` (or any compatible codec) back to their native types. Returns
+ * `undefined` when the node doesn't carry a recognized tag.
+ */
+export const decode = (v: unknown): unknown => {
+  if (v === null || typeof v !== 'object') return undefined;
+  const tag = (v as Record<string, unknown>)[T];
+  if (tag === undefined) return undefined;
+  const d = v as Record<string, any>;
+  switch (tag) {
+    case 'ta': {
+      const Ctor = TYPED_ARRAY_CTORS[d.t];
+      if (!Ctor) return undefined;
+      const bytes = base64ToBytes(d.d);
+      if (Ctor === DataView) return new DataView(bytes.buffer);
+      if (Ctor === Uint8Array) return bytes;
+      return new (Ctor as Uint8ArrayConstructor)(
+        bytes.buffer,
+        bytes.byteOffset,
+        bytes.byteLength / (Ctor as typeof Uint8Array).BYTES_PER_ELEMENT,
+      );
+    }
+    case 'ab':
+      return base64ToBytes(d.d).buffer;
+    case 'map':
+      return new Map(d.d);
+    case 'set':
+      return new Set(d.d);
+    case 'date':
+      return new Date(d.d);
+    case 're':
+      return new RegExp(d.d, d.f);
+    case 'err': {
+      const e = new Error(d.m);
+      if (d.n) e.name = d.n;
+      if (d.s) e.stack = d.s;
+      return e;
+    }
+    case 'url':
+      return new URL(d.d);
+    case 'bi':
+      return BigInt(d.d);
+  }
+  return undefined;
+};
