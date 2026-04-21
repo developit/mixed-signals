@@ -371,6 +371,13 @@ export class RPC {
     codec.send({type: 'notification', method, params}, ctx);
   }
 
+  /** @internal — per-client outbound codec hook for Reflection's walk. */
+  getEncode(
+    clientId: string,
+  ): ((value: unknown, ctx?: TransportContext) => unknown) | undefined {
+    return this.clients.get(clientId)?.encode;
+  }
+
   /** @internal — used by ForwardedUpstream to inject already-framed wire messages. */
   sendWire(clientId: string, msg: WireMessage): void {
     const codec = this.clients.get(clientId);

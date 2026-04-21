@@ -18,6 +18,28 @@ export interface TransportContext {
 type BaseTransport<Outgoing, Incoming, Ctx> = {
   send(data: Outgoing, ctx?: Ctx): void;
   onMessage(cb: (data: Incoming, ctx?: Ctx) => void | Promise<void>): void;
+  /**
+   * Optional per-node outbound transform. Invoked by the library's walker at
+   * every value during serialization (top-down). Return a replacement
+   * (typically `{@T: 'tag', d: ...}`) to tag a rich type; return `undefined`
+   * (or the value unchanged) to pass through. The walker recurses into the
+   * replacement, so nested handles / signals inside a tagged body still get
+   * emitted as `@H` correctly.
+   *
+   * This is where Map / Set / TypedArray / custom class tagging lives — see
+   * `mixed-signals/codecs` for a ready-made set or compose per-type helpers
+   * with `??` chaining.
+   */
+  encode?(value: unknown, ctx?: Ctx): unknown;
+  /**
+   * Optional per-node inbound transform. Invoked by the library's hydrator
+   * at every value during deserialization (bottom-up). Return a replacement
+   * to rebuild a rich type from its `@T` tag; return `undefined` to pass
+   * through. By the time `decode` sees `{@T: 'map', d: [...]}`, the `d`
+   * children have already been decoded — so `new Map(decodedEntries)` works
+   * directly and nested live Signals land where they should.
+   */
+  decode?(value: unknown, ctx?: Ctx): unknown;
   ready?: Promise<void>;
 };
 
@@ -63,6 +85,14 @@ export const PROMISE_REJECT_METHOD = '@E';
  * f=function, p=promise. See shared/brand.ts.
  */
 export const HANDLE_MARKER = '@H';
+/**
+ * Rich-type marker field. Populated by user-registered `transport.encode`
+ * codecs — e.g. `{@T: 'map', d: [[k, v], ...]}` for a Map. The library
+ * reserves this name but has no built-in codecs; see `mixed-signals/codecs`.
+ * Orthogonal to `@H` — a `@T` body may contain `@H` markers for nested
+ * handles, and vice versa.
+ */
+export const TYPE_MARKER = '@T';
 /**
  * Class reference. On first emission of a class to a peer, the value is a
  * string `"<classId>#<className>"` (or `"<classId>"` for anonymous classes).
