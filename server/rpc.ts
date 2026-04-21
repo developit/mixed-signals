@@ -451,6 +451,11 @@ export class RPC {
     const toDrop: string[] = [];
     for (const entry of this.handles.allEntries()) {
       if (entry.id === 'o0') continue; // never drop root
+      // Retention is a tier-2 concept. Signals are governed by @W/@U (tier
+      // 1) and have `refs.size === 0` by construction — without this
+      // filter the sweep would drop still-emitted signals and invalidate
+      // any later @W from the client.
+      if (entry.kind !== 'o' && entry.kind !== 'f') continue;
       if (entry.refs.size > 0) continue;
       if (now - entry.lastTouched < idleMs) continue;
       toDrop.push(entry.id);
@@ -458,6 +463,7 @@ export class RPC {
     for (const id of toDrop) this.dropHandle(id);
     // If there's still orphaned-but-fresh state, schedule another sweep.
     for (const entry of this.handles.allEntries()) {
+      if (entry.kind !== 'o' && entry.kind !== 'f') continue;
       if (entry.refs.size === 0 && entry.id !== 'o0') {
         this.scheduleTtlSweep();
         break;
