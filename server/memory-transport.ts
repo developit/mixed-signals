@@ -8,7 +8,10 @@ import type {
  * Creates two linked `StringTransport` instances for in-process communication.
  * Messages sent on one end are delivered to the other via `queueMicrotask`.
  */
-export function createMemoryTransportPair(): [StringTransport, StringTransport] {
+export function createMemoryTransportPair(): [
+  StringTransport,
+  StringTransport,
+] {
   let handlerA: ((data: {toString(): string}) => void) | undefined;
   let handlerB: ((data: {toString(): string}) => void) | undefined;
 

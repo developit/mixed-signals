@@ -121,11 +121,18 @@ export class Handles {
   /**
    * Release a handle for a client. Returns true if the entry is now fully
    * orphaned (no refs from any client), which the caller may use to free it.
+   *
+   * Only decrements when the client actually holds a ref. A client that
+   * sends a spurious or forged `@D` for a handle it never received does
+   * not affect refcounts for other clients — returning `false` here
+   * keeps a malicious peer from evicting live handles belonging to
+   * other clients.
    */
   release(id: string, clientId: ClientId, count = 1): boolean {
     const e = this.entries.get(id);
     if (!e) return false;
-    const prev = e.refs.get(clientId) ?? 0;
+    const prev = e.refs.get(clientId);
+    if (prev === undefined) return false;
     const next = prev - count;
     if (next <= 0) {
       e.refs.delete(clientId);

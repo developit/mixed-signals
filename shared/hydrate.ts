@@ -305,10 +305,15 @@ export class Hydrator {
 
     const methodCache = new Map<string, (...args: any[]) => any>();
     const env = this.env;
+
     let disposed = false;
     const disposeFn = () => {
       if (disposed) return;
       disposed = true;
+      // Cancel the GC callback so it doesn't send a second @D once the
+      // proxy is collected. Unregister before scheduleRelease so if the
+      // release flushes synchronously we still reach the unregister.
+      this.unregisterFinalization(id);
       env.scheduleRelease(id);
     };
     const proxy = new Proxy(target, {
@@ -465,10 +470,22 @@ export class Hydrator {
 
   // ───── registry / finalization ────────────────────────────────────────────
 
-  /** Tier 2 registration: stored weakly, release sent on finalization. */
+  /**
+   * Tier 2 registration: stored weakly, release sent on finalization.
+   *
+   * The WeakRef we store in `handles` doubles as the unregister token so
+   * `Symbol.dispose` can cancel the GC callback without holding a strong
+   * reference to the proxy itself.
+   */
   private registerWithFinalization(id: string, value: object) {
-    this.handles.set(id, new WeakRef(value));
-    this.finalization?.register(value, id, value);
+    const ref = new WeakRef(value);
+    this.handles.set(id, ref);
+    this.finalization?.register(value, id, ref);
+  }
+
+  private unregisterFinalization(id: string) {
+    const ref = this.handles.get(id);
+    if (ref instanceof WeakRef) this.finalization?.unregister(ref);
   }
 
   private lookup(id: string): any {

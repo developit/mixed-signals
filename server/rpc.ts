@@ -35,9 +35,49 @@ export interface RPCOptions {
 
 const DEFAULT_RETENTION: RetentionPolicy = {kind: 'ttl', idleMs: 30_000};
 
-// Allow dotted paths for nested method calls like "sessions.createSession".
-function dlv(obj: any, path: string): any {
-  return path.split('.').reduce((acc, key) => acc?.[key], obj);
+/**
+ * Keys we refuse to traverse during method dispatch. `constructor` is the
+ * big one — walking to it from any normal object lands on the class, and
+ * one more hop lands on `Function`, whose `apply` turns any attacker-
+ * controlled string into code (`Function("return process.env")()`). The
+ * rest are legacy `__proto__` / accessor back-doors that can also escape
+ * the intended object graph.
+ */
+const BLOCKED_METHOD_KEYS = new Set<string>([
+  '__proto__',
+  'constructor',
+  'prototype',
+  '__defineGetter__',
+  '__defineSetter__',
+  '__lookupGetter__',
+  '__lookupSetter__',
+]);
+
+/**
+ * Walk a dotted path to a property. Class methods live on the prototype,
+ * so we allow regular property lookup — but reject any segment whose name
+ * is in the blocked set, and reject any target that is `Object.prototype`
+ * itself (which is where a walk past a plain-object prototype would land).
+ * Returns `undefined` at the first invalid step so the caller surfaces
+ * “method not found” rather than a confusing TypeError.
+ */
+function safeGet(obj: any, key: string): any {
+  if (obj == null) return undefined;
+  if (BLOCKED_METHOD_KEYS.has(key)) return undefined;
+  if (obj === Object.prototype) return undefined;
+  const value = obj[key];
+  // Refuse to hand back anything that lives on `Object.prototype` itself
+  // (`toString`, `hasOwnProperty`, …). User classes that want those have
+  // to declare their own. This avoids handing a caller the built-in
+  // `Object.prototype.toString` bound to an arbitrary receiver.
+  if (typeof value === 'function' && Object.hasOwn(Object.prototype, key)) {
+    return undefined;
+  }
+  return value;
+}
+
+function safeDlv(obj: any, path: string): any {
+  return path.split('.').reduce<any>((acc, key) => safeGet(acc, key), obj);
 }
 
 /**
@@ -89,7 +129,7 @@ export class RPC {
     const prefix = String(this.nextUpstreamPrefix++);
     const upstream = new ForwardedUpstream(prefix, transport, this);
     this.upstreams.set(prefix, upstream);
-    for (const clientId of this.clients.keys()) upstream.setClient(clientId);
+    for (const clientId of this.clients.keys()) upstream.addClient(clientId);
     return () => {
       upstream.dispose();
       this.upstreams.delete(prefix);
@@ -150,7 +190,7 @@ export class RPC {
     const codec = new PeerCodec(transport, this.makeIncomingReviver(id));
     this.clients.set(id, codec);
 
-    for (const upstream of this.upstreams.values()) upstream.setClient(id);
+    for (const upstream of this.upstreams.values()) upstream.addClient(id);
 
     codec.onMessage(async (msg) => {
       try {
@@ -194,6 +234,14 @@ export class RPC {
       }
     } else if (this.retention.kind === 'ttl') {
       this.scheduleTtlSweep();
+    } else if (this.retention.kind === 'weak') {
+      // `weak` drops immediately on full release. A client disconnect is
+      // a full release for every handle it held — orphaned handles must
+      // be freed, not left dangling forever.
+      for (const id of orphaned) {
+        if (id === 'o0') continue; // root survives disconnects
+        this.dropHandle(id);
+      }
     }
   }
 
@@ -288,21 +336,27 @@ export class RPC {
    * object instead of a plain `{}`. Per-client to preserve the
    * "single-client per-RPC = no lateral escalation" sandbox guarantee.
    */
-  private makeIncomingReviver(_clientId: string): ReviveMarker {
+  private makeIncomingReviver(clientId: string): ReviveMarker {
     return (marker) => {
       const id = (marker as Record<string, unknown>)[HANDLE_MARKER];
       if (typeof id !== 'string') return null;
+      // Authorisation: only resolve handles this client has previously
+      // received from us. A client cannot refer to handles another client
+      // owns, even if the numeric id happens to exist in the shared
+      // registry. Handle ids are sequential and enumerable, so without
+      // this check a peer can reach any live handle just by guessing.
+      if (!this.handles.hasSentHandle(clientId, id)) return null;
       const entry = this.handles.get(id);
       if (entry) return entry.value;
-      // Unknown id (client never received it from us, or we've already freed
-      // it under the retention policy): return null rather than throwing.
       return null;
     };
   }
 
   notify(method: string, params: any[], clientId?: string) {
     if (clientId) this.sendNotification(clientId, method, params);
-    else for (const id of this.clients.keys()) this.sendNotification(id, method, params);
+    else
+      for (const id of this.clients.keys())
+        this.sendNotification(id, method, params);
   }
 
   /** @internal */
@@ -396,8 +450,8 @@ export class RPC {
       const segments = rest.split('.');
       const methodName = segments.pop()!;
       const receiver =
-        segments.length > 0 ? dlv(instance, segments.join('.')) : instance;
-      const target = receiver?.[methodName];
+        segments.length > 0 ? safeDlv(instance, segments.join('.')) : instance;
+      const target = safeGet(receiver, methodName);
       if (typeof target !== 'function') {
         throw new Error(`Method not found: ${rest} on ${handleId}`);
       }
@@ -420,8 +474,8 @@ export class RPC {
     const segments = method.split('.');
     const methodName = segments.pop()!;
     const receiver =
-      segments.length > 0 ? dlv(this.root, segments.join('.')) : this.root;
-    const target = receiver?.[methodName];
+      segments.length > 0 ? safeDlv(this.root, segments.join('.')) : this.root;
+    const target = safeGet(receiver, methodName);
     if (typeof target !== 'function') {
       throw new Error(`Method not found: ${method}`);
     }
@@ -435,6 +489,10 @@ export class RPC {
     // Signals are driven by @W/@U; promises are one-shot and don't track refs.
     const kind = handleId[0];
     if (kind !== 'o' && kind !== 'f') return;
+    // Root is never released. A client using TypeScript `using` or an
+    // errant dispose on the root proxy should not sever every subsequent
+    // method call.
+    if (handleId === 'o0') return;
     const fullyOrphaned = this.handles.release(handleId, clientId);
     if (fullyOrphaned) {
       if (this.retention.kind === 'disconnect') {

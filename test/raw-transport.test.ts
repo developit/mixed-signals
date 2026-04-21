@@ -1,13 +1,17 @@
 import {signal} from '@preact/signals-core';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {RPCClient} from '../client/rpc.ts';
-import {createModel} from '../server/model.ts';
 import {
   createMemoryTransportPair,
   createRawMemoryTransportPair,
 } from '../server/memory-transport.ts';
+import {createModel} from '../server/model.ts';
 import {RPC} from '../server/rpc.ts';
-import {Counter, createLinkedRawTransportPair, flush as tick} from './helpers.ts';
+import {
+  Counter,
+  createLinkedRawTransportPair,
+  flush as tick,
+} from './helpers.ts';
 
 /**
  * End-to-end raw-mode integration: exercises the same flows the string-mode
@@ -263,8 +267,7 @@ describe('Raw-mode transport: ctx.transfer', () => {
       },
     };
     const rpc = new RPC(root);
-    const [serverTransport, clientTransport] =
-      createRawMemoryTransportPair();
+    const [serverTransport, clientTransport] = createRawMemoryTransportPair();
 
     const incomingCtxs: unknown[] = [];
     const originalOnMessage = clientTransport.onMessage;
@@ -310,10 +313,7 @@ describe('Raw-mode transport: mode isolation', () => {
     expect(rawClient.root.count.peek()).toBe(0);
     expect(strClient.root.count.peek()).toBe(0);
 
-    await Promise.all([
-      rawClient.root.increment(),
-      strClient.root.increment(),
-    ]);
+    await Promise.all([rawClient.root.increment(), strClient.root.increment()]);
 
     // Each client saw their own increment acknowledged; the server ran both.
     expect(rawClient.root.count.peek()).toBe(0); // no subscription yet
@@ -324,8 +324,7 @@ describe('Raw-mode transport: mode isolation', () => {
 describe('Raw-mode transport: WireMessage shape is structured-clone safe', () => {
   it('does not wrap payload as a string anywhere on the raw path', async () => {
     const observed: unknown[] = [];
-    const [serverTransport, clientTransport] =
-      createRawMemoryTransportPair();
+    const [serverTransport, clientTransport] = createRawMemoryTransportPair();
 
     // Tap the client's send to capture what the RPC layer hands to the
     // transport. Must be an object with `type`, never a string.

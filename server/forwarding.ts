@@ -128,7 +128,13 @@ export class ForwardedUpstream {
 
   private pendingCalls = new Map<number, {clientId: string; callId: number}>();
   private nextUpstreamCallId = 1;
-  private clientId: string | undefined;
+  /**
+   * Every downstream client that should receive upstream push notifications
+   * (signal updates today; potentially more in future). A broker may have N
+   * downstream clients; all of them need the same upstream @S frame when
+   * the upstream fires.
+   */
+  private clients = new Set<string>();
 
   constructor(prefix: string, transport: Transport, host: UpstreamHost) {
     if (transport.mode === 'raw') {
@@ -147,8 +153,8 @@ export class ForwardedUpstream {
     );
   }
 
-  setClient(clientId: string) {
-    this.clientId = clientId;
+  addClient(clientId: string) {
+    this.clients.add(clientId);
   }
 
   private handleUpstreamMessage(msg: string) {
@@ -165,7 +171,7 @@ export class ForwardedUpstream {
         return;
       }
       if (parsed.method === SIGNAL_UPDATE_METHOD) {
-        if (!this.clientId) return;
+        if (this.clients.size === 0) return;
         const params = parseWireParams(parsed.payload);
         const [signalId, value, mode] = params as [HandleId, any, string?];
         const prefixedId = prefixId(this.prefix, signalId);
@@ -175,11 +181,16 @@ export class ForwardedUpstream {
         const outParams = mode
           ? [prefixedId, rewrittenValue, mode]
           : [prefixedId, rewrittenValue];
-        this.host.sendWire(this.clientId, {
-          type: 'notification',
+        // Fan the upstream push out to every downstream client. Broker
+        // topology: N clients share one upstream; all must see the push.
+        const msg = {
+          type: 'notification' as const,
           method: SIGNAL_UPDATE_METHOD,
           params: outParams,
-        });
+        };
+        for (const clientId of this.clients) {
+          this.host.sendWire(clientId, msg);
+        }
         return;
       }
     }
@@ -242,15 +253,17 @@ export class ForwardedUpstream {
   }
 
   removeClient(clientId: string) {
-    if (this.clientId === clientId) {
-      this.clientId = undefined;
-      this.pendingCalls.clear();
+    this.clients.delete(clientId);
+    // Cancel pending calls originated by this client. Keep calls from
+    // other clients intact.
+    for (const [upId, pending] of this.pendingCalls) {
+      if (pending.clientId === clientId) this.pendingCalls.delete(upId);
     }
   }
 
   dispose() {
     this.disposed = true;
-    this.clientId = undefined;
+    this.clients.clear();
     this.pendingCalls.clear();
   }
 }

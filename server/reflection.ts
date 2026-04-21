@@ -36,11 +36,21 @@ export class Reflection {
   private subscriptions = new Map<SignalId, Set<ClientId>>();
   private signalUnsubscribe = new Map<SignalId, () => void>();
   private lastSentValues = new Map<string, any>();
+  /**
+   * Per-client set of promise ids we've already attached a settlement
+   * listener for. Every `onPromiseEmitted` call checks this set so the
+   * .then/.catch chain is registered exactly once per (client, promise)
+   * pair — a promise shared across multiple clients settles for all of
+   * them, but we only wire the listener once per destination.
+   */
+  private promiseListenersByClient = new Map<ClientId, Set<string>>();
   private rpc: RpcSender;
   private serializer: Serializer;
+  private handles: Handles;
 
   constructor(rpc: RpcSender, handles: Handles) {
     this.rpc = rpc;
+    this.handles = handles;
     this.serializer = new Serializer(handles);
   }
 
@@ -64,6 +74,18 @@ export class Reflection {
         this.lastSentValues.set(`${clientId}:${id}`, sig.peek());
       },
       onPromiseEmitted: (id, p) => {
+        // Deliver the settlement to THIS client. Multiple clients may
+        // receive the same promise id; each needs their own listener
+        // so every peer sees the resolution. Dedup per client so we
+        // don't double-send if the same promise is re-emitted in a
+        // later frame.
+        let seen = this.promiseListenersByClient.get(clientId);
+        if (!seen) {
+          seen = new Set();
+          this.promiseListenersByClient.set(clientId, seen);
+        }
+        if (seen.has(id)) return;
+        seen.add(id);
         // Settlement is delivered as a notification so it can carry a nested
         // serialized value (which may itself be a model or signal).
         p.then(
@@ -95,6 +117,12 @@ export class Reflection {
   // ───── watch / unwatch ─────────────────────────────────────────────────────
 
   watch(clientId: ClientId, signalId: SignalId) {
+    // Authorisation: a client may only subscribe to a signal it has
+    // previously received on the wire. Signal ids are sequential (`s1`,
+    // `s2`, …) and enumerable, so without this check any client could
+    // subscribe to the live update stream for every signal on the server
+    // just by counting up.
+    if (!this.handles.hasSentHandle(clientId, signalId)) return;
     let subs = this.subscriptions.get(signalId);
     if (!subs) {
       subs = new Set();
@@ -140,6 +168,7 @@ export class Reflection {
     for (const key of this.lastSentValues.keys()) {
       if (key.startsWith(prefix)) this.lastSentValues.delete(key);
     }
+    this.promiseListenersByClient.delete(clientId);
   }
 
   /** Purge local state for a specific signal id (called on handle release). */
@@ -205,19 +234,34 @@ export class Reflection {
       typeof newValue === 'object' &&
       !Array.isArray(oldValue)
     ) {
+      // Use Object.keys (own-enumerable only); `for...in` walks the
+      // prototype chain and would yield stray entries for any object
+      // whose prototype carries enumerable props.
+      const oldKeys = Object.keys(oldValue);
+      const newKeys = Object.keys(newValue);
       const changes: any = {};
       let hasChanges = false;
-      for (const key in newValue) {
+      for (const key of newKeys) {
         if (newValue[key] !== oldValue[key]) {
           changes[key] = newValue[key];
           hasChanges = true;
         }
       }
-      if (!hasChanges) {
-        const oldKeys = Object.keys(oldValue);
-        const newKeys = Object.keys(newValue);
-        if (oldKeys.length === newKeys.length) return null;
+      // Detect deleted keys: present in old, absent in new. The `merge`
+      // mode cannot express a delete — a client applying `{...current,
+      // ...delta}` would keep the stale key forever. So if any key was
+      // removed, fall through to a full replace.
+      let hasDeletions = false;
+      if (newKeys.length < oldKeys.length) {
+        for (const key of oldKeys) {
+          if (!Object.hasOwn(newValue, key)) {
+            hasDeletions = true;
+            break;
+          }
+        }
       }
+      if (hasDeletions) return {value: newValue};
+      if (!hasChanges && oldKeys.length === newKeys.length) return null;
       if (hasChanges) return {value: changes, mode: 'merge'};
     }
     if (
