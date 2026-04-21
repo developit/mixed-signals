@@ -345,19 +345,12 @@ export class Hydrator {
       },
       has(target, key) {
         if (key === BRAND_REMOTE) return true;
-        if (key in target) return true;
-        // Hide duck-typing probes from `in` checks as well.
-        if (
-          key === 'then' ||
-          key === 'catch' ||
-          key === 'finally' ||
-          key === 'toJSON'
-        ) {
-          return false;
-        }
-        // Pretend unknown string keys exist so `'someMethod' in proxy` returns
-        // true — useful for duck-typing. Hidden from iteration.
-        return typeof key === 'string';
+        // Faithful membership: `key in proxy` answers "is this an own or
+        // inherited property of the backing target?" and nothing more. This
+        // matches `Reflect.has` / `Object.hasOwn` expectations. Duck-typing
+        // via `'method' in proxy` doesn't work for trap-dispatched methods
+        // — call `proxy.method?.()` instead.
+        return key in target;
       },
       ownKeys(target) {
         return Reflect.ownKeys(target).filter((k) => k !== BRAND_REMOTE);
