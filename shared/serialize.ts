@@ -1,6 +1,6 @@
 import {Signal} from '@preact/signals-core';
 import {BRAND_REMOTE, type RemoteBrand} from './brand.ts';
-import {isTransferable} from './codec.ts';
+import {isTransferable, isWireOpaque} from './codec.ts';
 import type {Handles} from './handles.ts';
 import {
   CLASS_FIELD,
@@ -35,6 +35,16 @@ export interface SerializeHooks {
    * semantics.
    */
   ctx?: TransportContext;
+  /**
+   * Per-node outbound transform from the peer's `Transport.encode` hook.
+   * Runs top-down at each value the walk encounters, *before* the serializer
+   * would otherwise upgrade it to an `@H` handle. A codec matches by
+   * returning a replacement object (typically an `@T`-tagged form); anything
+   * else (including `undefined`) passes through to normal handling. The
+   * walk recurses into the replacement so nested rich types / handles are
+   * processed correctly.
+   */
+  encode?(value: unknown, ctx?: TransportContext): unknown;
   /** Called on every signal we emit, so the caller can wire subscriptions. */
   onSignalEmitted?(id: string, signal: Signal<any>): void;
   /** Called on every handle emission that requires client retention (o, f). */
@@ -132,6 +142,19 @@ export class Serializer {
 
     if (t === 'string' || t === 'number' || t === 'boolean') return value;
 
+    // BigInt has no JSON representation — offer the encode hook a chance
+    // to tag it before we fall through. Without a codec, JSON.stringify
+    // later throws, which is fine (user got a deliberate error).
+    if (t === 'bigint') {
+      if (hooks.encode) {
+        const replaced = hooks.encode(value, hooks.ctx);
+        if (replaced !== undefined && replaced !== value) {
+          return this.walk(replaced, hooks);
+        }
+      }
+      return value;
+    }
+
     // A value that was previously hydrated from a wire frame — re-emit its id
     // so the owning peer can resolve it back to the original object/function.
     const brand = (value as any)[BRAND_REMOTE] as RemoteBrand | undefined;
@@ -176,12 +199,30 @@ export class Serializer {
       return out;
     }
 
+    // Transport-level codec hook: user-registered transforms that tag rich
+    // types (Map → {@T:'map', ...}, custom class → {@T:'money', ...}) before
+    // the serializer tries to upgrade them to `@H` handles. Runs top-down;
+    // the walk recurses into the replacement so nested signals/handles
+    // inside a tagged body are emitted as `@H` correctly.
+    if (hooks.encode) {
+      const replaced = hooks.encode(value, hooks.ctx);
+      if (replaced !== undefined && replaced !== value) {
+        return this.walk(replaced, hooks);
+      }
+    }
+
     // Respect .toJSON — matches JSON.stringify's own behavior, lets Date and
     // user-defined types opt out of handle upgrading with a one-liner.
     const toJSON = (value as any).toJSON;
     if (typeof toJSON === 'function') {
       return this.walk(toJSON.call(value), hooks);
     }
+
+    // Built-in pass-through: Map / Set / TypedArray / RegExp / Error / URL / …
+    // reach the transport intact. On raw, structured clone preserves them.
+    // On string, they need an `encode` hook registered to survive; without
+    // one, JSON.stringify is lossy (documented limitation).
+    if (isWireOpaque(value)) return value;
 
     return this.emitObject(value as Record<string, unknown>, hooks);
   }

@@ -114,6 +114,7 @@ export class RPCClient {
       const walked = substituteBrandsAndCollectTransferables(
         params || [],
         ctx,
+        this.codec.encode,
       ) as unknown[];
       this.codec.send({type: 'call', id, method, params: walked}, ctx);
     });
@@ -140,6 +141,7 @@ export class RPCClient {
       const walked = substituteBrandsAndCollectTransferables(
         params || [],
         ctx,
+        this.codec.encode,
       ) as unknown[];
       this.codec.send({type: 'notification', method, params: walked}, ctx);
     };

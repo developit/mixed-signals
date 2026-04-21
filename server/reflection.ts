@@ -19,6 +19,14 @@ interface RpcSender {
     params: unknown[],
     ctx?: TransportContext,
   ): void;
+  /**
+   * Per-client outbound codec hook, pulled off the client's transport so
+   * user-registered type transforms (Map/Set/u8/custom) run during the
+   * serializer's walk.
+   */
+  getEncode(
+    clientId: string,
+  ): ((value: unknown, ctx?: TransportContext) => unknown) | undefined;
 }
 
 /**
@@ -67,6 +75,7 @@ export class Reflection {
     const hooks: SerializeHooks = {
       peerId: clientId,
       ctx,
+      encode: this.rpc.getEncode(clientId),
       onSignalEmitted: (id, sig) => {
         this.signals.set(id, sig);
         // Seed lastSentValues with the current peek so the first diff against

@@ -12,6 +12,10 @@
       "types": "./build/client.d.ts",
       "default": "./build/client.js"
     },
+    "./codecs": {
+      "types": "./build/codecs.d.ts",
+      "default": "./build/codecs.js"
+    },
     "./disposable.d.ts": "./disposable.d.ts",
     "./package.json": "./package.json"
   },
@@ -19,6 +23,7 @@
     "build",
     "server",
     "client",
+    "codecs",
     "shared"
   ],
   "scripts": {
