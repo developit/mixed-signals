@@ -1,8 +1,15 @@
 import {signal} from '@preact/signals-core';
 import {createModel} from '../server/model.ts';
-import type {Transport} from '../shared/protocol.ts';
+import type {
+  RawTransport,
+  Transport,
+  TransportContext,
+} from '../shared/protocol.ts';
 
-export {createMemoryTransportPair} from '../server/memory-transport.ts';
+export {
+  createMemoryTransportPair,
+  createRawMemoryTransportPair,
+} from '../server/memory-transport.ts';
 
 type MessageHandler = (data: {toString(): string}) => void | Promise<void>;
 
@@ -86,4 +93,78 @@ export const Counter = createModel<{
 
 export function flush(ms = 20): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+type RawHandler = (
+  data: unknown,
+  ctx?: TransportContext,
+) => void | Promise<void>;
+
+/**
+ * Raw-mode counterpart to `createLinkedTransportPair` — messages are enqueued
+ * synchronously, delivered only when `flush()` is called, and structurally
+ * cloned at the boundary (mirroring real postMessage semantics). The enqueued
+ * ctx also gets `transfer` stripped before delivery, matching what a receiver
+ * would actually see.
+ */
+export function createLinkedRawTransportPair(): {
+  serverTransport: RawTransport;
+  clientTransport: RawTransport;
+  flush: () => Promise<void>;
+  /** All ctx objects observed on the server → client channel (sender-side). */
+  sentCtxToClient: TransportContext[];
+  sentCtxToServer: TransportContext[];
+} {
+  const queue: Array<() => Promise<void>> = [];
+  const handlers: Record<string, RawHandler | undefined> = {};
+  const sentCtxToClient: TransportContext[] = [];
+  const sentCtxToServer: TransportContext[] = [];
+
+  const enqueue = (key: string, data: unknown, ctx: TransportContext | undefined) => {
+    const cloned = structuredClone(data);
+    let forwardedCtx: TransportContext | undefined;
+    if (ctx) {
+      forwardedCtx = {};
+      for (const k of Object.keys(ctx)) {
+        if (k === 'transfer') continue;
+        forwardedCtx[k] = (ctx as Record<string, unknown>)[k];
+      }
+    }
+    queue.push(async () => {
+      await handlers[key]?.(cloned, forwardedCtx);
+    });
+  };
+
+  return {
+    serverTransport: {
+      mode: 'raw',
+      send(data, ctx) {
+        if (ctx) sentCtxToClient.push(ctx);
+        enqueue('client', data, ctx);
+      },
+      onMessage(cb) {
+        handlers.server = cb;
+      },
+    },
+    clientTransport: {
+      mode: 'raw',
+      send(data, ctx) {
+        if (ctx) sentCtxToServer.push(ctx);
+        enqueue('server', data, ctx);
+      },
+      onMessage(cb) {
+        handlers.client = cb;
+      },
+    },
+    async flush() {
+      while (queue.length > 0) {
+        const pending = queue.splice(0);
+        for (const deliver of pending) {
+          await deliver();
+        }
+      }
+    },
+    sentCtxToClient,
+    sentCtxToServer,
+  };
 }

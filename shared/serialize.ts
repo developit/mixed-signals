@@ -1,5 +1,6 @@
 import {Signal} from '@preact/signals-core';
 import {BRAND_REMOTE, type RemoteBrand} from './brand.ts';
+import {isTransferable} from './codec.ts';
 import type {Handles} from './handles.ts';
 import {
   CLASS_FIELD,
@@ -7,6 +8,7 @@ import {
   HANDLE_MARKER,
   PROPS_FIELD,
   SIGNAL_VALUE_FIELD,
+  type TransportContext,
 } from './protocol.ts';
 
 /**
@@ -24,6 +26,15 @@ export const MODEL_NAME_SYMBOL: unique symbol = Symbol.for(
 export interface SerializeHooks {
   /** The peer id we're serializing for — drives per-peer caches. */
   peerId: string;
+  /**
+   * Outbound transport context. When present, transferable values detected
+   * during the walk (ArrayBuffer, MessagePort, ImageBitmap, streams, …) are
+   * appended to `ctx.transfer` so the raw-mode transport can hand them to
+   * `postMessage(msg, ctx)` as an ownership transfer. String-mode transports
+   * can omit this — transferables are walked normally and lose ownership
+   * semantics.
+   */
+  ctx?: TransportContext;
   /** Called on every signal we emit, so the caller can wire subscriptions. */
   onSignalEmitted?(id: string, signal: Signal<any>): void;
   /** Called on every handle emission that requires client retention (o, f). */
@@ -135,6 +146,21 @@ export class Serializer {
       return this.emitFunction(value as (...a: any[]) => any, hooks);
 
     if (t !== 'object') return value;
+
+    // Transferable ownership-transferable values pass through opaquely on the
+    // raw path. They are NOT walked (they have no meaningful structure for
+    // us) and NOT copied — the transport takes ownership via `ctx.transfer`.
+    // On a string transport with no `ctx`, this is a no-op and the value
+    // gets serialized by the surrounding JSON.stringify as best it can
+    // (which for ArrayBuffer etc. will be `{}` — a known limitation of the
+    // string path, documented accordingly).
+    if (isTransferable(value)) {
+      if (hooks.ctx) {
+        if (!hooks.ctx.transfer) hooks.ctx.transfer = [];
+        hooks.ctx.transfer.push(value as Transferable);
+      }
+      return value;
+    }
 
     // Thenables get a pid; nothing else traverses through their state.
     if (typeof (value as any).then === 'function') {

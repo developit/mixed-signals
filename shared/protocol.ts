@@ -1,8 +1,51 @@
-export interface Transport {
-  send(data: string): void;
-  onMessage(cb: (data: {toString(): string}) => void): void;
-  ready?: Promise<void>;
+/**
+ * Context object carried alongside every wire message. Defaults to the
+ * postMessage options shape so a RawTransport can pass it through directly:
+ *
+ *   Worker.prototype.postMessage(message, options?)   // options = {transfer?}
+ *   MessagePort.prototype.postMessage(message, options?)
+ *   DedicatedWorkerGlobalScope.prototype.postMessage(message, options?)
+ *
+ * Extra keys on `ctx` are ignored by the DOM per spec. Consumers may extend
+ * the interface with their own metadata (auth, correlation ids, etc.) and a
+ * well-behaved transport will propagate it end to end.
+ */
+export interface TransportContext {
+  transfer?: Transferable[];
+  [key: string]: unknown;
 }
+
+type BaseTransport<Outgoing, Incoming, Ctx> = {
+  send(data: Outgoing, ctx?: Ctx): void;
+  onMessage(cb: (data: Incoming, ctx?: Ctx) => void | Promise<void>): void;
+  ready?: Promise<void>;
+};
+
+/**
+ * Wire framing is the compact string protocol (`M1:method:payload`, etc.).
+ * Every payload passes through `JSON.stringify` / `JSON.parse`. Use for
+ * byte-stream transports (WebSocket, stdio, fetch/SSE).
+ */
+export interface StringTransport<Ctx = TransportContext>
+  extends BaseTransport<string, {toString(): string}, Ctx> {
+  mode?: 'string' | undefined;
+}
+
+/**
+ * Wire "framing" is a structured object the transport delivers as-is. Use
+ * for `postMessage`-family transports (Worker, MessagePort, DedicatedWorker,
+ * BroadcastChannel-likes). Skips JSON stringify/parse entirely; the
+ * serializer populates `ctx.transfer` so ArrayBuffer / MessagePort / etc.
+ * can be transferred rather than copied.
+ */
+export interface RawTransport<Ctx = TransportContext>
+  extends BaseTransport<unknown, unknown, Ctx> {
+  mode: 'raw';
+}
+
+export type Transport<Ctx = TransportContext> =
+  | StringTransport<Ctx>
+  | RawTransport<Ctx>;
 
 export const ROOT_NOTIFICATION_METHOD = '@R';
 export const SIGNAL_UPDATE_METHOD = '@S';
@@ -44,6 +87,16 @@ export const PROPS_FIELD = 'p';
 export const DATA_FIELD = 'd';
 /** Signal value (for kind=s, initial inline value). */
 export const SIGNAL_VALUE_FIELD = 'v';
+
+/**
+ * Internal wire message. The codec layer converts to/from StringTransport's
+ * framing. RawTransport sends / receives this object directly.
+ */
+export type WireMessage =
+  | {type: 'call'; id: number; method: string; params: unknown[]}
+  | {type: 'notification'; method: string; params: unknown[]}
+  | {type: 'result'; id: number; value: unknown}
+  | {type: 'error'; id: number; value: unknown};
 
 type ParsedCallMessage = {
   type: 'call';
