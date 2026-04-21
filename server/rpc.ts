@@ -1,16 +1,14 @@
+import {PeerCodec, type ReviveMarker} from '../shared/codec.ts';
 import {Handles} from '../shared/handles.ts';
 import {
-  formatErrorMessage,
-  formatNotificationMessage,
-  formatResultMessage,
   HANDLE_MARKER,
-  parseWireMessage,
-  parseWireParams,
   RELEASE_HANDLES_METHOD,
   ROOT_NOTIFICATION_METHOD,
   type Transport,
+  type TransportContext,
   UNWATCH_SIGNALS_METHOD,
   WATCH_SIGNALS_METHOD,
+  type WireMessage,
 } from '../shared/protocol.ts';
 import {
   ForwardedUpstream,
@@ -48,13 +46,16 @@ function dlv(obj: any, path: string): any {
  *     functions, promises).
  *   - A `Reflection` instance that manages signal subscriptions and delta
  *     pushes for every connected client.
- *   - Transport bookkeeping per connected client.
+ *   - One `PeerCodec` per connected client — a thin wrapper around the
+ *     user-provided `Transport` that speaks a mode-agnostic `WireMessage`
+ *     interface internally. Clients can mix string- and raw-mode transports
+ *     on the same server.
  *
  * There is no `registerModel`. Use `createModel(name, factory)` — the name is
  * stamped on the ctor and the serializer picks it up automatically.
  */
 export class RPC {
-  private clients = new Map<string, Transport>();
+  private clients = new Map<string, PeerCodec>();
   private root: any;
   private retention: RetentionPolicy;
   private ttlTimer: ReturnType<typeof setTimeout> | null = null;
@@ -79,6 +80,10 @@ export class RPC {
    * Register an upstream mixed-signals connection whose handles are
    * transparently forwarded to downstream clients. All handles are
    * auto-forwarded — no per-type declaration needed.
+   *
+   * Upstreams are string-mode only today. A raw upstream would need the
+   * prefix/strip walkers in `forwarding.ts` to traverse structured trees,
+   * which they already do — but the framing layer ties them to strings.
    */
   addUpstream(transport: Transport): () => void {
     const prefix = String(this.nextUpstreamPrefix++);
@@ -106,9 +111,10 @@ export class RPC {
   }
 
   private broadcastMergedRoot(clientId: string) {
+    const ctx: TransportContext = {};
     const localRoot =
       this.root !== undefined
-        ? this.reflection.serialize(this.root, clientId)
+        ? this.reflection.serialize(this.root, clientId, ctx)
         : undefined;
     let merged = localRoot;
     for (const upstream of this.upstreams.values()) {
@@ -121,10 +127,7 @@ export class RPC {
       }
     }
     if (merged !== undefined) {
-      this.send(
-        clientId,
-        formatNotificationMessage(ROOT_NOTIFICATION_METHOD, [merged]),
-      );
+      this.sendNotification(clientId, ROOT_NOTIFICATION_METHOD, [merged], ctx);
     }
   }
 
@@ -144,23 +147,17 @@ export class RPC {
       this.reflection.removeClient(id);
       this.handles.releaseAllForClient(id);
     }
-    this.clients.set(id, transport);
+    const codec = new PeerCodec(transport, this.makeIncomingReviver(id));
+    this.clients.set(id, codec);
 
     for (const upstream of this.upstreams.values()) upstream.setClient(id);
 
-    const reviver = this.makeIncomingReviver();
-    transport.onMessage(async (data) => {
+    codec.onMessage(async (msg) => {
       try {
-        const raw = data.toString();
-        if (this.tryForwardClientMessage(id, raw)) return;
-        const message = parseWireMessage(raw);
-        if (!message || message.type === 'result' || message.type === 'error')
-          return;
-        // Only call-paths carry rpc-controlled messages; @W/@U/@D payloads
-        // are plain scalars and the reviver is a no-op for them.
-        const params = parseWireParams(message.payload, reviver);
-        const messageId = message.type === 'call' ? message.id : undefined;
-        await this.handleMessage(id, messageId, message.method, params);
+        if (this.tryForwardClientWireMessage(id, msg)) return;
+        if (msg.type !== 'call' && msg.type !== 'notification') return;
+        const messageId = msg.type === 'call' ? msg.id : undefined;
+        await this.handleMessage(id, messageId, msg.method, msg.params);
       } catch (err) {
         console.error('Failed to handle message:', err);
       }
@@ -171,14 +168,12 @@ export class RPC {
     // the client's `ready` promise resolves. If any upstream is still pending,
     // `onUpstreamRootChanged` will send the merged root later.
     if (this.upstreams.size === 0) {
+      const ctx: TransportContext = {};
       const serialized =
         this.root !== undefined
-          ? this.reflection.serialize(this.root, id)
+          ? this.reflection.serialize(this.root, id, ctx)
           : null;
-      this.send(
-        id,
-        formatNotificationMessage(ROOT_NOTIFICATION_METHOD, [serialized]),
-      );
+      this.sendNotification(id, ROOT_NOTIFICATION_METHOD, [serialized], ctx);
     } else if (this.allUpstreamsReady()) {
       this.broadcastMergedRoot(id);
     }
@@ -204,10 +199,11 @@ export class RPC {
 
   // ───── forwarding dispatch ───────────────────────────────────────────
 
-  private tryForwardClientMessage(clientId: string, raw: string): boolean {
+  private tryForwardClientWireMessage(
+    clientId: string,
+    parsed: WireMessage,
+  ): boolean {
     if (this.upstreams.size === 0) return false;
-    const parsed = parseWireMessage(raw);
-    if (!parsed) return false;
 
     if (
       parsed.type === 'notification' &&
@@ -215,7 +211,7 @@ export class RPC {
         parsed.method === UNWATCH_SIGNALS_METHOD ||
         parsed.method === RELEASE_HANDLES_METHOD)
     ) {
-      const ids = parseWireParams<string[]>(parsed.payload);
+      const ids = parsed.params as string[];
       const localIds: string[] = [];
       const upstreamBatches = new Map<ForwardedUpstream, string[]>();
       for (const id of ids) {
@@ -261,7 +257,7 @@ export class RPC {
             clientId,
             parsed.id,
             `${stripped}#${methodName}`,
-            parsed.payload,
+            parsed.params,
           );
           return true;
         }
@@ -270,7 +266,7 @@ export class RPC {
         const upstream = this.findUpstreamForId(parsed.method);
         if (upstream) {
           const stripped = stripInstancePrefix(upstream.prefix, parsed.method);
-          upstream.forwardCall(clientId, parsed.id, stripped, parsed.payload);
+          upstream.forwardCall(clientId, parsed.id, stripped, parsed.params);
           return true;
         }
       }
@@ -289,31 +285,60 @@ export class RPC {
    * Reviver that resolves incoming `@H` markers back to live server values.
    * A client that received a branded Proxy and is passing it back as an
    * argument will emit `{"@H":"o17"}` — this lets the server see the actual
-   * object instead of a plain `{}`.
+   * object instead of a plain `{}`. Per-client to preserve the
+   * "single-client per-RPC = no lateral escalation" sandbox guarantee.
    */
-  private makeIncomingReviver(): (key: string, value: any) => any {
-    return (_key, value) => {
-      if (value && typeof value === 'object' && HANDLE_MARKER in value) {
-        const id = value[HANDLE_MARKER];
-        const entry = this.handles.get(id);
-        if (entry) return entry.value;
-        // Unknown id (client never received it from us, or we've already freed
-        // it under the retention policy): return null rather than throwing.
-        return null;
-      }
-      return value;
+  private makeIncomingReviver(_clientId: string): ReviveMarker {
+    return (marker) => {
+      const id = (marker as Record<string, unknown>)[HANDLE_MARKER];
+      if (typeof id !== 'string') return null;
+      const entry = this.handles.get(id);
+      if (entry) return entry.value;
+      // Unknown id (client never received it from us, or we've already freed
+      // it under the retention policy): return null rather than throwing.
+      return null;
     };
   }
 
   notify(method: string, params: any[], clientId?: string) {
-    const message = formatNotificationMessage(method, params);
-    if (clientId) this.clients.get(clientId)?.send(message);
-    else for (const t of this.clients.values()) t.send(message);
+    if (clientId) this.sendNotification(clientId, method, params);
+    else for (const id of this.clients.keys()) this.sendNotification(id, method, params);
   }
 
   /** @internal */
-  send(clientId: string, message: string) {
-    this.clients.get(clientId)?.send(message);
+  sendNotification(
+    clientId: string,
+    method: string,
+    params: unknown[],
+    ctx?: TransportContext,
+  ): void {
+    const codec = this.clients.get(clientId);
+    if (!codec) return;
+    codec.send({type: 'notification', method, params}, ctx);
+  }
+
+  /** @internal — used by ForwardedUpstream to inject already-framed wire messages. */
+  sendWire(clientId: string, msg: WireMessage): void {
+    const codec = this.clients.get(clientId);
+    if (!codec) return;
+    codec.send(msg);
+  }
+
+  private sendResult(
+    clientId: string,
+    id: number,
+    value: unknown,
+    ctx?: TransportContext,
+  ): void {
+    const codec = this.clients.get(clientId);
+    if (!codec) return;
+    codec.send({type: 'result', id, value}, ctx);
+  }
+
+  private sendError(clientId: string, id: number, value: unknown): void {
+    const codec = this.clients.get(clientId);
+    if (!codec) return;
+    codec.send({type: 'error', id, value});
   }
 
   // ───── message dispatch ────────────────────────────────────────────────────
@@ -340,19 +365,17 @@ export class RPC {
 
     try {
       const result = await this.callMethod(method, params);
-      const serialized = this.reflection.serialize(result, clientId);
+      const ctx: TransportContext = {};
+      const serialized = this.reflection.serialize(result, clientId, ctx);
       if (id !== undefined) {
-        this.send(clientId, formatResultMessage(id, serialized));
+        this.sendResult(clientId, id, serialized, ctx);
       }
     } catch (error: any) {
       if (id !== undefined) {
-        this.send(
-          clientId,
-          formatErrorMessage(id, {
-            code: -1,
-            message: error?.message ?? String(error),
-          }),
-        );
+        this.sendError(clientId, id, {
+          code: -1,
+          message: error?.message ?? String(error),
+        });
       }
     }
   }

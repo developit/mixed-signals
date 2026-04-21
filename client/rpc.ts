@@ -1,36 +1,17 @@
-import {BRAND_REMOTE, type RemoteBrand} from '../shared/brand.ts';
+import {
+  PeerCodec,
+  substituteBrandsAndCollectTransferables,
+} from '../shared/codec.ts';
 import {Hydrator} from '../shared/hydrate.ts';
 import {
-  formatCallMessage,
-  formatNotificationMessage,
-  HANDLE_MARKER,
   PROMISE_REJECT_METHOD,
   PROMISE_RESOLVE_METHOD,
-  parseWireMessage,
-  parseWireParams,
-  parseWireValue,
   ROOT_NOTIFICATION_METHOD,
   SIGNAL_UPDATE_METHOD,
   type Transport,
+  type TransportContext,
 } from '../shared/protocol.ts';
 import {ClientReflection} from './reflection.ts';
-
-/**
- * JSON.stringify replacer used for client → server values. Detects branded
- * remote Proxies / Signals / functions and re-emits them as bare `@H` markers
- * so the server resolves them back to the original object by id.
- *
- * The brand is a non-enumerable own symbol, so JSON.stringify's default walk
- * would miss it — we explicitly check each visited value.
- */
-function outboundReplacer(_key: string, value: unknown): unknown {
-  if (value === null || value === undefined) return value;
-  const t = typeof value;
-  if (t !== 'object' && t !== 'function') return value;
-  const brand = (value as any)[BRAND_REMOTE] as RemoteBrand | undefined;
-  if (brand) return {[HANDLE_MARKER]: brand.id};
-  return value;
-}
 
 /**
  * Client-side RPC hub.
@@ -39,9 +20,15 @@ function outboundReplacer(_key: string, value: unknown): unknown {
  * automatically — Models and plain objects become `Proxy`s, functions become
  * callable proxies, promises become live `Promise`s, signals become real
  * `Signal`s wired to the watch/unwatch protocol.
+ *
+ * Works with either a `StringTransport` (the default — WebSocket, stdio,
+ * etc.) or a `RawTransport` (postMessage / MessagePort / Worker). On the
+ * raw path, outbound calls walk the arg tree to substitute branded remote
+ * handles with `@H` markers and collect Transferable values into
+ * `ctx.transfer`, which the transport hands to `postMessage(msg, ctx)`.
  */
 export class RPCClient {
-  private transport: Transport;
+  private codec: PeerCodec;
   private nextId = 1;
   private pending = new Map<
     number,
@@ -62,7 +49,6 @@ export class RPCClient {
   private _resolveReady!: () => void;
 
   constructor(transport: Transport, _ctx?: any) {
-    this.transport = transport;
     this.transportReady = transport.ready;
     this.ready = new Promise((resolve) => {
       this._resolveReady = resolve;
@@ -70,11 +56,13 @@ export class RPCClient {
     this.reflection = new ClientReflection(this);
     this.hydrator = new Hydrator(this.reflection);
     this.reflection.setHydrator(this.hydrator);
-    this.wireTransport(transport);
+    this.codec = new PeerCodec(transport, (marker) =>
+      this.hydrator.hydrate(marker),
+    );
+    this.wireCodec();
   }
 
   reconnect(transport: Transport) {
-    this.transport = transport;
     this.transportReady = transport.ready;
     for (const {reject} of this.pending.values()) {
       reject(new Error('Transport reconnected'));
@@ -85,28 +73,35 @@ export class RPCClient {
     this.ready = new Promise((resolve) => {
       this._resolveReady = resolve;
     });
-    this.wireTransport(transport);
+    this.codec = new PeerCodec(transport, (marker) =>
+      this.hydrator.hydrate(marker),
+    );
+    this.wireCodec();
   }
 
-  private wireTransport(transport: Transport) {
-    transport.onMessage((data) => {
-      const message = parseWireMessage(data.toString());
-      if (!message) return;
-      const reviver = this.hydrator.reviver;
-
-      if (message.type === 'result' || message.type === 'error') {
-        const parsed = parseWireValue(message.payload, reviver);
-        const pending = this.pending.get(message.id);
+  private wireCodec() {
+    this.codec.onMessage((msg) => {
+      if (msg.type === 'result') {
+        const pending = this.pending.get(msg.id);
         if (!pending) return;
-        this.pending.delete(message.id);
-        if (message.type === 'result') pending.resolve(parsed);
-        else pending.reject(new Error((parsed as {message?: string}).message));
+        this.pending.delete(msg.id);
+        pending.resolve(msg.value);
         return;
       }
-      if (message.type === 'call') return;
+      if (msg.type === 'error') {
+        const pending = this.pending.get(msg.id);
+        if (!pending) return;
+        this.pending.delete(msg.id);
+        pending.reject(
+          new Error(
+            ((msg.value as {message?: string}) ?? {}).message ?? 'RPC error',
+          ),
+        );
+        return;
+      }
+      if (msg.type === 'call') return;
 
-      const params = parseWireParams(message.payload, reviver);
-      this.handleNotification(message.method, params);
+      this.handleNotification(msg.method, msg.params as any[]);
     });
   }
 
@@ -115,9 +110,12 @@ export class RPCClient {
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
       this.pending.set(id, {resolve, reject});
-      this.transport.send(
-        formatCallMessage(id, method, params || [], outboundReplacer),
-      );
+      const ctx: TransportContext = {};
+      const walked = substituteBrandsAndCollectTransferables(
+        params || [],
+        ctx,
+      ) as unknown[];
+      this.codec.send({type: 'call', id, method, params: walked}, ctx);
     });
   }
 
@@ -137,11 +135,21 @@ export class RPCClient {
   }
 
   notify(method: string, params?: any[]) {
-    const message = formatNotificationMessage(method, params, outboundReplacer);
+    const sendIt = () => {
+      const ctx: TransportContext = {};
+      const walked = substituteBrandsAndCollectTransferables(
+        params || [],
+        ctx,
+      ) as unknown[];
+      this.codec.send(
+        {type: 'notification', method, params: walked},
+        ctx,
+      );
+    };
     if (this.transportReady) {
-      this.transportReady.then(() => this.transport.send(message));
+      this.transportReady.then(sendIt);
     } else {
-      this.transport.send(message);
+      sendIt();
     }
   }
 

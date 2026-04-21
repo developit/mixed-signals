@@ -1,10 +1,10 @@
 import type {Signal} from '@preact/signals-core';
 import type {Handles} from '../shared/handles.ts';
 import {
-  formatNotificationMessage,
   PROMISE_REJECT_METHOD,
   PROMISE_RESOLVE_METHOD,
   SIGNAL_UPDATE_METHOD,
+  type TransportContext,
 } from '../shared/protocol.ts';
 import {type SerializeHooks, Serializer} from '../shared/serialize.ts';
 
@@ -13,7 +13,12 @@ type ClientId = string;
 type DeltaMode = 'append' | 'merge';
 
 interface RpcSender {
-  send(clientId: string, message: string): void;
+  sendNotification(
+    clientId: string,
+    method: string,
+    params: unknown[],
+    ctx?: TransportContext,
+  ): void;
 }
 
 /**
@@ -43,10 +48,15 @@ export class Reflection {
    * Serialize a value for a specific client. Wires any newly-emitted signals
    * into the subscription table (lazy-subscription happens on first watch)
    * and attaches settlement listeners to any pending promises.
+   *
+   * When `ctx` is provided, transferable values encountered during the walk
+   * are collected into `ctx.transfer` so the raw-mode transport can forward
+   * them as ownership transfers.
    */
-  serialize(value: any, clientId: ClientId): any {
+  serialize(value: any, clientId: ClientId, ctx?: TransportContext): any {
     const hooks: SerializeHooks = {
       peerId: clientId,
+      ctx,
       onSignalEmitted: (id, sig) => {
         this.signals.set(id, sig);
         // Seed lastSentValues with the current peek so the first diff against
@@ -58,21 +68,21 @@ export class Reflection {
         // serialized value (which may itself be a model or signal).
         p.then(
           (v) => {
-            const payload = this.serialize(v, clientId);
-            this.rpc.send(
+            const settleCtx: TransportContext = {};
+            const payload = this.serialize(v, clientId, settleCtx);
+            this.rpc.sendNotification(
               clientId,
-              formatNotificationMessage(PROMISE_RESOLVE_METHOD, [id, payload]),
+              PROMISE_RESOLVE_METHOD,
+              [id, payload],
+              settleCtx,
             );
           },
           (err) => {
             const msg = err?.message ?? String(err);
-            this.rpc.send(
-              clientId,
-              formatNotificationMessage(PROMISE_REJECT_METHOD, [
-                id,
-                {message: msg},
-              ]),
-            );
+            this.rpc.sendNotification(clientId, PROMISE_REJECT_METHOD, [
+              id,
+              {message: msg},
+            ]);
           },
         );
       },
@@ -159,14 +169,12 @@ export class Reflection {
       if (lastValue === newValue) continue;
       const update = this.computeDelta(lastValue, newValue);
       if (!update) continue;
-      const serializedValue = this.serialize(update.value, clientId);
+      const ctx: TransportContext = {};
+      const serializedValue = this.serialize(update.value, clientId, ctx);
       const params = update.mode
         ? [signalId, serializedValue, update.mode]
         : [signalId, serializedValue];
-      this.rpc.send(
-        clientId,
-        formatNotificationMessage(SIGNAL_UPDATE_METHOD, params),
-      );
+      this.rpc.sendNotification(clientId, SIGNAL_UPDATE_METHOD, params, ctx);
       this.lastSentValues.set(`${clientId}:${signalId}`, newValue);
     }
   }

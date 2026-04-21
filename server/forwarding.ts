@@ -1,17 +1,17 @@
 import {
   formatCallMessage,
-  formatErrorMessage,
   formatNotificationMessage,
-  formatResultMessage,
   HANDLE_MARKER,
   parseWireMessage,
   parseWireParams,
   RELEASE_HANDLES_METHOD,
   ROOT_NOTIFICATION_METHOD,
   SIGNAL_UPDATE_METHOD,
+  type StringTransport,
   type Transport,
   UNWATCH_SIGNALS_METHOD,
   WATCH_SIGNALS_METHOD,
+  type WireMessage,
 } from '../shared/protocol.ts';
 
 type HandleId = string;
@@ -91,12 +91,19 @@ export function stripInstancePrefix(prefix: string, id: HandleId): HandleId {
   return stripIdPrefix(prefix, id) ?? id;
 }
 
-function needsRewrite(rawPayload: string): boolean {
-  return rawPayload.includes(`"${HANDLE_MARKER}"`);
+function containsMarker(value: unknown): boolean {
+  if (value === null || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some(containsMarker);
+  for (const key of Object.keys(value)) {
+    if (key === HANDLE_MARKER) return true;
+    if (containsMarker((value as Record<string, unknown>)[key])) return true;
+  }
+  return false;
 }
 
 interface UpstreamHost {
-  send(clientId: string, message: string): void;
+  /** Inject an already-framed wire message toward a specific downstream. */
+  sendWire(clientId: string, msg: WireMessage): void;
   /** Called when the upstream root changes. */
   onUpstreamRootChanged(): void;
 }
@@ -104,10 +111,14 @@ interface UpstreamHost {
 /**
  * One upstream connection. Rewrites ids on inbound messages (adds the prefix)
  * and strips them on outbound (client → upstream) messages.
+ *
+ * Upstreams speak the string-framed protocol. Raw-mode downstream clients
+ * still work because `sendWire` hands already-structured `WireMessage`s to
+ * the host, which dispatches through each client's codec.
  */
 export class ForwardedUpstream {
   readonly prefix: string;
-  private transport: Transport;
+  private transport: StringTransport;
   private host: UpstreamHost;
   private disposed = false;
 
@@ -120,13 +131,20 @@ export class ForwardedUpstream {
   private clientId: string | undefined;
 
   constructor(prefix: string, transport: Transport, host: UpstreamHost) {
+    if (transport.mode === 'raw') {
+      throw new Error(
+        'addUpstream: raw-mode transports are not supported for upstreams. Use a string-mode transport.',
+      );
+    }
     this.prefix = prefix;
-    this.transport = transport;
+    this.transport = transport as StringTransport;
     this.host = host;
     this.ready = new Promise((resolve) => {
       this._resolveReady = resolve;
     });
-    transport.onMessage((data) => this.handleUpstreamMessage(data.toString()));
+    this.transport.onMessage((data) =>
+      this.handleUpstreamMessage(data.toString()),
+    );
   }
 
   setClient(clientId: string) {
@@ -151,16 +169,17 @@ export class ForwardedUpstream {
         const params = parseWireParams(parsed.payload);
         const [signalId, value, mode] = params as [HandleId, any, string?];
         const prefixedId = prefixId(this.prefix, signalId);
-        const rewrittenValue = needsRewrite(parsed.payload)
+        const rewrittenValue = containsMarker(value)
           ? addPrefix(this.prefix, value)
           : value;
         const outParams = mode
           ? [prefixedId, rewrittenValue, mode]
           : [prefixedId, rewrittenValue];
-        this.host.send(
-          this.clientId,
-          formatNotificationMessage(SIGNAL_UPDATE_METHOD, outParams),
-        );
+        this.host.sendWire(this.clientId, {
+          type: 'notification',
+          method: SIGNAL_UPDATE_METHOD,
+          params: outParams,
+        });
         return;
       }
     }
@@ -170,13 +189,14 @@ export class ForwardedUpstream {
       if (!pending) return;
       this.pendingCalls.delete(parsed.id);
       const result = JSON.parse(parsed.payload);
-      const rewritten = needsRewrite(parsed.payload)
+      const rewritten = containsMarker(result)
         ? addPrefix(this.prefix, result)
         : result;
-      this.host.send(
-        pending.clientId,
-        formatResultMessage(pending.callId, rewritten),
-      );
+      this.host.sendWire(pending.clientId, {
+        type: 'result',
+        id: pending.callId,
+        value: rewritten,
+      });
       return;
     }
 
@@ -184,10 +204,11 @@ export class ForwardedUpstream {
       const pending = this.pendingCalls.get(parsed.id);
       if (!pending) return;
       this.pendingCalls.delete(parsed.id);
-      this.host.send(
-        pending.clientId,
-        formatErrorMessage(pending.callId, JSON.parse(parsed.payload)),
-      );
+      this.host.sendWire(pending.clientId, {
+        type: 'error',
+        id: pending.callId,
+        value: JSON.parse(parsed.payload),
+      });
     }
   }
 
@@ -195,11 +216,10 @@ export class ForwardedUpstream {
     clientId: string,
     downstreamCallId: number,
     method: string,
-    rawPayload: string,
+    params: unknown[],
   ) {
     const upstreamCallId = this.nextUpstreamCallId++;
     this.pendingCalls.set(upstreamCallId, {clientId, callId: downstreamCallId});
-    const params = parseWireParams(rawPayload);
     this.transport.send(formatCallMessage(upstreamCallId, method, params));
   }
 
