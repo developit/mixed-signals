@@ -8,6 +8,7 @@ export default defineConfig({
   },
   format: 'esm',
   dts: true,
+  minify: true,
   outputOptions: {
     chunkFileNames: '[name].shared.js',
   },

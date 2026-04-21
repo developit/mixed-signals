@@ -51,18 +51,13 @@ const nativeFromBase64 =
     ? (Uint8Array as Uint8ArrayCtorBase64Ext).fromBase64
     : undefined;
 
-const CHUNK = 0x8000;
-
 function bytesToBase64(bytes: Uint8Array): string {
   if (nativeToBase64) return nativeToBase64.call(bytes);
-  // Chunked to avoid the argument-count limit on `String.fromCharCode`.
+  // Direct char-by-char loop. Avoids `String.fromCharCode.apply(null, huge)`
+  // arg-count limits (engine-specific, historically ~64k) without needing
+  // chunking. Only runs on runtimes without native toBase64.
   let binary = '';
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    binary += String.fromCharCode.apply(
-      null,
-      Array.from(bytes.subarray(i, i + CHUNK)),
-    );
-  }
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
   return btoa(binary);
 }
 
