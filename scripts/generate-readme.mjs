@@ -16,6 +16,11 @@ const ENTRY_POINTS = [
     json: 'client.json',
     heading: 'mixed-signals/client',
   },
+  {
+    src: 'codecs/index.ts',
+    json: 'codecs.json',
+    heading: 'mixed-signals/codecs',
+  },
 ];
 
 // Run typedoc to generate JSON for each entry point
