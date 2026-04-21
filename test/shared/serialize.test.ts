@@ -241,19 +241,28 @@ describe('Serializer: promises (tier 3)', () => {
     expect(h.get(id)).toBeUndefined();
   });
 
-  it('the same Promise re-emits with the same pid (no double settlement)', () => {
+  it('the same Promise re-emits with the same pid across peers', () => {
     const p = Promise.resolve(1);
     const h = new Handles();
     const ser = new Serializer(h);
-    const fired: string[] = [];
-    const hooks = {
+    // `onPromiseEmitted` fires on every emission so the *host* can wire a
+    // settlement listener per-peer. The serializer keeps a stable pid per
+    // Promise across all emissions.
+    const fired: Array<[string, string]> = [];
+    const firstOut = ser.serialize(p, {
       peerId: 'c1',
-      onPromiseEmitted: (id: string) => fired.push(id),
-    };
-    const first = ser.serialize(p, hooks);
-    const second = ser.serialize(p, hooks);
-    expect(first[HANDLE_MARKER]).toBe(second[HANDLE_MARKER]);
-    expect(fired).toHaveLength(1);
+      onPromiseEmitted: (id: string) => fired.push(['c1', id]),
+    });
+    const secondOut = ser.serialize(p, {
+      peerId: 'c2',
+      onPromiseEmitted: (id: string) => fired.push(['c2', id]),
+    });
+    expect(firstOut[HANDLE_MARKER]).toBe(secondOut[HANDLE_MARKER]);
+    // Emitted once per peer that receives it; same id both times.
+    expect(fired).toEqual([
+      ['c1', firstOut[HANDLE_MARKER]],
+      ['c2', firstOut[HANDLE_MARKER]],
+    ]);
   });
 });
 

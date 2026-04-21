@@ -1,5 +1,10 @@
 import {describe, expect, it} from 'vitest';
 import {
+  BRAND_REMOTE,
+  type HandleKind,
+  type RemoteBrand,
+} from '../shared/brand.ts';
+import {
   hydrateTree,
   isTransferable,
   PeerCodec,
@@ -12,7 +17,6 @@ import {
   type TransportContext,
   type WireMessage,
 } from '../shared/protocol.ts';
-import {BRAND_REMOTE, type HandleKind, type RemoteBrand} from '../shared/brand.ts';
 
 function makeStringTransport() {
   let handler: ((data: {toString(): string}) => void) | undefined;
@@ -25,7 +29,11 @@ function makeStringTransport() {
       handler = cb;
     },
   };
-  return {transport, sent, deliver: (d: string) => handler?.({toString: () => d})};
+  return {
+    transport,
+    sent,
+    deliver: (d: string) => handler?.({toString: () => d}),
+  };
 }
 
 function makeRawTransport() {

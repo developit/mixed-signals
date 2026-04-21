@@ -141,10 +141,7 @@ export class RPCClient {
         params || [],
         ctx,
       ) as unknown[];
-      this.codec.send(
-        {type: 'notification', method, params: walked},
-        ctx,
-      );
+      this.codec.send({type: 'notification', method, params: walked}, ctx);
     };
     if (this.transportReady) {
       this.transportReady.then(sendIt);

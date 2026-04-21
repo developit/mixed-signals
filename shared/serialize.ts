@@ -230,14 +230,21 @@ export class Serializer {
   // ───── promise (tier 3, one-shot) ─────────────────────────────────────────
 
   private emitPromise(p: Promise<any>, hooks: SerializeHooks): any {
-    // Promises are outside the Handles registry. Their lifecycle is a single
-    // resolution or rejection; there is nothing to refcount or release.
+    // Promises are outside the Handles registry. Their lifecycle is a
+    // single resolution or rejection; there is nothing to refcount.
+    //
+    // Settlement must reach every peer that received this promise id,
+    // not just the first one. A shared promise on the root (or nested in
+    // a shared model) is typically emitted to client A first and client
+    // B second; both must get the same @P/@E frame when it settles. We
+    // call `onPromiseEmitted` on every emission and let the host guard
+    // duplicate listener registration per (peer, id).
     let id = this.promiseIds.get(p);
     if (!id) {
       id = `p${this.nextPromiseId++}`;
       this.promiseIds.set(p, id);
-      hooks.onPromiseEmitted?.(id, p);
     }
+    hooks.onPromiseEmitted?.(id, p);
     return {[HANDLE_MARKER]: id};
   }
 

@@ -120,7 +120,11 @@ export function createLinkedRawTransportPair(): {
   const sentCtxToClient: TransportContext[] = [];
   const sentCtxToServer: TransportContext[] = [];
 
-  const enqueue = (key: string, data: unknown, ctx: TransportContext | undefined) => {
+  const enqueue = (
+    key: string,
+    data: unknown,
+    ctx: TransportContext | undefined,
+  ) => {
     const cloned = structuredClone(data);
     let forwardedCtx: TransportContext | undefined;
     if (ctx) {

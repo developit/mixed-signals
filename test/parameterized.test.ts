@@ -27,10 +27,12 @@ interface Pair {
 
 function makePair(mode: Mode): Pair {
   if (mode === 'string') {
-    const {serverTransport, clientTransport, flush} = createLinkedTransportPair();
+    const {serverTransport, clientTransport, flush} =
+      createLinkedTransportPair();
     return {serverTransport, clientTransport, flush};
   }
-  const {serverTransport, clientTransport, flush} = createLinkedRawTransportPair();
+  const {serverTransport, clientTransport, flush} =
+    createLinkedRawTransportPair();
   return {serverTransport, clientTransport, flush};
 }
 
@@ -71,7 +73,9 @@ for (const mode of ['string', 'raw'] as const) {
       await client.ready;
 
       const observed: number[] = [];
-      const unsub = client.root.count.subscribe((v: number) => observed.push(v));
+      const unsub = client.root.count.subscribe((v: number) =>
+        observed.push(v),
+      );
       await flush();
       await tick(5);
       await flush();
