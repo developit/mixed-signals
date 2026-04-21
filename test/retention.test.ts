@@ -76,22 +76,41 @@ describe('Retention: ttl policy', () => {
     await p;
     expect(rpc.handles.valueOf('o1')).toBeDefined();
 
-    // Client releases the handle.
+    // Client releases the object handle. Signals are tier 1 and NOT
+    // refcounted — the client filters them out of release batches, and
+    // the server ignores them in handleRelease. Their lifecycle is the
+    // subscription (@W/@U) and eventual client disconnect.
     client.notify(RELEASE_HANDLES_METHOD, ['o1']);
-    await flush();
-    // Signal was a child — release that too for a clean orphan.
-    client.notify(RELEASE_HANDLES_METHOD, ['s1']);
     await flush();
 
     // Not yet idle enough.
     rpc._sweepTtlNow();
     expect(rpc.handles.valueOf('o1')).toBeDefined();
 
-    // Fast-forward beyond the idle window.
+    // Fast-forward beyond the idle window. The object drops; the signal
+    // persists (tier 1, not swept) until the connection ends.
     vi.setSystemTime(Date.now() + 2_000);
     rpc._sweepTtlNow();
     expect(rpc.handles.valueOf('o1')).toBeUndefined();
-    expect(rpc.handles.valueOf('s1')).toBeUndefined();
+    expect(rpc.handles.valueOf('s1')).toBeDefined();
+  });
+
+  it('does not sweep signals, even when idle past idleMs (tier 1 lifecycle)', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC(
+      {sig: signal(0)},
+      {retention: {kind: 'ttl', idleMs: 1_000, sweepMs: 500}},
+    );
+    const {client, flush} = connect(rpc, 'c1');
+    await flush();
+    await client.ready;
+    // The server emitted s1 as part of the root; no one ever subscribed.
+    expect(rpc.handles.valueOf('s1')).toBeDefined();
+    vi.setSystemTime(Date.now() + 10_000);
+    rpc._sweepTtlNow();
+    // Still there. Signals are dropped only via releaseAllForClient on
+    // disconnect (when no remaining client has seen them).
+    expect(rpc.handles.valueOf('s1')).toBeDefined();
   });
 
   it('keeps handles that still have refs from other clients', async () => {
