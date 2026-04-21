@@ -222,11 +222,16 @@ export class Handles {
   /**
    * Look up (or allocate) a class id for a given ctor / signature / class def.
    *
-   * The ctor cache is the primary key for stable classes (Models,
-   * user-defined classes with methods). Plain-object cases without a stable
-   * ctor never reach this path — they're emitted in the ad-hoc keyed form.
-   * `ctor === Object` is explicitly skipped; the signature cache catches
-   * anonymous-ctor-less cases if the caller does use them.
+   * Caching rules:
+   *   - The ctor cache is a fast-path for stable-shape classes (Models:
+   *     every instance carries the same factory output; normal classes
+   *     whose instances always have the same own-property set). We only
+   *     consult it when the ctor is not `Object` and only trust the hit
+   *     if the current shape signature ALSO matches the cached def — a
+   *     hand-written class with conditionally-present own properties can
+   *     still serialize correctly, it just allocates a fresh class id
+   *     when its shape differs.
+   *   - The signature cache catches ctor-less / anonymous cases.
    */
   classIdFor(
     ctor: object | undefined,
@@ -237,7 +242,13 @@ export class Handles {
     const useCtorCache = ctor && ctor !== Object;
     if (useCtorCache) {
       const hit = this.classIdByCtor.get(ctor);
-      if (hit !== undefined) return hit;
+      if (hit !== undefined) {
+        // Trust the ctor cache only when the shape matches. Otherwise fall
+        // through to signature-based allocation: two instances with
+        // different own-property sets deserve different class ids.
+        const cachedDef = this.classDefs.get(hit);
+        if (cachedDef && signaturesMatch(cachedDef.keys, keys)) return hit;
+      }
     }
     let id = this.classIdBySig.get(signature);
     if (id === undefined) {
@@ -245,7 +256,12 @@ export class Handles {
       this.classIdBySig.set(signature, id);
       this.classDefs.set(id, {id, name, keys});
     }
-    if (useCtorCache) this.classIdByCtor.set(ctor, id);
+    // Only update the ctor cache if it was empty; never overwrite a prior
+    // mapping to a different id (keeps "first instance wins" semantics, so
+    // the most common shape stays the fast-path hit).
+    if (useCtorCache && this.classIdByCtor.get(ctor) === undefined) {
+      this.classIdByCtor.set(ctor, id);
+    }
     return id;
   }
 
@@ -266,6 +282,12 @@ export class Handles {
     }
     s.add(classId);
   }
+}
+
+function signaturesMatch(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
 }
 
 // Helper types re-exported from the type boundary so consumers don't need to

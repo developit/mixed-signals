@@ -186,6 +186,29 @@ describe('Serializer: cached classes (Models, user classes)', () => {
     expect(out.d).toHaveLength(1);
   });
 
+  it('class instances with differing shapes get distinct class ids', () => {
+    // Hand-written class with a conditionally-present own property.
+    class Config {
+      url = 'x';
+      method() {}
+      withRegion() {
+        (this as any).region = 'us';
+        return this;
+      }
+    }
+    const h = new Handles();
+    const ser = new Serializer(h);
+    const a = ser.serialize(new Config(), {peerId: 'c1'});
+    const b = ser.serialize(new Config().withRegion(), {peerId: 'c1'});
+    // Different own-property sets → different class ids. First one hits the
+    // ctor cache, second falls through because its shape doesn't match.
+    const idA = Number.parseInt((a.c as string).split('#')[0], 10);
+    const idB = Number.parseInt((b.c as string).split('#')[0], 10);
+    expect(idA).not.toBe(idB);
+    expect(a.p).toBe('url');
+    expect(b.p).toBe('url,region');
+  });
+
   it('a class with a comma in a property name throws a clear error', () => {
     // Hand-build a class-ctor with a weird own key so we hit the cached-class path.
     class Weird {

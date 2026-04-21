@@ -224,27 +224,44 @@ export class Hydrator {
   // ───── object / class instance ────────────────────────────────────────────
 
   /**
-   * Install a class def seen for the first time on the wire. Accepts either
-   * the string form `"<id>#<name>"` / `"<id>"` (first emission) or does
-   * nothing if the class is already known by the numeric id path.
+   * Install a class def seen for the first time on the wire, or look one up.
+   *
+   *   - `c: "3#Counter"` or `c: "3"` → first emission; also carries a `p`
+   *     field with the property list. Install the class def.
+   *   - `c: 3` (numeric) → must already be known. If not, the server sent
+   *     a bare class ref without the def — we throw a descriptive error
+   *     so the condition is visible, not silently data-corrupting.
    */
   private ensureClass(cField: unknown, propsField: unknown): RemoteClass {
-    const asString = typeof cField === 'string';
     let classId: number;
     let name: string | null = null;
-    if (asString) {
-      const s = cField as string;
+    if (typeof cField === 'string') {
+      const s = cField;
       const hashIdx = s.indexOf('#');
-      classId = Number.parseInt(hashIdx === -1 ? s : s.slice(0, hashIdx), 10);
+      const idPart = hashIdx === -1 ? s : s.slice(0, hashIdx);
+      classId = Number.parseInt(idPart, 10);
+      if (!Number.isFinite(classId)) {
+        throw new Error(`Invalid class marker "${s}" — id is not numeric.`);
+      }
       if (hashIdx !== -1) name = s.slice(hashIdx + 1);
+    } else if (typeof cField === 'number' && Number.isFinite(cField)) {
+      classId = cField;
     } else {
-      classId = cField as number;
+      throw new Error(
+        `Invalid class marker of type ${typeof cField}; expected string or number.`,
+      );
     }
+
     const existing = this.classes.get(classId);
     if (existing) return existing;
-    // First-time emission: must carry `p` (property list).
-    const propsStr = typeof propsField === 'string' ? propsField : '';
-    const keys = propsStr === '' ? [] : propsStr.split(',');
+
+    // No entry yet — this must be a first emission, which requires `p`.
+    if (typeof propsField !== 'string') {
+      throw new Error(
+        `Unknown class id ${classId} with no \`p\` prelude; server emitted a bare class reference before the class was introduced on this connection.`,
+      );
+    }
+    const keys = propsField === '' ? [] : propsField.split(',');
     const cls: RemoteClass = {
       id: classId,
       name,
