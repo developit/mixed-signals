@@ -427,6 +427,29 @@ type this bundle knows about; otherwise `undefined` (pass through).
 
 ### Shared
 
+#### Shared by `RawTransport`, `StringTransport`
+
+- Kind: **Shared base**
+- Methods:
+  - `decode(value: unknown, ctx?: Ctx) => unknown` — Optional per-node inbound transform. Invoked by the library's hydrator
+at every value during deserialization (bottom-up). Return a replacement
+to rebuild a rich type from its `@T` tag; return `undefined` to pass
+through. By the time `decode` sees `{@T: 'map', d: [...]}`, the `d`
+children have already been decoded — so `new Map(decodedEntries)` works
+directly and nested live Signals land where they should.
+  - `encode(value: unknown, ctx?: Ctx) => unknown` — Optional per-node outbound transform. Invoked by the library's walker at
+every value during serialization (top-down). Return a replacement
+(typically `{@T: 'tag', d: ...}`) to tag a rich type; return `undefined`
+(or the value unchanged) to pass through. The walker recurses into the
+replacement, so nested handles / signals inside a tagged body still get
+emitted as `@H` correctly.
+
+This is where Map / Set / TypedArray / custom class tagging lives — see
+`mixed-signals/codecs` for a ready-made set or compose per-type helpers
+with `??` chaining.
+- Properties:
+  - `ready: Promise<void>`
+
 #### `RawTransport`
 
 - Kind: **Interface**
@@ -436,27 +459,10 @@ BroadcastChannel-likes). Skips JSON stringify/parse entirely; the
 serializer populates `ctx.transfer` so ArrayBuffer / MessagePort / etc.
 can be transferred rather than copied.
 - Methods:
-  - `decode(value: unknown, ctx?: Ctx) => unknown` — Optional per-node inbound transform. Invoked by the library's hydrator
-at every value during deserialization (bottom-up). Return a replacement
-to rebuild a rich type from its `@T` tag; return `undefined` to pass
-through. By the time `decode` sees `{@T: 'map', d: [...]}`, the `d`
-children have already been decoded — so `new Map(decodedEntries)` works
-directly and nested live Signals land where they should.
-  - `encode(value: unknown, ctx?: Ctx) => unknown` — Optional per-node outbound transform. Invoked by the library's walker at
-every value during serialization (top-down). Return a replacement
-(typically `{@T: 'tag', d: ...}`) to tag a rich type; return `undefined`
-(or the value unchanged) to pass through. The walker recurses into the
-replacement, so nested handles / signals inside a tagged body still get
-emitted as `@H` correctly.
-
-This is where Map / Set / TypedArray / custom class tagging lives — see
-`mixed-signals/codecs` for a ready-made set or compose per-type helpers
-with `??` chaining.
   - `onMessage(cb: (data: unknown, ctx?: Ctx) => void | Promise<void>) => void`
   - `send(data: unknown, ctx?: Ctx) => void`
 - Properties:
   - `mode: "raw"`
-  - `ready: Promise<void>`
 
 #### `StringTransport`
 
@@ -465,27 +471,10 @@ with `??` chaining.
 Every payload passes through `JSON.stringify` / `JSON.parse`. Use for
 byte-stream transports (WebSocket, stdio, fetch/SSE).
 - Methods:
-  - `decode(value: unknown, ctx?: Ctx) => unknown` — Optional per-node inbound transform. Invoked by the library's hydrator
-at every value during deserialization (bottom-up). Return a replacement
-to rebuild a rich type from its `@T` tag; return `undefined` to pass
-through. By the time `decode` sees `{@T: 'map', d: [...]}`, the `d`
-children have already been decoded — so `new Map(decodedEntries)` works
-directly and nested live Signals land where they should.
-  - `encode(value: unknown, ctx?: Ctx) => unknown` — Optional per-node outbound transform. Invoked by the library's walker at
-every value during serialization (top-down). Return a replacement
-(typically `{@T: 'tag', d: ...}`) to tag a rich type; return `undefined`
-(or the value unchanged) to pass through. The walker recurses into the
-replacement, so nested handles / signals inside a tagged body still get
-emitted as `@H` correctly.
-
-This is where Map / Set / TypedArray / custom class tagging lives — see
-`mixed-signals/codecs` for a ready-made set or compose per-type helpers
-with `??` chaining.
   - `onMessage(cb: (data: { toString: unknown }, ctx?: Ctx) => void | Promise<void>) => void`
   - `send(data: string, ctx?: Ctx) => void`
 - Properties:
   - `mode: "string"`
-  - `ready: Promise<void>`
 
 #### `Transport`
 
