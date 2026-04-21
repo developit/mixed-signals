@@ -155,7 +155,8 @@ function stringifyWireParams(
   params: readonly unknown[] = [],
   replacer?: (this: any, key: string, value: any) => any,
 ): string {
-  return params.map((param) => JSON.stringify(param, replacer)).join(',');
+  if (params.length === 0) return '';
+  return JSON.stringify(params, replacer).slice(1, -1);
 }
 
 export function formatCallMessage(

@@ -79,7 +79,7 @@ export class Reflection {
     };
     const out = this.serializer.serialize(value, hooks);
     if (out === undefined) return null;
-    return JSON.parse(JSON.stringify(out));
+    return out;
   }
 
   // ───── watch / unwatch ─────────────────────────────────────────────────────
