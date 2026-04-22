@@ -137,7 +137,18 @@ export class Serializer {
   }
 
   private walk(value: any, hooks: SerializeHooks): any {
-    if (value === null || value === undefined) return value;
+    if (value === null) return value;
+    if (value === undefined) {
+      // `undefined` has no JSON representation; default behavior drops it
+      // from object properties and coerces it to `null` in arrays. If an
+      // encode hook is registered, give it a chance to tag — e.g. the
+      // default bundle emits {"@T":"u"} so `{a: undefined}` round-trips.
+      if (hooks.encode) {
+        const replaced = hooks.encode(value, hooks.ctx);
+        if (replaced !== undefined) return this.walk(replaced, hooks);
+      }
+      return undefined;
+    }
     const t = typeof value;
 
     if (t === 'string' || t === 'number' || t === 'boolean') return value;

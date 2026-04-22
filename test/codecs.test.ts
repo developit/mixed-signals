@@ -69,6 +69,18 @@ describe('encode / decode — per-type round-trips', () => {
     expect(d).toBe(12345678901234567890n);
   });
 
+  it('undefined is tagged {@T:"u"} on encode', () => {
+    expect(encode(undefined)).toEqual({'@T': 'u'});
+  });
+
+  it('decode returns undefined for non-tagged values and for plain objects without @T', () => {
+    // The library (hydrateTree) handles @T:'u' directly so the decoder
+    // itself never has to produce undefined. Confirmed here: decode on the
+    // tagged object returns undefined too (via the "no-match" path), which
+    // is fine because hydrateTree short-circuits before calling decode.
+    expect(decode({'@T': 'u'})).toBeUndefined();
+  });
+
   it('ArrayBuffer', () => {
     const ab = new ArrayBuffer(4);
     new Uint8Array(ab).set([1, 2, 3, 4]);

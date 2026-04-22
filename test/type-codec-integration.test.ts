@@ -254,6 +254,76 @@ for (const mode of ['string', 'raw'] as const) {
       expect(result.flags).toBe('giu');
     });
 
+    it('tagged undefined round-trips through object properties', async () => {
+      const root = {
+        getFlags() {
+          return {a: true, b: undefined, c: false};
+        },
+      };
+      const rpc = new RPC(root);
+      const {serverTransport, clientTransport, flush} = makePair(mode);
+      withCodecs(serverTransport);
+      withCodecs(clientTransport);
+      const client = new RPCClient(clientTransport);
+      rpc.addClient(serverTransport, 'c1');
+      await flush();
+      await client.ready;
+
+      const p = client.root.getFlags();
+      await flush();
+      const result = (await p) as {a: boolean; b: unknown; c: boolean};
+      expect(result.a).toBe(true);
+      expect(result.b).toBeUndefined();
+      expect(result.c).toBe(false);
+      // Distinction from absent: the key IS present on the hydrated object.
+      expect('b' in result).toBe(true);
+    });
+
+    it('tagged undefined round-trips as method argument', async () => {
+      let seen: unknown = 'untouched';
+      const root = {
+        probe(v: unknown) {
+          seen = v;
+          return 'ok';
+        },
+      };
+      const rpc = new RPC(root);
+      const {serverTransport, clientTransport, flush} = makePair(mode);
+      withCodecs(serverTransport);
+      withCodecs(clientTransport);
+      const client = new RPCClient(clientTransport);
+      rpc.addClient(serverTransport, 'c1');
+      await flush();
+      await client.ready;
+
+      const p = client.root.probe(undefined);
+      await flush();
+      await p;
+      expect(seen).toBeUndefined();
+    });
+
+    it('tagged undefined round-trips inside arrays', async () => {
+      const root = {
+        sparse() {
+          return [1, undefined, 3];
+        },
+      };
+      const rpc = new RPC(root);
+      const {serverTransport, clientTransport, flush} = makePair(mode);
+      withCodecs(serverTransport);
+      withCodecs(clientTransport);
+      const client = new RPCClient(clientTransport);
+      rpc.addClient(serverTransport, 'c1');
+      await flush();
+      await client.ready;
+
+      const p = client.root.sparse();
+      await flush();
+      const result = (await p) as unknown[];
+      expect(result).toEqual([1, undefined, 3]);
+      expect(result[1]).toBeUndefined();
+    });
+
     it('nested rich types: Map<string, Set<Uint8Array>>', async () => {
       const root = {
         nested() {
@@ -311,6 +381,39 @@ describe('Serializer regression: built-ins are not mis-upgraded to @H', () => {
     const result = await p;
     expect(result).toBeInstanceOf(Uint8Array);
     expect(Array.from(result as Uint8Array)).toEqual([9, 9, 9]);
+  });
+
+  it('undefined without codecs: dropped from objects, null in arrays (JSON default)', async () => {
+    const root = {
+      getFlags() {
+        return {a: true, b: undefined, c: false};
+      },
+      getList() {
+        return [1, undefined, 3];
+      },
+    };
+    const rpc = new RPC(root);
+    const {serverTransport, clientTransport, flush} = createLinkedTransportPair();
+    const client = new RPCClient(clientTransport);
+    rpc.addClient(serverTransport, 'c1');
+    await flush();
+    await client.ready;
+
+    const flags = await (async () => {
+      const p = client.root.getFlags();
+      await flush();
+      return p;
+    })();
+    expect(flags.a).toBe(true);
+    expect('b' in flags).toBe(false); // silently dropped — JSON default
+    expect(flags.c).toBe(false);
+
+    const list = await (async () => {
+      const p = client.root.getList();
+      await flush();
+      return p;
+    })();
+    expect(list).toEqual([1, null, 3]); // null in arrays — JSON default
   });
 
   it('Map without codecs over string transport: degrades gracefully, does not become an @H handle', async () => {
