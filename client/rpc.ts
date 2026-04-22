@@ -1,145 +1,160 @@
 import {
-  formatCallMessage,
-  formatNotificationMessage,
-  parseWireMessage,
-  parseWireParams,
-  parseWireValue,
+  PeerCodec,
+  substituteBrandsAndCollectTransferables,
+} from '../shared/codec.ts';
+import {Hydrator} from '../shared/hydrate.ts';
+import {
+  PROMISE_REJECT_METHOD,
+  PROMISE_RESOLVE_METHOD,
   ROOT_NOTIFICATION_METHOD,
   SIGNAL_UPDATE_METHOD,
   type Transport,
+  type TransportContext,
 } from '../shared/protocol.ts';
 import {ClientReflection} from './reflection.ts';
 
+/**
+ * Client-side RPC hub.
+ *
+ * No model registration is required. Every incoming value is hydrated
+ * automatically — Models and plain objects become `Proxy`s, functions become
+ * callable proxies, promises become live `Promise`s, signals become real
+ * `Signal`s wired to the watch/unwatch protocol.
+ *
+ * Works with either a `StringTransport` (the default — WebSocket, stdio,
+ * etc.) or a `RawTransport` (postMessage / MessagePort / Worker). On the
+ * raw path, outbound calls walk the arg tree to substitute branded remote
+ * handles with `@H` markers and collect Transferable values into
+ * `ctx.transfer`, which the transport hands to `postMessage(msg, ctx)`.
+ */
 export class RPCClient {
-  private transport: Transport;
+  private codec: PeerCodec;
   private nextId = 1;
   private pending = new Map<
     number,
-    {resolve: (v: any) => void; reject: (e: any) => void}
+    {resolve(v: any): void; reject(e: any): void}
   >();
   private notificationListeners = new Set<
     (method: string, params: any[]) => void
   >();
+
   /** @internal */
   reflection: ClientReflection;
+  /** @internal */
+  hydrator: Hydrator;
+
   private transportReady: Promise<void> | undefined;
   root: any = undefined;
   ready: Promise<void>;
   private _resolveReady!: () => void;
 
-  constructor(transport: Transport, ctx?: any) {
-    this.transport = transport;
+  constructor(transport: Transport, _ctx?: any) {
     this.transportReady = transport.ready;
     this.ready = new Promise((resolve) => {
       this._resolveReady = resolve;
     });
-    this.reflection = new ClientReflection(this, ctx);
-    this.wireTransport(transport);
+    this.reflection = new ClientReflection(this);
+    this.hydrator = new Hydrator(this.reflection);
+    this.reflection.setHydrator(this.hydrator);
+    this.codec = new PeerCodec(transport, (marker) =>
+      this.hydrator.hydrate(marker),
+    );
+    this.wireCodec();
   }
 
-  /**
-   * Replace the transport and reset internal state for a reconnection.
-   * A new `ready` promise is created that resolves on the next `@R` message.
-   */
   reconnect(transport: Transport) {
-    this.transport = transport;
     this.transportReady = transport.ready;
-
-    // Reject all in-flight RPCs
     for (const {reject} of this.pending.values()) {
       reject(new Error('Transport reconnected'));
     }
     this.pending.clear();
-
-    // Clear reflection caches so the fresh @R rebuilds everything
     this.reflection.reset();
-
-    // Fresh ready gate
+    this.hydrator.reset();
     this.ready = new Promise((resolve) => {
       this._resolveReady = resolve;
     });
-
-    this.wireTransport(transport);
+    this.codec = new PeerCodec(transport, (marker) =>
+      this.hydrator.hydrate(marker),
+    );
+    this.wireCodec();
   }
 
-  private wireTransport(transport: Transport) {
-    transport.onMessage((data) => {
-      const message = parseWireMessage(data.toString());
-      if (!message) return;
-
-      const reviver = (_key: string, val: any) => {
-        if (typeof val === 'object' && val) {
-          if ('@S' in val) {
-            return this.reflection.getOrCreateSignal(val['@S'], val.v);
-          }
-
-          if ('@M' in val) {
-            return this.reflection.createModelFacade(val);
-          }
-        }
-
-        return val;
-      };
-
-      if (message.type === 'result' || message.type === 'error') {
-        const parsed = parseWireValue(message.payload, reviver);
-        const pending = this.pending.get(message.id);
+  private wireCodec() {
+    this.codec.onMessage((msg) => {
+      if (msg.type === 'result') {
+        const pending = this.pending.get(msg.id);
         if (!pending) return;
-
-        this.pending.delete(message.id);
-
-        if (message.type === 'result') {
-          pending.resolve(parsed);
-          return;
-        }
-
-        pending.reject(new Error((parsed as {message?: string}).message));
+        this.pending.delete(msg.id);
+        pending.resolve(msg.value);
         return;
       }
+      if (msg.type === 'error') {
+        const pending = this.pending.get(msg.id);
+        if (!pending) return;
+        this.pending.delete(msg.id);
+        pending.reject(
+          new Error(
+            ((msg.value as {message?: string}) ?? {}).message ?? 'RPC error',
+          ),
+        );
+        return;
+      }
+      if (msg.type === 'call') return;
 
-      if (message.type === 'call') return;
-
-      const params = parseWireParams(message.payload, reviver);
-      this.handleNotification(message.method, params);
+      this.handleNotification(msg.method, msg.params as any[]);
     });
-  }
-
-  registerModel(typeName: string, ctor: any) {
-    this.reflection.registerModel(typeName, ctor);
   }
 
   async call(method: string, params?: any): Promise<any> {
     if (this.transportReady) await this.transportReady;
     return new Promise((resolve, reject) => {
-      this.sendCall(method, params, resolve, reject);
+      const id = this.nextId++;
+      this.pending.set(id, {resolve, reject});
+      const ctx: TransportContext = {};
+      const walked = substituteBrandsAndCollectTransferables(
+        params || [],
+        ctx,
+        this.codec.encode,
+      ) as unknown[];
+      this.codec.send({type: 'call', id, method, params: walked}, ctx);
     });
   }
 
-  notify(method: string, params?: any[]) {
-    const message = formatNotificationMessage(method, params);
-    if (this.transportReady) {
-      this.transportReady.then(() => this.transport.send(message));
-    } else {
-      this.transport.send(message);
-    }
+  /**
+   * Resolve the constructor for a remote class by name. Every class instance
+   * the client has hydrated is built on a shared prototype, so you can use
+   * the returned function with `instanceof`:
+   *
+   *   const Counter = client.classOf('Counter');
+   *   value instanceof Counter;
+   *
+   * Returns `undefined` if no instance of a class with that name has been
+   * received yet.
+   */
+  classOf(name: string): (new () => any) | undefined {
+    return this.hydrator.classOf(name);
   }
 
-  private sendCall(
-    method: string,
-    params: any,
-    resolve: (v: any) => void,
-    reject: (e: any) => void,
-  ) {
-    const id = this.nextId++;
-    this.pending.set(id, {resolve, reject});
-    this.transport.send(formatCallMessage(id, method, params || []));
+  notify(method: string, params?: any[]) {
+    const sendIt = () => {
+      const ctx: TransportContext = {};
+      const walked = substituteBrandsAndCollectTransferables(
+        params || [],
+        ctx,
+        this.codec.encode,
+      ) as unknown[];
+      this.codec.send({type: 'notification', method, params: walked}, ctx);
+    };
+    if (this.transportReady) {
+      this.transportReady.then(sendIt);
+    } else {
+      sendIt();
+    }
   }
 
   onNotification(cb: (method: string, params: any[]) => void): () => void {
     this.notificationListeners.add(cb);
-    return () => {
-      this.notificationListeners.delete(cb);
-    };
+    return () => this.notificationListeners.delete(cb);
   }
 
   private handleNotification(method: string, params: any[]) {
@@ -147,8 +162,14 @@ export class RPCClient {
       this.root = params[0];
       this._resolveReady();
     } else if (method === SIGNAL_UPDATE_METHOD) {
-      const [id, value, mode] = params;
-      this.reflection.handleUpdate(id, value, mode);
+      const [id, value, mode] = params as [string, any, string?];
+      this.hydrator.applySignalUpdate(id, value, mode);
+    } else if (method === PROMISE_RESOLVE_METHOD) {
+      const [id, value] = params as [string, any];
+      this.reflection.settlePromise(id, value, false);
+    } else if (method === PROMISE_REJECT_METHOD) {
+      const [id, value] = params as [string, any];
+      this.reflection.settlePromise(id, value, true);
     } else {
       for (const listener of this.notificationListeners) {
         listener(method, params);

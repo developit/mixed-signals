@@ -1,249 +1,227 @@
-import {Signal} from '@preact/signals-core';
+import type {Signal} from '@preact/signals-core';
+import type {Handles} from '../shared/handles.ts';
 import {
-  formatNotificationMessage,
+  PROMISE_REJECT_METHOD,
+  PROMISE_RESOLVE_METHOD,
   SIGNAL_UPDATE_METHOD,
+  type TransportContext,
 } from '../shared/protocol.ts';
-import type {Instances} from './instances.ts';
+import {type SerializeHooks, Serializer} from '../shared/serialize.ts';
 
-type SignalId = number;
+type SignalId = string;
 type ClientId = string;
 type DeltaMode = 'append' | 'merge';
 
 interface RpcSender {
-  send(clientId: string, message: string): void;
+  sendNotification(
+    clientId: string,
+    method: string,
+    params: unknown[],
+    ctx?: TransportContext,
+  ): void;
+  /**
+   * Per-client outbound codec hook, pulled off the client's transport so
+   * user-registered type transforms (Map/Set/u8/custom) run during the
+   * serializer's walk.
+   */
+  getEncode(
+    clientId: string,
+  ): ((value: unknown, ctx?: TransportContext) => unknown) | undefined;
 }
 
-type ModelConstructor =
-  | (new (
-      ...args: any[]
-    ) => any)
-  | ((...args: any[]) => any);
-
+/**
+ * Server-side reactivity + delta pusher. Owns:
+ *   - signal subscription lifecycle (lazy: only subscribes to a source Signal
+ *     once at least one client is watching)
+ *   - per-client "last sent value" cache for diffing
+ *   - pushes `@S` signal update notifications with delta mode when possible
+ *
+ * Unlike the previous incarnation it no longer tracks model constructors or
+ * instance ids — those live in `Handles` and the shared serializer.
+ */
 export class Reflection {
-  private signalIds = new WeakMap<Signal<any>, SignalId>();
   private signals = new Map<SignalId, Signal<any>>();
   private subscriptions = new Map<SignalId, Set<ClientId>>();
+  private signalUnsubscribe = new Map<SignalId, () => void>();
   private lastSentValues = new Map<string, any>();
-  private sentModels = new Map<ClientId, Set<string>>();
-  private nextSignalId = 1;
+  /**
+   * Per-client set of promise ids we've already attached a settlement
+   * listener for. Every `onPromiseEmitted` call checks this set so the
+   * .then/.catch chain is registered exactly once per (client, promise)
+   * pair — a promise shared across multiple clients settles for all of
+   * them, but we only wire the listener once per destination.
+   */
+  private promiseListenersByClient = new Map<ClientId, Set<string>>();
   private rpc: RpcSender;
-  private instances: Instances;
-  private modelRegistry = new Map<ModelConstructor, string>();
-  private autoIds = new WeakMap<object, string>();
+  private serializer: Serializer;
+  private handles: Handles;
 
-  constructor(rpc: RpcSender, instances: Instances) {
+  constructor(rpc: RpcSender, handles: Handles) {
     this.rpc = rpc;
-    this.instances = instances;
+    this.handles = handles;
+    this.serializer = new Serializer(handles);
   }
 
-  registerModel(name: string, Ctor: ModelConstructor) {
-    this.modelRegistry.set(Ctor, name);
-  }
-
-  isModel(val: any): boolean {
-    if (typeof val !== 'object' || val === null) return false;
-
-    for (const Ctor of this.modelRegistry.keys()) {
-      if (val instanceof Ctor) return true;
-    }
-
-    return false;
-  }
-
-  getModelType(val: any): string | undefined {
-    for (const [Ctor, name] of this.modelRegistry) {
-      if (val instanceof Ctor) return name;
-    }
-  }
-
-  getInstanceId(instance: any): string {
-    const existingId = this.instances.getId(instance);
-    if (existingId !== undefined) return existingId;
-
-    if ('id' in instance) {
-      const id = instance.id;
-      return String(id instanceof Signal ? id.peek() : id);
-    }
-
-    let id = this.autoIds.get(instance);
-    if (id === undefined) {
-      id = this.instances.nextId();
-      this.autoIds.set(instance, id);
-    }
-
-    return id;
-  }
-
-  private getSignalId(sig: Signal<any>): SignalId {
-    let id = this.signalIds.get(sig);
-    if (!id) {
-      id = this.nextSignalId++;
-      this.signalIds.set(sig, id);
-      this.signals.set(id, sig);
-    }
-
-    return id;
-  }
-
-  private serializeValue(value: any, clientId?: ClientId): any {
-    if (value === this.rpc || value === this || value === this.instances)
-      return undefined;
-    if (typeof value === 'function') return undefined;
-
-    if (value instanceof Signal) {
-      const id = this.getSignalId(value);
-      const signalValue = value.peek();
-
-      if (clientId) {
-        this.lastSentValues.set(`${clientId}:${id}`, signalValue);
-        this.watch(clientId, id);
-      }
-
-      return {'@S': id, v: this.serializeValue(signalValue, clientId)};
-    }
-
-    if (this.isModel(value)) {
-      const typeName = this.getModelType(value)!;
-      const instanceId = this.getInstanceId(value);
-      const marker = `${typeName}#${instanceId}`;
-
-      if (!this.instances.get(instanceId)) {
-        this.instances.register(instanceId, value);
-      }
-
-      if (clientId) {
-        let sent = this.sentModels.get(clientId);
-        if (sent?.has(marker)) {
-          return {'@M': marker};
+  /**
+   * Serialize a value for a specific client. Wires any newly-emitted signals
+   * into the subscription table (lazy-subscription happens on first watch)
+   * and attaches settlement listeners to any pending promises.
+   *
+   * When `ctx` is provided, transferable values encountered during the walk
+   * are collected into `ctx.transfer` so the raw-mode transport can forward
+   * them as ownership transfers.
+   */
+  serialize(value: any, clientId: ClientId, ctx?: TransportContext): any {
+    const hooks: SerializeHooks = {
+      peerId: clientId,
+      ctx,
+      encode: this.rpc.getEncode(clientId),
+      onSignalEmitted: (id, sig) => {
+        this.signals.set(id, sig);
+        // Seed lastSentValues with the current peek so the first diff against
+        // a subsequent update is stable.
+        this.lastSentValues.set(`${clientId}:${id}`, sig.peek());
+      },
+      onPromiseEmitted: (id, p) => {
+        // Deliver the settlement to THIS client. Multiple clients may
+        // receive the same promise id; each needs their own listener
+        // so every peer sees the resolution. Dedup per client so we
+        // don't double-send if the same promise is re-emitted in a
+        // later frame.
+        let seen = this.promiseListenersByClient.get(clientId);
+        if (!seen) {
+          seen = new Set();
+          this.promiseListenersByClient.set(clientId, seen);
         }
-
-        if (!sent) {
-          sent = new Set();
-          this.sentModels.set(clientId, sent);
-        }
-
-        sent.add(marker);
-      }
-
-      const branded: Record<string, any> = {'@M': marker};
-      for (const [key, prop] of Object.entries(value)) {
-        if (key.startsWith('_')) continue;
-
-        const serializedProp = this.serializeValue(prop, clientId);
-        if (serializedProp !== undefined) {
-          branded[key] = serializedProp;
-        }
-      }
-
-      return branded;
-    }
-
-    if (Array.isArray(value)) {
-      return value.map((item) => {
-        const serializedItem = this.serializeValue(item, clientId);
-        return serializedItem === undefined ? null : serializedItem;
-      });
-    }
-
-    if (value && typeof value === 'object') {
-      const serialized: Record<string, any> = {};
-      for (const [key, prop] of Object.entries(value)) {
-        if (key.startsWith('_')) continue;
-
-        const serializedProp = this.serializeValue(prop, clientId);
-        if (serializedProp !== undefined) {
-          serialized[key] = serializedProp;
-        }
-      }
-
-      return serialized;
-    }
-
-    return value;
+        if (seen.has(id)) return;
+        seen.add(id);
+        // Settlement is delivered as a notification so it can carry a nested
+        // serialized value (which may itself be a model or signal).
+        p.then(
+          (v) => {
+            const settleCtx: TransportContext = {};
+            const payload = this.serialize(v, clientId, settleCtx);
+            this.rpc.sendNotification(
+              clientId,
+              PROMISE_RESOLVE_METHOD,
+              [id, payload],
+              settleCtx,
+            );
+          },
+          (err) => {
+            const msg = err?.message ?? String(err);
+            this.rpc.sendNotification(clientId, PROMISE_REJECT_METHOD, [
+              id,
+              {message: msg},
+            ]);
+          },
+        );
+      },
+    };
+    const out = this.serializer.serialize(value, hooks);
+    if (out === undefined) return null;
+    return out;
   }
 
-  serialize(value: any, clientId?: ClientId): any {
-    const serialized = this.serializeValue(value, clientId);
-    if (serialized === undefined) return null;
-
-    return JSON.parse(JSON.stringify(serialized));
-  }
+  // ───── watch / unwatch ─────────────────────────────────────────────────────
 
   watch(clientId: ClientId, signalId: SignalId) {
+    // Authorisation: a client may only subscribe to a signal it has
+    // previously received on the wire. Signal ids are sequential (`s1`,
+    // `s2`, …) and enumerable, so without this check any client could
+    // subscribe to the live update stream for every signal on the server
+    // just by counting up.
+    if (!this.handles.hasSentHandle(clientId, signalId)) return;
     let subs = this.subscriptions.get(signalId);
     if (!subs) {
       subs = new Set();
       this.subscriptions.set(signalId, subs);
     }
-
     const isFirst = subs.size === 0;
     subs.add(clientId);
-
     if (isFirst) {
       const sig = this.signals.get(signalId);
-      if (sig) {
-        // The server only subscribes to source signals once a client cares.
-        sig.subscribe(() => {
-          this.notifySubscribers(signalId);
-        });
+      if (sig && !this.signalUnsubscribe.has(signalId)) {
+        const unsub = sig.subscribe(() => this.notifySubscribers(signalId));
+        this.signalUnsubscribe.set(signalId, unsub);
       }
     }
   }
 
   unwatch(clientId: ClientId, signalId: SignalId) {
-    this.subscriptions.get(signalId)?.delete(clientId);
+    const subs = this.subscriptions.get(signalId);
+    if (!subs) return;
+    subs.delete(clientId);
+    if (subs.size === 0) {
+      this.subscriptions.delete(signalId);
+      const unsub = this.signalUnsubscribe.get(signalId);
+      if (unsub) {
+        unsub();
+        this.signalUnsubscribe.delete(signalId);
+      }
+    }
   }
 
   removeClient(clientId: ClientId) {
-    for (const subs of this.subscriptions.values()) {
-      subs.delete(clientId);
+    for (const [id, subs] of this.subscriptions) {
+      if (subs.delete(clientId) && subs.size === 0) {
+        this.subscriptions.delete(id);
+        const unsub = this.signalUnsubscribe.get(id);
+        if (unsub) {
+          unsub();
+          this.signalUnsubscribe.delete(id);
+        }
+      }
     }
-
     const prefix = `${clientId}:`;
     for (const key of this.lastSentValues.keys()) {
       if (key.startsWith(prefix)) this.lastSentValues.delete(key);
     }
-
-    this.sentModels.delete(clientId);
+    this.promiseListenersByClient.delete(clientId);
   }
+
+  /** Purge local state for a specific signal id (called on handle release). */
+  forgetSignal(signalId: SignalId) {
+    this.subscriptions.delete(signalId);
+    const unsub = this.signalUnsubscribe.get(signalId);
+    if (unsub) {
+      unsub();
+      this.signalUnsubscribe.delete(signalId);
+    }
+    this.signals.delete(signalId);
+    const prefix = `:${signalId}`;
+    for (const key of this.lastSentValues.keys()) {
+      if (key.endsWith(prefix)) this.lastSentValues.delete(key);
+    }
+  }
+
+  // ───── push ────────────────────────────────────────────────────────────────
 
   private notifySubscribers(signalId: SignalId) {
     const sig = this.signals.get(signalId);
     const clients = this.subscriptions.get(signalId);
     if (!sig || !clients || clients.size === 0) return;
-
     const newValue = sig.peek();
-
     for (const clientId of clients) {
       const lastValue = this.lastSentValues.get(`${clientId}:${signalId}`);
       if (lastValue === newValue) continue;
-
       const update = this.computeDelta(lastValue, newValue);
       if (!update) continue;
-
-      const serializedValue = this.serialize(update.value, clientId);
+      const ctx: TransportContext = {};
+      const serializedValue = this.serialize(update.value, clientId, ctx);
       const params = update.mode
         ? [signalId, serializedValue, update.mode]
         : [signalId, serializedValue];
-
-      this.rpc.send(
-        clientId,
-        formatNotificationMessage(SIGNAL_UPDATE_METHOD, params),
-      );
+      this.rpc.sendNotification(clientId, SIGNAL_UPDATE_METHOD, params, ctx);
       this.lastSentValues.set(`${clientId}:${signalId}`, newValue);
     }
   }
 
-  /**
-   * Compute the delta between the last-sent value and the new value.
-   * Returns null if the values are shallow-equal (no update needed).
-   */
   private computeDelta(
     oldValue: any,
     newValue: any,
   ): {value: any; mode?: DeltaMode} | null {
     if (oldValue === undefined) return {value: newValue};
-
     if (Array.isArray(oldValue) && Array.isArray(newValue)) {
       if (
         newValue.length > oldValue.length &&
@@ -251,7 +229,6 @@ export class Reflection {
       ) {
         return {value: newValue.slice(oldValue.length), mode: 'append'};
       }
-      // Same length, same elements — no update needed.
       if (
         newValue.length === oldValue.length &&
         oldValue.every((value, index) => value === newValue[index])
@@ -259,7 +236,6 @@ export class Reflection {
         return null;
       }
     }
-
     if (
       oldValue &&
       newValue &&
@@ -267,26 +243,36 @@ export class Reflection {
       typeof newValue === 'object' &&
       !Array.isArray(oldValue)
     ) {
+      // Use Object.keys (own-enumerable only); `for...in` walks the
+      // prototype chain and would yield stray entries for any object
+      // whose prototype carries enumerable props.
+      const oldKeys = Object.keys(oldValue);
+      const newKeys = Object.keys(newValue);
       const changes: any = {};
       let hasChanges = false;
-
-      for (const key in newValue) {
+      for (const key of newKeys) {
         if (newValue[key] !== oldValue[key]) {
           changes[key] = newValue[key];
           hasChanges = true;
         }
       }
-
-      // No changed keys and no removed keys — no update needed.
-      if (!hasChanges) {
-        const oldKeys = Object.keys(oldValue);
-        const newKeys = Object.keys(newValue);
-        if (oldKeys.length === newKeys.length) return null;
+      // Detect deleted keys: present in old, absent in new. The `merge`
+      // mode cannot express a delete — a client applying `{...current,
+      // ...delta}` would keep the stale key forever. So if any key was
+      // removed, fall through to a full replace.
+      let hasDeletions = false;
+      if (newKeys.length < oldKeys.length) {
+        for (const key of oldKeys) {
+          if (!Object.hasOwn(newValue, key)) {
+            hasDeletions = true;
+            break;
+          }
+        }
       }
-
+      if (hasDeletions) return {value: newValue};
+      if (!hasChanges && oldKeys.length === newKeys.length) return null;
       if (hasChanges) return {value: changes, mode: 'merge'};
     }
-
     if (
       typeof oldValue === 'string' &&
       typeof newValue === 'string' &&
@@ -295,7 +281,6 @@ export class Reflection {
       if (newValue.length === oldValue.length) return null;
       return {value: newValue.slice(oldValue.length), mode: 'append'};
     }
-
     return {value: newValue};
   }
 }

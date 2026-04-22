@@ -16,6 +16,11 @@ const ENTRY_POINTS = [
     json: 'client.json',
     heading: 'mixed-signals/client',
   },
+  {
+    src: 'codecs/index.ts',
+    json: 'codecs.json',
+    heading: 'mixed-signals/codecs',
+  },
 ];
 
 // Run typedoc to generate JSON for each entry point
@@ -95,7 +100,136 @@ function commentText(comment) {
     .trim();
 }
 
-function renderNode(node) {
+/**
+ * Canonical key for a child member — methods (kind 2048), properties (1024),
+ * and constructors (512). Two members sharing this key across interfaces are
+ * considered "the same member" and eligible to be factored into a shared
+ * base entry.
+ */
+function memberKey(m) {
+  const sig = m.signatures?.[0];
+  const sigStr = sig ? sigToLine(sig) : '';
+  const sigDoc = commentText(sig?.comment || m.comment);
+  const typ = m.type ? typeToString(m.type) : '';
+  return `${m.kind}::${m.name}::${sigStr}::${typ}::${sigDoc}`;
+}
+
+/**
+ * Given a set of interfaces (kind 256), find members that appear identically
+ * across 2+ of them and return (a) synthetic "shared base" groups to emit
+ * separately, and (b) the set of member keys to exclude from each
+ * interface's own rendering.
+ *
+ * Generic: any interface with members matching another interface's members
+ * triggers extraction. The group is keyed by the *set* of interface names it
+ * appears in, so A+B share one block, A+C share another, A+B+C share a
+ * third — each distinct participation set becomes its own synthesized entry.
+ */
+function extractSharedBase(interfaces) {
+  // memberKey → {member: Node, ifaces: Set<string>}
+  const keyIndex = new Map();
+  for (const iface of interfaces) {
+    for (const child of iface.children || []) {
+      if (child.kind !== 2048 && child.kind !== 1024 && child.kind !== 512)
+        continue;
+      const key = memberKey(child);
+      let entry = keyIndex.get(key);
+      if (!entry) {
+        entry = {member: child, ifaces: new Set()};
+        keyIndex.set(key, entry);
+      }
+      entry.ifaces.add(iface.name);
+    }
+  }
+
+  // Group keys by the sorted interface-name list they appear in. Any
+  // group with 2+ participating interfaces becomes a synthetic entry.
+  const groups = new Map();
+  for (const [key, {member, ifaces}] of keyIndex) {
+    if (ifaces.size < 2) continue;
+    const sortedNames = [...ifaces].sort();
+    const groupKey = sortedNames.join('|');
+    let group = groups.get(groupKey);
+    if (!group) {
+      group = {ifaces: sortedNames, members: [], keys: new Set()};
+      groups.set(groupKey, group);
+    }
+    group.members.push(member);
+    group.keys.add(key);
+  }
+
+  // Per-interface exclusion: drop any member whose key got factored out.
+  const exclude = new Map();
+  for (const group of groups.values()) {
+    for (const name of group.ifaces) {
+      let set = exclude.get(name);
+      if (!set) {
+        set = new Set();
+        exclude.set(name, set);
+      }
+      for (const key of group.keys) set.add(key);
+    }
+  }
+
+  return {groups: [...groups.values()], exclude};
+}
+
+/** Render a synthesized "shared by X, Y" entry for a group of common members. */
+function renderSharedGroup(group) {
+  const lines = [];
+  const names = group.ifaces.map((n) => `\`${n}\``).join(', ');
+  lines.push(`#### Shared by ${names}`);
+  lines.push('');
+  lines.push(`- Kind: **Shared base**`);
+  emitMembers(lines, group.members);
+  lines.push('');
+  return lines;
+}
+
+/**
+ * Emit a children-list block (constructors, methods, properties) with an
+ * optional per-key filter. Extracted so `renderNode` and `renderSharedGroup`
+ * share the same formatting.
+ */
+function emitMembers(lines, children, ownerName, excludeKeys) {
+  const filter = (c) =>
+    !excludeKeys || !excludeKeys.has(memberKey(c));
+
+  const ctors = children.filter((c) => c.kind === 512 && filter(c));
+  if (ctors.length) {
+    lines.push('- Constructor:');
+    for (const c of ctors) {
+      for (const sig of c.signatures || []) {
+        lines.push(`  - \`new ${ownerName}${sigToLine(sig)}\``);
+      }
+    }
+  }
+
+  const methods = children.filter((c) => c.kind === 2048 && filter(c));
+  if (methods.length) {
+    lines.push('- Methods:');
+    for (const m of methods) {
+      const sig = m.signatures?.[0];
+      const mDesc = commentText(sig?.comment);
+      lines.push(
+        `  - \`${m.name}${sig ? sigToLine(sig) : '()'}\`${mDesc ? ' — ' + mDesc : ''}`,
+      );
+    }
+  }
+
+  const props = children.filter((c) => c.kind === 1024 && filter(c));
+  if (props.length) {
+    lines.push('- Properties:');
+    for (const p of props) {
+      const pDesc = commentText(p.comment);
+      lines.push(
+        `  - \`${p.name}: ${typeToString(p.type)}\`${pDesc ? ' — ' + pDesc : ''}`,
+      );
+    }
+  }
+}
+
+function renderNode(node, excludeKeys) {
   const lines = [];
   const kind = KIND[node.kind] || 'Value';
   const desc = commentText(node.comment);
@@ -109,44 +243,11 @@ function renderNode(node) {
     lines.push('- Signatures:');
     for (const sig of node.signatures) {
       const sigDesc = commentText(sig.comment);
-      lines.push(
-        `  - \`${sigToLine(sig)}\`${sigDesc ? ' — ' + sigDesc : ''}`,
-      );
+      lines.push(`  - \`${sigToLine(sig)}\`${sigDesc ? ' — ' + sigDesc : ''}`);
     }
   }
 
-  const ctors = (node.children || []).filter((c) => c.kind === 512);
-  if (ctors.length) {
-    lines.push('- Constructor:');
-    for (const c of ctors) {
-      for (const sig of c.signatures || []) {
-        lines.push(`  - \`new ${node.name}${sigToLine(sig)}\``);
-      }
-    }
-  }
-
-  const methods = (node.children || []).filter((c) => c.kind === 2048);
-  if (methods.length) {
-    lines.push('- Methods:');
-    for (const m of methods) {
-      const sig = m.signatures?.[0];
-      const mDesc = commentText(sig?.comment);
-      lines.push(
-        `  - \`${m.name}${sig ? sigToLine(sig) : '()'}\`${mDesc ? ' — ' + mDesc : ''}`,
-      );
-    }
-  }
-
-  const props = (node.children || []).filter((c) => c.kind === 1024);
-  if (props.length) {
-    lines.push('- Properties:');
-    for (const p of props) {
-      const pDesc = commentText(p.comment);
-      lines.push(
-        `  - \`${p.name}: ${typeToString(p.type)}\`${pDesc ? ' — ' + pDesc : ''}`,
-      );
-    }
-  }
+  emitMembers(lines, node.children || [], node.name, excludeKeys);
 
   if (node.type) {
     lines.push(`- Type: \`${typeToString(node.type)}\``);
@@ -194,6 +295,28 @@ const apiLines = [
   '',
 ];
 
+/**
+ * Emit a set of exports, factoring out any members shared across 2+
+ * interfaces in the set into synthesized "Shared by …" entries. Each
+ * interface is then rendered with its shared members filtered out.
+ */
+function emitSection(nodes) {
+  const interfaces = nodes.filter((n) => n.kind === 256);
+  const {groups, exclude} = extractSharedBase(interfaces);
+
+  // Sort synthetic groups by their stringified iface list for stability.
+  const sorted = groups
+    .slice()
+    .sort((a, b) => a.ifaces.join(',').localeCompare(b.ifaces.join(',')));
+  for (const group of sorted) {
+    apiLines.push(...renderSharedGroup(group));
+  }
+
+  for (const node of nodes) {
+    apiLines.push(...renderNode(node, exclude.get(node.name)));
+  }
+}
+
 // Emit per-entrypoint sections (excluding shared types)
 for (const {entry, exports} of entryExports) {
   const specific = exports
@@ -202,9 +325,7 @@ for (const {entry, exports} of entryExports) {
   if (!specific.length) continue;
 
   apiLines.push(`### \`${entry.heading}\``, '');
-  for (const node of specific) {
-    apiLines.push(...renderNode(node));
-  }
+  emitSection(specific);
 }
 
 // Emit shared section
@@ -213,9 +334,7 @@ if (sharedNames.size) {
   const sharedNodes = entryExports[0].exports
     .filter((n) => sharedNames.has(n.name))
     .sort((a, b) => a.name.localeCompare(b.name));
-  for (const node of sharedNodes) {
-    apiLines.push(...renderNode(node));
-  }
+  emitSection(sharedNodes);
 }
 
 // Preserve authored content above ## API marker
