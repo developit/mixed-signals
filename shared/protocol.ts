@@ -101,18 +101,21 @@ export function parseWireMessage(message: string): ParsedWireMessage | null {
   };
 }
 
-// Unicode noncharacter used as a wire sentinel so `undefined` survives JSON
-// without colliding with any meaningful user string.
-const UNDEFINED_WIRE = '\uFDD0';
+// Tagged-object sentinel so `undefined` survives JSON. Matches the `@S`/`@M`
+// convention used for signal and model references in serialized payloads.
+const UNDEFINED_TAG = '@u';
 
 type Reviver = (key: string, value: unknown) => unknown;
 
+const isUndefinedTag = (value: unknown): boolean =>
+  typeof value === 'object' && value !== null && UNDEFINED_TAG in value;
+
 const replaceUndefined: Reviver = (_key, value) =>
-  value === undefined ? UNDEFINED_WIRE : value;
+  value === undefined ? {[UNDEFINED_TAG]: 1} : value;
 
 function wrapReviver(reviver?: Reviver): Reviver {
   return (key, value) => {
-    const v = value === UNDEFINED_WIRE ? undefined : value;
+    const v = isUndefinedTag(value) ? undefined : value;
     return reviver ? reviver(key, v) : v;
   };
 }

@@ -48,6 +48,7 @@ describe('protocol', () => {
   it('preserves undefined across the wire', () => {
     // Params: undefined roundtrips as undefined (not null).
     const call = formatCallMessage(1, 'm', [1, undefined, 'x']);
+    expect(call).toBe('M1:m:1,{"@u":1},"x"');
     const parsedCall = parseWireMessage(call);
     const params = parseWireParams<unknown[]>(
       (parsedCall as {payload: string}).payload,
