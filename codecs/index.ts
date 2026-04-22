@@ -113,6 +113,13 @@ const TYPED_ARRAY_CTORS: Record<
  * type this bundle knows about; otherwise `undefined` (pass through).
  */
 export const encode = (v: unknown): unknown => {
+  // `undefined` has no JSON representation and is otherwise dropped from
+  // object properties / coerced to `null` in arrays. Tag so the wire
+  // faithfully distinguishes `undefined` from absent / null. The
+  // decoding side is library-handled (see `hydrateTree`) because the
+  // decoder's `undefined`-means-pass-through convention collides with
+  // returning `undefined` as a match value.
+  if (v === undefined) return {[T]: 'u'};
   if (ArrayBuffer.isView(v)) {
     const name = (v as {constructor: {name: string}}).constructor.name;
     if (name in TYPED_ARRAY_CTORS) {

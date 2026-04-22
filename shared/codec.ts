@@ -12,8 +12,12 @@ import {
   type StringTransport,
   type Transport,
   type TransportContext,
+  TYPE_MARKER,
   type WireMessage,
 } from './protocol.ts';
+
+/** Reserved built-in tag the library resolves directly during hydrateTree. */
+const UNDEFINED_TAG = 'u';
 
 /**
  * Resolve a wire `@H` marker to a live peer-side value.
@@ -83,9 +87,53 @@ export class PeerCodec {
       return;
     }
     (this.transport as StringTransport).onMessage((data) => {
-      const msg = decodeStringWire(data.toString(), this.makeReviver());
+      const msg = this.decodeString(data.toString());
       if (msg) return cb(msg);
     });
+  }
+
+  /**
+   * String-mode inbound: parse the JSON payload without a reviver, then
+   * walk the resulting object tree with `hydrateTree`. We avoid the
+   * JSON.parse reviver specifically because a reviver that returns
+   * `undefined` *deletes the key from its parent object* — which would
+   * break tagged-undefined (`{@T:'u'}`) round-tripping. Running the walk
+   * in a separate pass is a bit more work per message but is the only way
+   * to faithfully restore `undefined` values in-place.
+   */
+  private decodeString(raw: string): WireMessage | null {
+    const parsed = parseWireMessage(raw);
+    if (!parsed) return null;
+    const revive = this.revive;
+    const decode = this.transport.decode;
+    const walk = (v: unknown) => hydrateTree(v, revive, decode);
+    switch (parsed.type) {
+      case 'call':
+        return {
+          type: 'call',
+          id: parsed.id,
+          method: parsed.method,
+          params: walk(parseWireParams(parsed.payload)) as unknown[],
+        };
+      case 'notification':
+        return {
+          type: 'notification',
+          method: parsed.method,
+          params: walk(parseWireParams(parsed.payload)) as unknown[],
+        };
+      case 'result':
+        return {
+          type: 'result',
+          id: parsed.id,
+          value: walk(parseWireValue(parsed.payload)),
+        };
+      case 'error':
+        return {
+          type: 'error',
+          id: parsed.id,
+          value: walk(parseWireValue(parsed.payload)),
+        };
+    }
   }
 
   private decodeRaw(
@@ -115,32 +163,6 @@ export class PeerCodec {
     } as WireMessage;
   }
 
-  private makeReviver():
-    | ((key: string, value: unknown) => unknown)
-    | undefined {
-    const revive = this.revive;
-    const decode = this.transport.decode;
-    if (!revive && !decode) return undefined;
-    return (_key, value) => {
-      // Reviver runs bottom-up natively; user `decode` fires here at each
-      // node (with already-decoded children), and `@H` resolution fires
-      // after to resolve handles on top of whatever `decode` produced.
-      let current: unknown = value;
-      if (decode && current && typeof current === 'object') {
-        const replaced = decode(current);
-        if (replaced !== undefined) current = replaced;
-      }
-      if (
-        revive &&
-        current &&
-        typeof current === 'object' &&
-        HANDLE_MARKER in current
-      ) {
-        return revive(current as Record<string, unknown>);
-      }
-      return current;
-    };
-  }
 }
 
 /**
@@ -159,6 +181,13 @@ export function hydrateTree(
   ctx?: TransportContext,
 ): unknown {
   if (tree === null || typeof tree !== 'object') return tree;
+  // Library-handled tags that collide with the decoder's pass-through
+  // sentinel. `{@T: 'u'}` resolves to `undefined` here because a decoder
+  // returning `undefined` is how "I don't match this value" is signaled —
+  // so tagged-undefined can't round-trip through the user-codec contract.
+  if ((tree as Record<string, unknown>)[TYPE_MARKER] === UNDEFINED_TAG) {
+    return undefined;
+  }
   if (revive && HANDLE_MARKER in (tree as Record<string, unknown>)) {
     // Walk body fields first, bottom-up, so nested markers (including `@T`
     // codec tags) inside `d` / `v` are hydrated before `revive` sees the
@@ -246,7 +275,15 @@ function walkOutbound(
   inArray: boolean,
   encode: ((value: unknown, ctx?: TransportContext) => unknown) | undefined,
 ): unknown {
-  if (value === null || value === undefined) return inArray ? null : value;
+  if (value === null) return value;
+  if (value === undefined) {
+    // Offer to the encode hook before falling back to JSON-compat behavior.
+    if (encode) {
+      const replaced = encode(value, ctx);
+      if (replaced !== undefined) return walkOutbound(replaced, ctx, inArray, encode);
+    }
+    return inArray ? null : value;
+  }
   const t = typeof value;
   if (t === 'string' || t === 'number' || t === 'boolean') return value;
   if (t === 'bigint') {
@@ -387,37 +424,3 @@ function encodeWireMessage(msg: WireMessage): string {
   }
 }
 
-function decodeStringWire(
-  raw: string,
-  reviver: ((key: string, value: unknown) => unknown) | undefined,
-): WireMessage | null {
-  const parsed = parseWireMessage(raw);
-  if (!parsed) return null;
-  switch (parsed.type) {
-    case 'call':
-      return {
-        type: 'call',
-        id: parsed.id,
-        method: parsed.method,
-        params: parseWireParams(parsed.payload, reviver),
-      };
-    case 'notification':
-      return {
-        type: 'notification',
-        method: parsed.method,
-        params: parseWireParams(parsed.payload, reviver),
-      };
-    case 'result':
-      return {
-        type: 'result',
-        id: parsed.id,
-        value: parseWireValue(parsed.payload, reviver),
-      };
-    case 'error':
-      return {
-        type: 'error',
-        id: parsed.id,
-        value: parseWireValue(parsed.payload, reviver),
-      };
-  }
-}
