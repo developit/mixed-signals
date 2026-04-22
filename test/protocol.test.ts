@@ -45,28 +45,42 @@ describe('protocol', () => {
     });
   });
 
-  it('encodes undefined params as null (valid JSON roundtrip)', () => {
+  it('preserves undefined across the wire', () => {
+    // Params: undefined roundtrips as undefined (not null).
     const call = formatCallMessage(1, 'm', [1, undefined, 'x']);
-    expect(call).toBe('M1:m:1,null,"x"');
-    const parsed = parseWireMessage(call);
-    expect(parsed).toEqual({
-      type: 'call',
-      id: 1,
-      method: 'm',
-      payload: '1,null,"x"',
-    });
-    expect(parseWireParams((parsed as {payload: string}).payload)).toEqual([
-      1,
-      null,
-      'x',
-    ]);
+    const parsedCall = parseWireMessage(call);
+    const params = parseWireParams<unknown[]>(
+      (parsedCall as {payload: string}).payload,
+    );
+    expect(params.length).toBe(3);
+    expect(params[0]).toBe(1);
+    expect(params[1]).toBeUndefined();
+    expect(params[2]).toBe('x');
+    // null stays null — the two are distinct on the wire.
+    expect(parseWireParams<unknown[]>('null')).toEqual([null]);
 
-    const notification = formatNotificationMessage('@W', [
-      undefined,
-      undefined,
-    ]);
-    expect(notification).toBe('N:@W:null,null');
-    expect(parseWireParams('null,null')).toEqual([null, null]);
+    // Notifications: same preservation.
+    const note = formatNotificationMessage('@W', [undefined, undefined]);
+    const notePayload = (parseWireMessage(note) as {payload: string}).payload;
+    const noteParams = parseWireParams<unknown[]>(notePayload);
+    expect(noteParams.length).toBe(2);
+    expect(noteParams[0]).toBeUndefined();
+    expect(noteParams[1]).toBeUndefined();
+
+    // Results: undefined roundtrips instead of becoming invalid JSON.
+    const result = formatResultMessage(4, undefined);
+    const resultPayload = (parseWireMessage(result) as {payload: string})
+      .payload;
+    expect(parseWireValue(resultPayload)).toBeUndefined();
+
+    // Nested undefined inside a result array is preserved (no null coercion).
+    const arr = formatResultMessage(5, [1, undefined, 3]);
+    const arrPayload = (parseWireMessage(arr) as {payload: string}).payload;
+    const revivedArr = parseWireValue<unknown[]>(arrPayload);
+    expect(revivedArr.length).toBe(3);
+    expect(revivedArr[0]).toBe(1);
+    expect(revivedArr[1]).toBeUndefined();
+    expect(revivedArr[2]).toBe(3);
   });
 
   it('parses params and values with empty payloads and revivers', () => {

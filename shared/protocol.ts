@@ -101,22 +101,38 @@ export function parseWireMessage(message: string): ParsedWireMessage | null {
   };
 }
 
+// Unicode noncharacter used as a wire sentinel so `undefined` survives JSON
+// without colliding with any meaningful user string.
+const UNDEFINED_WIRE = '\uFDD0';
+
+type Reviver = (key: string, value: unknown) => unknown;
+
+const replaceUndefined: Reviver = (_key, value) =>
+  value === undefined ? UNDEFINED_WIRE : value;
+
+function wrapReviver(reviver?: Reviver): Reviver {
+  return (key, value) => {
+    const v = value === UNDEFINED_WIRE ? undefined : value;
+    return reviver ? reviver(key, v) : v;
+  };
+}
+
 export function parseWireParams<T = unknown[]>(
   payload: string,
-  reviver?: (key: string, value: unknown) => unknown,
+  reviver?: Reviver,
 ): T {
-  return JSON.parse(payload ? `[${payload}]` : '[]', reviver) as T;
+  return JSON.parse(payload ? `[${payload}]` : '[]', wrapReviver(reviver)) as T;
 }
 
 export function parseWireValue<T = unknown>(
   payload: string,
-  reviver?: (key: string, value: unknown) => unknown,
+  reviver?: Reviver,
 ): T {
-  return JSON.parse(payload, reviver) as T;
+  return JSON.parse(payload, wrapReviver(reviver)) as T;
 }
 
 function stringifyWireParams(params: readonly unknown[] = []): string {
-  return JSON.stringify(params).slice(1, -1);
+  return JSON.stringify(params, replaceUndefined).slice(1, -1);
 }
 
 export function formatCallMessage(
@@ -135,9 +151,9 @@ export function formatNotificationMessage(
 }
 
 export function formatResultMessage(id: number, result: unknown): string {
-  return `R${id}:${JSON.stringify(result)}`;
+  return `R${id}:${JSON.stringify(result, replaceUndefined)}`;
 }
 
 export function formatErrorMessage(id: number, error: unknown): string {
-  return `E${id}:${JSON.stringify(error)}`;
+  return `E${id}:${JSON.stringify(error, replaceUndefined)}`;
 }
