@@ -108,7 +108,10 @@ const UNDEFINED_TAG = '@u';
 type Reviver = (key: string, value: unknown) => unknown;
 
 const isUndefinedTag = (value: unknown): boolean =>
-  typeof value === 'object' && value !== null && UNDEFINED_TAG in value;
+  typeof value === 'object' &&
+  value !== null &&
+  UNDEFINED_TAG in value &&
+  Object.keys(value).length === 1;
 
 const replaceUndefined: Reviver = (_key, value) =>
   value === undefined ? {[UNDEFINED_TAG]: 1} : value;

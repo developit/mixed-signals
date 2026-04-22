@@ -82,6 +82,13 @@ describe('protocol', () => {
     expect(revivedArr[0]).toBe(1);
     expect(revivedArr[1]).toBeUndefined();
     expect(revivedArr[2]).toBe(3);
+
+    // A user object that happens to have an `@u` key plus other keys is
+    // NOT the sentinel — only a lone {"@u": ...} triggers the replacement.
+    const collision = formatResultMessage(6, {'@u': 1, other: 2});
+    const collisionPayload = (parseWireMessage(collision) as {payload: string})
+      .payload;
+    expect(parseWireValue(collisionPayload)).toEqual({'@u': 1, other: 2});
   });
 
   it('parses params and values with empty payloads and revivers', () => {
