@@ -45,6 +45,52 @@ describe('protocol', () => {
     });
   });
 
+  it('preserves undefined across the wire', () => {
+    // Params: undefined roundtrips as undefined (not null).
+    const call = formatCallMessage(1, 'm', [1, undefined, 'x']);
+    expect(call).toBe('M1:m:1,{"@u":1},"x"');
+    const parsedCall = parseWireMessage(call);
+    const params = parseWireParams<unknown[]>(
+      (parsedCall as {payload: string}).payload,
+    );
+    expect(params.length).toBe(3);
+    expect(params[0]).toBe(1);
+    expect(params[1]).toBeUndefined();
+    expect(params[2]).toBe('x');
+    // null stays null — the two are distinct on the wire.
+    expect(parseWireParams<unknown[]>('null')).toEqual([null]);
+
+    // Notifications: same preservation.
+    const note = formatNotificationMessage('@W', [undefined, undefined]);
+    const notePayload = (parseWireMessage(note) as {payload: string}).payload;
+    const noteParams = parseWireParams<unknown[]>(notePayload);
+    expect(noteParams.length).toBe(2);
+    expect(noteParams[0]).toBeUndefined();
+    expect(noteParams[1]).toBeUndefined();
+
+    // Results: undefined roundtrips instead of becoming invalid JSON.
+    const result = formatResultMessage(4, undefined);
+    const resultPayload = (parseWireMessage(result) as {payload: string})
+      .payload;
+    expect(parseWireValue(resultPayload)).toBeUndefined();
+
+    // Nested undefined inside a result array is preserved (no null coercion).
+    const arr = formatResultMessage(5, [1, undefined, 3]);
+    const arrPayload = (parseWireMessage(arr) as {payload: string}).payload;
+    const revivedArr = parseWireValue<unknown[]>(arrPayload);
+    expect(revivedArr.length).toBe(3);
+    expect(revivedArr[0]).toBe(1);
+    expect(revivedArr[1]).toBeUndefined();
+    expect(revivedArr[2]).toBe(3);
+
+    // A user object that happens to have an `@u` key plus other keys is
+    // NOT the sentinel — only a lone {"@u": ...} triggers the replacement.
+    const collision = formatResultMessage(6, {'@u': 1, other: 2});
+    const collisionPayload = (parseWireMessage(collision) as {payload: string})
+      .payload;
+    expect(parseWireValue(collisionPayload)).toEqual({'@u': 1, other: 2});
+  });
+
   it('parses params and values with empty payloads and revivers', () => {
     const reviver = (_key: string, value: unknown) => {
       if (typeof value === 'number') return value * 2;
