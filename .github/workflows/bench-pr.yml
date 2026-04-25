@@ -1,0 +1,124 @@
+name: PR Benchmarks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  bench-base:
+    name: Benchmark base SHA
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm bench --profile=smoke --output=bench-base-node.json
+      - run: pnpm bench:d8 --profile=smoke --output=bench/results/bench-base-d8.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-base
+          path: |
+            bench/results/bench-base-node.json
+            bench/results/bench-base-d8.json
+
+  bench-head:
+    name: Benchmark PR head
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm bench --profile=smoke --output=bench-head-node.json
+      - run: pnpm bench:d8 --profile=smoke --output=bench/results/bench-head-d8.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-head
+          path: |
+            bench/results/bench-head-node.json
+            bench/results/bench-head-d8.json
+
+  compare-and-comment:
+    name: Compare and comment
+    runs-on: ubuntu-latest
+    needs: [bench-base, bench-head]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: bench-base
+          path: artifacts/base
+      - uses: actions/download-artifact@v4
+        with:
+          name: bench-head
+          path: artifacts/head
+      - run: |
+          node bench/scripts/pr-benchmark-report.mjs \
+            --base-node=artifacts/base/bench/results/bench-base-node.json \
+            --head-node=artifacts/head/bench/results/bench-head-node.json \
+            --base-d8=artifacts/base/bench/results/bench-base-d8.json \
+            --head-d8=artifacts/head/bench/results/bench-head-d8.json \
+            --out=bench-report.md
+      - name: Node regression gate
+        id: node_gate
+        continue-on-error: true
+        run: pnpm bench:compare --base=artifacts/base/bench/results/bench-base-node.json --head=artifacts/head/bench/results/bench-head-node.json
+      - uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const fs = require('node:fs');
+            const body = fs.readFileSync('bench-report.md', 'utf8');
+            const gateFailed = '${{ steps.node_gate.outcome }}' === 'failure';
+            const marker = '<!-- mixed-signals-bench-report -->';
+            const status = gateFailed
+              ? '⚠️ Node regression gate failed (see workflow logs).'
+              : '✅ Node regression gate passed.';
+            const finalBody = `${marker}\n${status}\n\n${body}`;
+            const {owner, repo} = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body: finalBody,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body: finalBody,
+              });
+            }
+      - name: Fail workflow on regression gate
+        if: steps.node_gate.outcome == 'failure'
+        run: exit 1

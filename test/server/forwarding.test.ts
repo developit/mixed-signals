@@ -3,7 +3,8 @@ import {afterEach, describe, expect, it, vi} from 'vitest';
 import {createReflectedModel} from '../../client/model.ts';
 import type {WireContext} from '../../client/reflection.ts';
 import {RPCClient} from '../../client/rpc.ts';
-import {addPrefix, stripPrefix} from '../../server/forwarding.ts';
+import {addPrefix, ForwardedUpstream, stripPrefix} from '../../server/forwarding.ts';
+import {parseWireMessage, parseWireParams} from '../../shared/protocol.ts';
 import {createModel} from '../../server/model.ts';
 import {RPC} from '../../server/rpc.ts';
 import type {Transport} from '../../shared/protocol.ts';
@@ -97,6 +98,10 @@ class BrokerProject {
     this.name.value = next;
     return {ok: true};
   }
+
+  acceptsRef(project: BrokerProject) {
+    return project === this;
+  }
 }
 
 class BrokerSessions {
@@ -157,6 +162,7 @@ interface ProjectApi {
   id: Signal<string>;
   name: Signal<string>;
   rename(next: string): Promise<{ok: boolean}>;
+  acceptsRef(project: ProjectApi): Promise<boolean>;
 }
 
 interface SessionsApi {
@@ -260,7 +266,7 @@ describe('protocol-level forwarding', () => {
     // --- Browser setup ---
     const ProjectModel = createReflectedModel<ProjectApi>(
       ['id', 'name'],
-      ['rename'],
+      ['rename', 'acceptsRef'],
     );
     let browser!: RPCClient;
     const ctx = {
@@ -593,5 +599,32 @@ describe('protocol-level forwarding', () => {
     expect(browser.root.project.name.value).toBe('Updated');
 
     stopName();
+  });
+
+  it('strips forwarded prefixes from @M method arguments', async () => {
+    let outbound = '';
+    const transport: Transport = {
+      send(data: string) {
+        outbound = data;
+      },
+      onMessage() {},
+    };
+
+    const upstream = new ForwardedUpstream('2', transport, {
+      onUpstreamRootChanged() {},
+      send() {},
+    });
+
+    upstream.forwardCall(
+      'client-1',
+      10,
+      'abc#acceptsRef',
+      JSON.stringify({'@M': 'BrokerProject#2_77'}),
+    );
+
+    const parsed = parseWireMessage(outbound);
+    expect(parsed?.type).toBe('call');
+    const params = parseWireParams(parsed!.payload);
+    expect(params).toEqual([{'@M': 'BrokerProject#77'}]);
   });
 });

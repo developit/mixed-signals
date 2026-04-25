@@ -29,6 +29,7 @@ export class Reflection {
   private rpc: RpcSender;
   private instances: Instances;
   private modelRegistry = new Map<ModelConstructor, string>();
+  private modelNameCache = new WeakMap<object, string | null>();
   private autoIds = new WeakMap<object, string>();
 
   constructor(rpc: RpcSender, instances: Instances) {
@@ -42,18 +43,25 @@ export class Reflection {
 
   isModel(val: any): boolean {
     if (typeof val !== 'object' || val === null) return false;
-
-    for (const Ctor of this.modelRegistry.keys()) {
-      if (val instanceof Ctor) return true;
-    }
-
-    return false;
+    return this.getModelType(val) !== undefined;
   }
 
   getModelType(val: any): string | undefined {
-    for (const [Ctor, name] of this.modelRegistry) {
-      if (val instanceof Ctor) return name;
+    if (typeof val !== 'object' || val === null) return undefined;
+
+    const cached = this.modelNameCache.get(val);
+    if (cached !== undefined) {
+      return cached === null ? undefined : cached;
     }
+
+    for (const [Ctor, name] of this.modelRegistry) {
+      if (val instanceof Ctor) {
+        this.modelNameCache.set(val, name);
+        return name;
+      }
+    }
+
+    this.modelNameCache.set(val, null);
   }
 
   getInstanceId(instance: any): string {
@@ -165,8 +173,7 @@ export class Reflection {
   serialize(value: any, clientId?: ClientId): any {
     const serialized = this.serializeValue(value, clientId);
     if (serialized === undefined) return null;
-
-    return JSON.parse(JSON.stringify(serialized));
+    return serialized;
   }
 
   watch(clientId: ClientId, signalId: SignalId) {
