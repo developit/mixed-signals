@@ -16,6 +16,10 @@ jobs:
   bench-base:
     name: Benchmark base SHA
     runs-on: ubuntu-latest
+    outputs:
+      node_missing: ${{ steps.run_base.outputs.node_missing }}
+      d8_missing: ${{ steps.run_base.outputs.d8_missing }}
+      any_missing: ${{ steps.run_base.outputs.any_missing }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,9 +31,48 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm bench --profile=smoke --output=bench-base-node.json
-      - run: pnpm bench:d8 --profile=smoke --output=bench/results/bench-base-d8.json
+      - name: Run base benchmarks (tolerant)
+        id: run_base
+        shell: bash
+        run: |
+          mkdir -p bench/results
+
+          node_missing=false
+          d8_missing=false
+
+          if ! pnpm install --frozen-lockfile; then
+            node_missing=true
+            d8_missing=true
+          fi
+
+          if [ "$node_missing" = "false" ]; then
+            if ! pnpm bench --profile=smoke --output=bench-base-node.json; then
+              node_missing=true
+            fi
+          fi
+
+          if [ "$d8_missing" = "false" ]; then
+            if ! pnpm bench:d8 --profile=smoke --output=bench/results/bench-base-d8.json; then
+              d8_missing=true
+            fi
+          fi
+
+          if [ "$node_missing" = "true" ]; then
+            printf '{"missing":true,"source":"base-node","reason":"bench command unavailable or failed"}\n' > bench/results/bench-base-node.json
+          fi
+
+          if [ "$d8_missing" = "true" ]; then
+            printf '{"missing":true,"source":"base-d8","reason":"bench:d8 command unavailable or failed"}\n' > bench/results/bench-base-d8.json
+          fi
+
+          any_missing=false
+          if [ "$node_missing" = "true" ] || [ "$d8_missing" = "true" ]; then
+            any_missing=true
+          fi
+
+          echo "node_missing=$node_missing" >> "$GITHUB_OUTPUT"
+          echo "d8_missing=$d8_missing" >> "$GITHUB_OUTPUT"
+          echo "any_missing=$any_missing" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: bench-base
@@ -40,6 +83,10 @@ jobs:
   bench-head:
     name: Benchmark PR head
     runs-on: ubuntu-latest
+    outputs:
+      node_missing: ${{ steps.run_head.outputs.node_missing }}
+      d8_missing: ${{ steps.run_head.outputs.d8_missing }}
+      any_missing: ${{ steps.run_head.outputs.any_missing }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -49,9 +96,48 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm bench --profile=smoke --output=bench-head-node.json
-      - run: pnpm bench:d8 --profile=smoke --output=bench/results/bench-head-d8.json
+      - name: Run head benchmarks (tolerant)
+        id: run_head
+        shell: bash
+        run: |
+          mkdir -p bench/results
+
+          node_missing=false
+          d8_missing=false
+
+          if ! pnpm install --frozen-lockfile; then
+            node_missing=true
+            d8_missing=true
+          fi
+
+          if [ "$node_missing" = "false" ]; then
+            if ! pnpm bench --profile=smoke --output=bench-head-node.json; then
+              node_missing=true
+            fi
+          fi
+
+          if [ "$d8_missing" = "false" ]; then
+            if ! pnpm bench:d8 --profile=smoke --output=bench/results/bench-head-d8.json; then
+              d8_missing=true
+            fi
+          fi
+
+          if [ "$node_missing" = "true" ]; then
+            printf '{"missing":true,"source":"head-node","reason":"bench command unavailable or failed"}\n' > bench/results/bench-head-node.json
+          fi
+
+          if [ "$d8_missing" = "true" ]; then
+            printf '{"missing":true,"source":"head-d8","reason":"bench:d8 command unavailable or failed"}\n' > bench/results/bench-head-d8.json
+          fi
+
+          any_missing=false
+          if [ "$node_missing" = "true" ] || [ "$d8_missing" = "true" ]; then
+            any_missing=true
+          fi
+
+          echo "node_missing=$node_missing" >> "$GITHUB_OUTPUT"
+          echo "d8_missing=$d8_missing" >> "$GITHUB_OUTPUT"
+          echo "any_missing=$any_missing" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: bench-head
@@ -90,6 +176,7 @@ jobs:
             --out=bench-report.md
       - name: Node regression gate
         id: node_gate
+        if: needs.bench-base.outputs.node_missing != 'true' && needs.bench-head.outputs.node_missing != 'true'
         continue-on-error: true
         run: pnpm bench:compare --base=artifacts/base/bench/results/bench-base-node.json --head=artifacts/head/bench/results/bench-head-node.json
       - uses: actions/github-script@v7
@@ -99,10 +186,14 @@ jobs:
             const fs = require('node:fs');
             const body = fs.readFileSync('bench-report.md', 'utf8');
             const gateFailed = '${{ steps.node_gate.outcome }}' === 'failure';
+            const baseMissing = '${{ needs.bench-base.outputs.any_missing }}' === 'true';
+            const headMissing = '${{ needs.bench-head.outputs.any_missing }}' === 'true';
             const marker = '<!-- mixed-signals-bench-report -->';
-            const status = gateFailed
-              ? '⚠️ Node regression gate failed (see workflow logs).'
-              : '✅ Node regression gate passed.';
+            let status = '✅ Node regression gate passed.';
+            if (gateFailed) status = '⚠️ Node regression gate failed (see workflow logs).';
+            if (baseMissing || headMissing) {
+              status = '❌ Benchmark inputs were missing for base/head (likely benchmark scripts not present on one side).';
+            }
             const finalBody = `${marker}\n${status}\n\n${body}`;
             const {owner, repo} = context.repo;
             const issue_number = context.payload.pull_request.number;
@@ -129,5 +220,5 @@ jobs:
               });
             }
       - name: Fail workflow on regression gate
-        if: steps.node_gate.outcome == 'failure'
+        if: steps.node_gate.outcome == 'failure' || needs.bench-base.outputs.any_missing == 'true' || needs.bench-head.outputs.any_missing == 'true'
         run: exit 1
