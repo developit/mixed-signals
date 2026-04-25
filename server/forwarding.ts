@@ -225,8 +225,10 @@ export class ForwardedUpstream {
     const upstreamCallId = this.nextUpstreamCallId++;
     this.pendingCalls.set(upstreamCallId, {clientId, callId: downstreamCallId});
 
-    // TODO: strip prefix from params when methods accept model/signal references as arguments
-    const params = parseWireParams(rawPayload);
+    const parsedParams = parseWireParams(rawPayload);
+    const params = needsRewrite(rawPayload)
+      ? stripPrefix(this.prefix, parsedParams)
+      : parsedParams;
     this.transport.send(formatCallMessage(upstreamCallId, method, params));
   }
 

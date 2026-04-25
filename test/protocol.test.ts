@@ -43,6 +43,28 @@ describe('protocol', () => {
       id: 5,
       payload: '{"message":"boom"}',
     });
+
+    // Empty params remain compact and parse correctly.
+    const emptyCall = formatCallMessage(6, 'noop', []);
+    expect(emptyCall).toBe('M6:noop:');
+    expect(parseWireMessage(emptyCall)).toEqual({
+      type: 'call',
+      id: 6,
+      method: 'noop',
+      payload: '',
+    });
+
+    // Complex params survive comma-heavy payloads.
+    const complex = formatCallMessage(7, 'merge', [
+      {a: [1, 2, 3], text: 'x,y'},
+      {nested: {ok: true}},
+    ]);
+    const parsedComplex = parseWireMessage(complex);
+    expect(parsedComplex?.type).toBe('call');
+    expect(parseWireParams(parsedComplex!.payload)).toEqual([
+      {a: [1, 2, 3], text: 'x,y'},
+      {nested: {ok: true}},
+    ]);
   });
 
   it('parses params and values with empty payloads and revivers', () => {
