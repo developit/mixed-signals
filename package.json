@@ -33,13 +33,13 @@
     "changeset": "changeset",
     "version-packages": "changeset version",
     "release": "changeset publish",
-    "bench": "tsx bench/index.ts --mode=inproc --profile=dev",
-    "bench:workers": "tsx bench/index.ts --mode=workers --profile=dev",
-    "bench:full": "tsx bench/index.ts --mode=inproc --profile=full",
+    "bench": "node bench/index.ts --mode=inproc --profile=dev",
+    "bench:workers": "node bench/index.ts --mode=workers --profile=dev",
+    "bench:full": "node bench/index.ts --mode=inproc --profile=full",
     "bench:d8": "node bench/scripts/run-d8.mjs --profile=full",
     "bench:d8:debug": "node bench/scripts/run-d8.mjs --debug --profile=full",
-    "bench:compare": "tsx bench/index.ts compare",
-    "bench:baseline:update": "tsx bench/index.ts --baseline-update"
+    "bench:compare": "node bench/index.ts compare",
+    "bench:baseline:update": "node bench/index.ts --baseline-update"
   },
   "publishConfig": {
     "access": "public",
@@ -78,7 +78,6 @@
     "tinybench": "^5.1.0",
     "tslib": "^2.8.1",
     "tsdown": "^0.20.0",
-    "tsx": "^4.20.6",
     "typedoc": "^0.28.13",
     "typescript": "^5.7.0",
     "vitest": "^4.0.0"
