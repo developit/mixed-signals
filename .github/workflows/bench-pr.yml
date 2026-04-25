@@ -46,7 +46,7 @@ jobs:
           fi
 
           if [ "$node_missing" = "false" ]; then
-            if ! pnpm bench --profile=smoke --output=bench-base-node.json; then
+            if ! pnpm bench --profile=smoke --output=bench/results/bench-base-node.json; then
               node_missing=true
             fi
           fi
@@ -111,7 +111,7 @@ jobs:
           fi
 
           if [ "$node_missing" = "false" ]; then
-            if ! pnpm bench --profile=smoke --output=bench-head-node.json; then
+            if ! pnpm bench --profile=smoke --output=bench/results/bench-head-node.json; then
               node_missing=true
             fi
           fi

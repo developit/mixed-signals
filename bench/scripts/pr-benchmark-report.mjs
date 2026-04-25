@@ -11,7 +11,7 @@ function fmt(n, digits = 2) {
 }
 
 function normalizeNode(report) {
-  if (report?.missing) return [];
+  if (report?.missing || !Array.isArray(report?.results)) return [];
   return report.results.map((r) => ({
     key: `${r.scenario}|${r.mode}|${r.topology}`,
     scenario: r.scenario,
@@ -21,7 +21,7 @@ function normalizeNode(report) {
 }
 
 function normalizeD8(report) {
-  if (report?.missing) return [];
+  if (report?.missing || !Array.isArray(report?.results)) return [];
   return report.results.map((r) => ({
     key: r.scenario,
     scenario: r.scenario,
@@ -33,7 +33,8 @@ function normalizeD8(report) {
 function table(title, baseRows, headRows) {
   const baseMap = new Map(baseRows.map((r) => [r.key, r]));
   const rows = [];
-  for (const head of headRows) {
+  for (let i = 0; i < headRows.length; i++) {
+    const head = headRows[i];
     const base = baseMap.get(head.key);
     if (!base) continue;
     rows.push(
@@ -51,6 +52,20 @@ function table(title, baseRows, headRows) {
   ].join('\n');
 }
 
+async function readReport(path, source) {
+  try {
+    const raw = await fs.readFile(path, 'utf8');
+    return JSON.parse(raw);
+  } catch (err) {
+    const code = err && typeof err === 'object' && 'code' in err ? err.code : 'unknown';
+    return {
+      missing: true,
+      source,
+      reason: `unable to read ${path} (${code})`,
+    };
+  }
+}
+
 async function main() {
   const args = Object.fromEntries(
     process.argv.slice(2).map((a) => {
@@ -59,17 +74,12 @@ async function main() {
     }),
   );
 
-  const [baseNodeRaw, headNodeRaw, baseD8Raw, headD8Raw] = await Promise.all([
-    fs.readFile(args['--base-node'], 'utf8'),
-    fs.readFile(args['--head-node'], 'utf8'),
-    fs.readFile(args['--base-d8'], 'utf8'),
-    fs.readFile(args['--head-d8'], 'utf8'),
+  const [baseNodeJson, headNodeJson, baseD8Json, headD8Json] = await Promise.all([
+    readReport(args['--base-node'], 'base-node'),
+    readReport(args['--head-node'], 'head-node'),
+    readReport(args['--base-d8'], 'base-d8'),
+    readReport(args['--head-d8'], 'head-d8'),
   ]);
-
-  const baseNodeJson = JSON.parse(baseNodeRaw);
-  const headNodeJson = JSON.parse(headNodeRaw);
-  const baseD8Json = JSON.parse(baseD8Raw);
-  const headD8Json = JSON.parse(headD8Raw);
 
   const baseNode = normalizeNode(baseNodeJson);
   const headNode = normalizeNode(headNodeJson);
