@@ -60,6 +60,7 @@
     "type": "git",
     "url": "git+https://github.com/developit/mixed-signals.git"
   },
+  "packageManager": "pnpm@10.13.1",
   "peerDependencies": {
     "@preact/signals-core": ">=1.14.0"
   },
