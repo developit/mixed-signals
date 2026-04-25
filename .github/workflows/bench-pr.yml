@@ -167,18 +167,36 @@ jobs:
         with:
           name: bench-head
           path: artifacts/head
+      - name: Resolve artifact file paths
+        id: resolve_paths
+        shell: bash
+        run: |
+          base_node=$(find artifacts/base -type f -name 'bench-base-node.json' 2>/dev/null | head -n 1)
+          head_node=$(find artifacts/head -type f -name 'bench-head-node.json' 2>/dev/null | head -n 1)
+          base_d8=$(find artifacts/base -type f -name 'bench-base-d8.json' 2>/dev/null | head -n 1)
+          head_d8=$(find artifacts/head -type f -name 'bench-head-d8.json' 2>/dev/null | head -n 1)
+
+          if [ -z "$base_node" ]; then base_node='artifacts/base/bench/results/bench-base-node.json'; fi
+          if [ -z "$head_node" ]; then head_node='artifacts/head/bench/results/bench-head-node.json'; fi
+          if [ -z "$base_d8" ]; then base_d8='artifacts/base/bench/results/bench-base-d8.json'; fi
+          if [ -z "$head_d8" ]; then head_d8='artifacts/head/bench/results/bench-head-d8.json'; fi
+
+          echo "base_node=$base_node" >> "$GITHUB_OUTPUT"
+          echo "head_node=$head_node" >> "$GITHUB_OUTPUT"
+          echo "base_d8=$base_d8" >> "$GITHUB_OUTPUT"
+          echo "head_d8=$head_d8" >> "$GITHUB_OUTPUT"
       - run: |
           node bench/scripts/pr-benchmark-report.mjs \
-            --base-node=artifacts/base/bench/results/bench-base-node.json \
-            --head-node=artifacts/head/bench/results/bench-head-node.json \
-            --base-d8=artifacts/base/bench/results/bench-base-d8.json \
-            --head-d8=artifacts/head/bench/results/bench-head-d8.json \
+            --base-node=${{ steps.resolve_paths.outputs.base_node }} \
+            --head-node=${{ steps.resolve_paths.outputs.head_node }} \
+            --base-d8=${{ steps.resolve_paths.outputs.base_d8 }} \
+            --head-d8=${{ steps.resolve_paths.outputs.head_d8 }} \
             --out=bench-report.md
       - name: Node regression gate
         id: node_gate
         if: needs.bench-base.outputs.node_missing != 'true' && needs.bench-head.outputs.node_missing != 'true'
         continue-on-error: true
-        run: pnpm bench:compare --base=artifacts/base/bench/results/bench-base-node.json --head=artifacts/head/bench/results/bench-head-node.json
+        run: pnpm bench:compare --base=${{ steps.resolve_paths.outputs.base_node }} --head=${{ steps.resolve_paths.outputs.head_node }}
       - uses: actions/github-script@v7
         if: always()
         with:
