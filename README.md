@@ -14,8 +14,8 @@ The only dependency is `@preact/signals-core` (>=1.8.0).
 
 **mixed-signals** reflects server-side Preact Models and Signals (anything created via `@preact/signals-core`) to connected clients in real-time. Signals on the server are serialized with identity markers, and the client reconstructs them as local signals that stay in sync via a lightweight wire protocol.
 
-- **Server** models use `createModel()` from `signal-wire/server` _(a thin wrapper around `@preact/signals-core`'s `createModel`)_
-- **Client** models use `createReflectedModel()` from `signal-wire/client` to create local proxies that mirror server state
+- **Server** models use `createModel()` from `mixed-signals/server` _(a thin wrapper around `@preact/signals-core`'s `createModel`)_
+- **Client** models use `createReflectedModel()` from `mixed-signals/client` to create local proxies that mirror server state
 - An **RPC** layer handles method calls (client → server) and signal updates (server → client)
 - Delta compression for arrays (append), objects (merge), and strings (append) minimizes bandwidth
 
