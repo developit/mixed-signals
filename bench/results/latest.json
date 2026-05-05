@@ -1,0 +1,236 @@
+{
+  "metadata": {
+    "timestamp": "2026-04-13T18:54:12.600Z",
+    "gitSha": "bd3674b",
+    "node": "v22.21.1",
+    "platform": "linux/x64",
+    "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+    "profile": "smoke"
+  },
+  "results": [
+    {
+      "scenario": "method-reflected/root",
+      "mode": "inproc",
+      "topology": "direct",
+      "transport": "microtask",
+      "params": {
+        "concurrency": 1,
+        "payload": "noop"
+      },
+      "metrics": {
+        "opsPerSec": 103162.25503108859,
+        "sampleCount": 257910,
+        "cv": 3.441234239600368,
+        "latency": {
+          "p50": 0.006,
+          "p95": 0.013,
+          "p99": 0.035,
+          "max": 8.402,
+          "count": 257910
+        }
+      }
+    },
+    {
+      "scenario": "method-reflected/nested",
+      "mode": "inproc",
+      "topology": "direct",
+      "transport": "microtask",
+      "params": {
+        "concurrency": 1,
+        "projects": 32
+      },
+      "metrics": {
+        "opsPerSec": 82977.13680461264,
+        "sampleCount": 207443,
+        "cv": 1.9620721463691084,
+        "latency": {
+          "p50": 0.009,
+          "p95": 0.016,
+          "p99": 0.023,
+          "max": 4.678,
+          "count": 207443
+        }
+      }
+    },
+    {
+      "scenario": "initial-large-graph",
+      "mode": "inproc",
+      "topology": "direct",
+      "transport": "microtask",
+      "params": {
+        "size": 512
+      },
+      "metrics": {
+        "opsPerSec": 12.654352466007031,
+        "sampleCount": 33,
+        "cv": 0.5177932125706952,
+        "latency": {
+          "p50": 67.071,
+          "p95": 126.975,
+          "p99": 284.415,
+          "max": 284.365,
+          "count": 33
+        },
+        "memory": {
+          "snapshots": [
+            {
+              "phase": "setup",
+              "rss": 185212928,
+              "heapUsed": 45232808,
+              "heapTotal": 76148736,
+              "external": 2834275,
+              "arrayBuffers": 166803,
+              "cpuUserUs": 9861091,
+              "cpuSystemUs": 552730,
+              "v8UsedHeap": 45260496
+            },
+            {
+              "phase": "sample",
+              "rss": 623308800,
+              "heapUsed": 507714952,
+              "heapTotal": 535773184,
+              "external": 2764683,
+              "arrayBuffers": 97171,
+              "cpuUserUs": 15128109,
+              "cpuSystemUs": 2483506,
+              "v8UsedHeap": 507741480
+            }
+          ],
+          "peakRssDeltaMb": 417.80078125,
+          "retainedHeapDeltaMb": 441.0573425292969
+        }
+      }
+    },
+    {
+      "scenario": "signal-updates",
+      "mode": "inproc",
+      "topology": "direct",
+      "transport": "microtask",
+      "params": {
+        "fanout": 1,
+        "burst": 10
+      },
+      "metrics": {
+        "opsPerSec": 392.68240363427753,
+        "sampleCount": 984,
+        "cv": 0.28882184935304195,
+        "latency": {
+          "p50": 2.403,
+          "p95": 3.825,
+          "p99": 5.655,
+          "max": 10.781,
+          "count": 984
+        },
+        "bytesPerOp": 33.96951219512195
+      }
+    },
+    {
+      "scenario": "forwarding-middle-overhead",
+      "mode": "inproc",
+      "topology": "forwarded",
+      "transport": "microtask",
+      "params": {
+        "paired": 1
+      },
+      "metrics": {
+        "opsPerSec": 79439.5962998652,
+        "sampleCount": 222431,
+        "cv": 3.8356113336850406,
+        "latency": {
+          "p50": 0.009,
+          "p95": 0.016,
+          "p99": 0.023,
+          "max": 2.655,
+          "count": 222431
+        },
+        "middle": {
+          "cpuUserUsPerOp": 18.04573103569197,
+          "cpuSystemUsPerOp": 0.5069032643831121,
+          "rssDeltaBytesPerOp": 63.033516011707
+        },
+        "bytesPerOp": 31.322831048717063
+      }
+    },
+    {
+      "scenario": "memory-lifecycle",
+      "mode": "inproc",
+      "topology": "direct",
+      "transport": "microtask",
+      "params": {
+        "phases": 5
+      },
+      "metrics": {
+        "opsPerSec": 26.8,
+        "sampleCount": 67,
+        "cv": 0,
+        "latency": {
+          "p50": 0,
+          "p95": 0,
+          "p99": 0,
+          "max": 0
+        },
+        "memory": {
+          "snapshots": [
+            {
+              "phase": "setup",
+              "rss": 674000896,
+              "heapUsed": 554771528,
+              "heapTotal": 593166336,
+              "external": 2973579,
+              "arrayBuffers": 306067,
+              "cpuUserUs": 27819116,
+              "cpuSystemUs": 2943806,
+              "v8UsedHeap": 554772888
+            },
+            {
+              "phase": "warmup",
+              "rss": 674000896,
+              "heapUsed": 554845128,
+              "heapTotal": 593166336,
+              "external": 2973579,
+              "arrayBuffers": 306067,
+              "cpuUserUs": 27821320,
+              "cpuSystemUs": 2944039,
+              "v8UsedHeap": 554846032
+            },
+            {
+              "phase": "load",
+              "rss": 938110976,
+              "heapUsed": 817430432,
+              "heapTotal": 857153536,
+              "external": 2973579,
+              "arrayBuffers": 306067,
+              "cpuUserUs": 30122393,
+              "cpuSystemUs": 4393802,
+              "v8UsedHeap": 817431576
+            },
+            {
+              "phase": "quiesce",
+              "rss": 938110976,
+              "heapUsed": 817442176,
+              "heapTotal": 857153536,
+              "external": 2973579,
+              "arrayBuffers": 306067,
+              "cpuUserUs": 30123536,
+              "cpuSystemUs": 4393957,
+              "v8UsedHeap": 817443000
+            },
+            {
+              "phase": "sample",
+              "rss": 938110976,
+              "heapUsed": 817443744,
+              "heapTotal": 857153536,
+              "external": 2973579,
+              "arrayBuffers": 306067,
+              "cpuUserUs": 30123536,
+              "cpuSystemUs": 4394063,
+              "v8UsedHeap": 817444856
+            }
+          ],
+          "peakRssDeltaMb": 251.875,
+          "retainedHeapDeltaMb": 250.50374603271484
+        }
+      }
+    }
+  ]
+}
