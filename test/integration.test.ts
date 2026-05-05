@@ -472,6 +472,252 @@ describe('Integration: Server <-> Client', () => {
     expect(rpcClient.root.count.peek()).toBe(10);
   });
 
+  it('client receives Date signal value and live updates', async () => {
+    vi.useFakeTimers();
+    const createdAt = signal(new Date('2025-01-15T12:00:00.000Z'));
+    const rpc = new RPC({createdAt});
+
+    const {serverTransport, clientTransport, flush} =
+      createLinkedTransportPair();
+    const ctx = {rpc: null as any};
+    const rpcClient = new RPCClient(clientTransport, ctx);
+    ctx.rpc = rpcClient;
+    rpc.addClient(serverTransport, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    expect(rpcClient.root.createdAt.peek()).toBeInstanceOf(Date);
+    expect(rpcClient.root.createdAt.peek()).toEqual(
+      new Date('2025-01-15T12:00:00.000Z'),
+    );
+
+    rpcClient.root.createdAt.subscribe(() => undefined);
+    vi.advanceTimersByTime(1);
+    await flush();
+
+    createdAt.value = new Date('2025-06-01T00:00:00.000Z');
+    await flush();
+
+    expect(rpcClient.root.createdAt.peek()).toBeInstanceOf(Date);
+    expect(rpcClient.root.createdAt.peek()).toEqual(
+      new Date('2025-06-01T00:00:00.000Z'),
+    );
+  });
+
+  it('client receives Uint8Array signal value and live updates', async () => {
+    vi.useFakeTimers();
+    const data = signal(new Uint8Array([1, 2, 3]));
+    const rpc = new RPC({data});
+
+    const {serverTransport, clientTransport, flush} =
+      createLinkedTransportPair();
+    const ctx = {rpc: null as any};
+    const rpcClient = new RPCClient(clientTransport, ctx);
+    ctx.rpc = rpcClient;
+    rpc.addClient(serverTransport, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    expect(rpcClient.root.data.peek()).toBeInstanceOf(Uint8Array);
+    expect(rpcClient.root.data.peek()).toEqual(new Uint8Array([1, 2, 3]));
+
+    rpcClient.root.data.subscribe(() => undefined);
+    vi.advanceTimersByTime(1);
+    await flush();
+
+    data.value = new Uint8Array([4, 5, 6, 7]);
+    await flush();
+
+    expect(rpcClient.root.data.peek()).toBeInstanceOf(Uint8Array);
+    expect(rpcClient.root.data.peek()).toEqual(new Uint8Array([4, 5, 6, 7]));
+  });
+
+  it('server method returning Date is received as Date on client', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC({
+      getTimestamp() {
+        return new Date('2025-03-20T10:30:00.000Z');
+      },
+    });
+
+    const {serverTransport, clientTransport, flush} =
+      createLinkedTransportPair();
+    const ctx = {rpc: null as any};
+    const rpcClient = new RPCClient(clientTransport, ctx);
+    ctx.rpc = rpcClient;
+    rpc.addClient(serverTransport, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    const promise = rpcClient.call('getTimestamp');
+    await flush();
+    const result = await promise;
+
+    expect(result).toBeInstanceOf(Date);
+    expect(result).toEqual(new Date('2025-03-20T10:30:00.000Z'));
+  });
+
+  it('server method returning Uint8Array is received as Uint8Array on client', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC({
+      readBinary() {
+        return new Uint8Array([0x48, 0x65, 0x6c, 0x6c, 0x6f]);
+      },
+    });
+
+    const {serverTransport, clientTransport, flush} =
+      createLinkedTransportPair();
+    const ctx = {rpc: null as any};
+    const rpcClient = new RPCClient(clientTransport, ctx);
+    ctx.rpc = rpcClient;
+    rpc.addClient(serverTransport, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    const promise = rpcClient.call('readBinary');
+    await flush();
+    const result = await promise;
+
+    expect(result).toBeInstanceOf(Uint8Array);
+    expect(result).toEqual(new Uint8Array([0x48, 0x65, 0x6c, 0x6c, 0x6f]));
+  });
+
+  it('Date arguments from client arrive as Date on server', async () => {
+    vi.useFakeTimers();
+    let received: unknown;
+    const rpc = new RPC({
+      setDate(d: unknown) {
+        received = d;
+        return {ok: true};
+      },
+    });
+
+    const {serverTransport, clientTransport, flush} =
+      createLinkedTransportPair();
+    const ctx = {rpc: null as any};
+    const rpcClient = new RPCClient(clientTransport, ctx);
+    ctx.rpc = rpcClient;
+    rpc.addClient(serverTransport, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    const promise = rpcClient.call('setDate', [
+      new Date('2025-01-15T12:00:00.000Z'),
+    ]);
+    await flush();
+    await promise;
+
+    expect(received).toBeInstanceOf(Date);
+    expect(received).toEqual(new Date('2025-01-15T12:00:00.000Z'));
+  });
+
+  it('client receives BigInt signal value and live updates', async () => {
+    vi.useFakeTimers();
+    const bigId = signal(9007199254740993n);
+    const rpc = new RPC({bigId});
+
+    const {serverTransport, clientTransport, flush} =
+      createLinkedTransportPair();
+    const ctx = {rpc: null as any};
+    const rpcClient = new RPCClient(clientTransport, ctx);
+    ctx.rpc = rpcClient;
+    rpc.addClient(serverTransport, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    expect(typeof rpcClient.root.bigId.peek()).toBe('bigint');
+    expect(rpcClient.root.bigId.peek()).toBe(9007199254740993n);
+
+    rpcClient.root.bigId.subscribe(() => undefined);
+    vi.advanceTimersByTime(1);
+    await flush();
+
+    bigId.value = 0n;
+    await flush();
+
+    expect(typeof rpcClient.root.bigId.peek()).toBe('bigint');
+    expect(rpcClient.root.bigId.peek()).toBe(0n);
+  });
+
+  it('server method returning BigInt is received as BigInt on client', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC({
+      getBigId() {
+        return 9007199254740993n;
+      },
+    });
+
+    const {serverTransport, clientTransport, flush} =
+      createLinkedTransportPair();
+    const ctx = {rpc: null as any};
+    const rpcClient = new RPCClient(clientTransport, ctx);
+    ctx.rpc = rpcClient;
+    rpc.addClient(serverTransport, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    const promise = rpcClient.call('getBigId');
+    await flush();
+    const result = await promise;
+
+    expect(typeof result).toBe('bigint');
+    expect(result).toBe(9007199254740993n);
+  });
+
+  it('BigInt argument from client arrives as BigInt on server', async () => {
+    vi.useFakeTimers();
+    let received: unknown;
+    const rpc = new RPC({
+      setBigId(id: unknown) {
+        received = id;
+        return {ok: true};
+      },
+    });
+
+    const {serverTransport, clientTransport, flush} =
+      createLinkedTransportPair();
+    const ctx = {rpc: null as any};
+    const rpcClient = new RPCClient(clientTransport, ctx);
+    ctx.rpc = rpcClient;
+    rpc.addClient(serverTransport, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    const promise = rpcClient.call('setBigId', [9007199254740993n]);
+    await flush();
+    await promise;
+
+    expect(typeof received).toBe('bigint');
+    expect(received).toBe(9007199254740993n);
+  });
+
+  it('Uint8Array arguments from client arrive as Uint8Array on server', async () => {
+    vi.useFakeTimers();
+    let received: unknown;
+    const rpc = new RPC({
+      setData(d: unknown) {
+        received = d;
+        return {ok: true};
+      },
+    });
+
+    const {serverTransport, clientTransport, flush} =
+      createLinkedTransportPair();
+    const ctx = {rpc: null as any};
+    const rpcClient = new RPCClient(clientTransport, ctx);
+    ctx.rpc = rpcClient;
+    rpc.addClient(serverTransport, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    const promise = rpcClient.call('setData', [new Uint8Array([1, 2, 3])]);
+    await flush();
+    await promise;
+
+    expect(received).toBeInstanceOf(Uint8Array);
+    expect(received).toEqual(new Uint8Array([1, 2, 3]));
+  });
+
   it('rpc.call from client still works with method routing', async () => {
     vi.useFakeTimers();
     const rpc = new RPC();

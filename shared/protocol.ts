@@ -115,8 +115,58 @@ export function parseWireValue<T = unknown>(
   return JSON.parse(payload, reviver) as T;
 }
 
+export function uint8ArrayToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+export function base64ToUint8Array(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+/**
+ * Recursively converts Date, Uint8Array, and BigInt to tagged wire objects
+ * before JSON.stringify (which can't handle these types natively).
+ */
+function toWireValue(value: unknown): unknown {
+  if (value instanceof Date) return {'@D': value.getTime()};
+  if (value instanceof Uint8Array) return {'@B': uint8ArrayToBase64(value)};
+  if (typeof value === 'bigint') return {'@n': value.toString()};
+  if (Array.isArray(value)) return value.map(toWireValue);
+  if (value && typeof value === 'object') {
+    const result: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      result[k] = toWireValue(v);
+    }
+    return result;
+  }
+  return value;
+}
+
+/**
+ * JSON.parse reviver that reconstructs tagged wire objects back to
+ * Date, Uint8Array, and BigInt.
+ */
+export function wireReviver(_key: string, value: unknown): unknown {
+  if (typeof value === 'object' && value !== null) {
+    const obj = value as Record<string, unknown>;
+    if ('@D' in obj) return new Date(obj['@D'] as number);
+    if ('@B' in obj) return base64ToUint8Array(obj['@B'] as string);
+    if ('@n' in obj) return BigInt(obj['@n'] as string);
+  }
+  return value;
+}
+
 function stringifyWireParams(params: readonly unknown[] = []): string {
-  return params.map((param) => JSON.stringify(param)).join(',');
+  return params.map((param) => JSON.stringify(toWireValue(param))).join(',');
 }
 
 export function formatCallMessage(
@@ -135,7 +185,7 @@ export function formatNotificationMessage(
 }
 
 export function formatResultMessage(id: number, result: unknown): string {
-  return `R${id}:${JSON.stringify(result)}`;
+  return `R${id}:${JSON.stringify(toWireValue(result))}`;
 }
 
 export function formatErrorMessage(id: number, error: unknown): string {

@@ -8,6 +8,7 @@ import {
   type Transport,
   UNWATCH_SIGNALS_METHOD,
   WATCH_SIGNALS_METHOD,
+  wireReviver,
 } from '../shared/protocol.ts';
 import {
   ForwardedUpstream,
@@ -100,7 +101,7 @@ export class RPC {
         if (!message || message.type === 'result' || message.type === 'error')
           return;
 
-        const params = parseWireParams(message.payload);
+        const params = parseWireParams(message.payload, wireReviver);
         const messageId = message.type === 'call' ? message.id : undefined;
         await this.handleMessage(id, messageId, message.method, params);
       } catch (err: any) {
