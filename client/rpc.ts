@@ -1,6 +1,8 @@
 import {
   formatCallMessage,
+  formatErrorMessage,
   formatNotificationMessage,
+  formatResultMessage,
   parseWireMessage,
   parseWireParams,
   parseWireValue,
@@ -9,6 +11,12 @@ import {
   type Transport,
 } from '../shared/protocol.ts';
 import {ClientReflection} from './reflection.ts';
+
+// Walk a dotted path like "browser.logs" against an object so peer-issued
+// calls can target nested methods on the exposed root.
+function dlv(obj: any, path: string): any {
+  return path.split('.').reduce((acc, key) => acc?.[key], obj);
+}
 
 export class RPCClient {
   private transport: Transport;
@@ -20,6 +28,7 @@ export class RPCClient {
   private notificationListeners = new Set<
     (method: string, params: any[]) => void
   >();
+  private localRoot: any;
   /** @internal */
   reflection: ClientReflection;
   private transportReady: Promise<void> | undefined;
@@ -97,7 +106,10 @@ export class RPCClient {
         return;
       }
 
-      if (message.type === 'call') return;
+      if (message.type === 'call') {
+        this.handleCall(message.id, message.method, message.payload, reviver);
+        return;
+      }
 
       const params = parseWireParams(message.payload, reviver);
       this.handleNotification(message.method, params);
@@ -106,6 +118,66 @@ export class RPCClient {
 
   registerModel(typeName: string, ctor: any) {
     this.reflection.registerModel(typeName, ctor);
+  }
+
+  /**
+   * Publish an object as the dispatch target for peer-issued method
+   * calls. Mirrors the server's `RPC.expose`: an inbound `M{id}:method`
+   * frame is dispatched against this root using the same dot-notation
+   * lookup the server uses for nested methods (e.g. `"browser.logs"`
+   * walks `root.browser.logs`). Returning a non-promise sends `R{id}`
+   * with the value; throwing or rejecting sends `E{id}` with the
+   * `{code, message}` shape. Calling `expose` again replaces the prior
+   * root.
+   */
+  expose(root: any) {
+    this.localRoot = root;
+  }
+
+  private handleCall(
+    id: number,
+    method: string,
+    payload: string,
+    reviver: (key: string, val: any) => any,
+  ) {
+    const segments = method.split('.');
+    const methodName = segments.pop()!;
+    const receiver =
+      segments.length > 0 ? dlv(this.localRoot, segments.join('.')) : this.localRoot;
+    const target = receiver?.[methodName];
+    if (typeof target !== 'function') {
+      this.transport.send(
+        formatErrorMessage(id, {
+          code: -1,
+          message: `Method not found: ${method}`,
+        }),
+      );
+      return;
+    }
+    let params: unknown[];
+    try {
+      params = parseWireParams(payload, reviver);
+    } catch (error: any) {
+      this.transport.send(
+        formatErrorMessage(id, {
+          code: -1,
+          message: error?.message ?? String(error),
+        }),
+      );
+      return;
+    }
+    Promise.resolve()
+      .then(() => target.apply(receiver, params))
+      .then(
+        (result) => this.transport.send(formatResultMessage(id, result)),
+        (error: any) =>
+          this.transport.send(
+            formatErrorMessage(id, {
+              code: -1,
+              message: error?.message ?? String(error),
+            }),
+          ),
+      );
   }
 
   async call(method: string, params?: any): Promise<any> {

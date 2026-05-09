@@ -243,6 +243,136 @@ describe('RPCClient', () => {
     });
   });
 
+  describe('expose', () => {
+    it('dispatches a top-level method against the exposed root and emits R', async () => {
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      client.expose({echo: (a: unknown, b: unknown) => [b, a]});
+
+      transport.emit('M7:echo:1,"two"');
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(transport.sent).toContain('R7:["two",1]');
+    });
+
+    it('walks dotted method names against nested objects', async () => {
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      client.expose({browser: {logs: () => ['a', 'b']}});
+
+      transport.emit('M4:browser.logs:');
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(transport.sent).toContain('R4:["a","b"]');
+    });
+
+    it('binds `this` to the immediate receiver, not the root', async () => {
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      client.expose({
+        browser: {
+          tag: 'b',
+          name() {
+            return (this as {tag: string}).tag;
+          },
+        },
+      });
+
+      transport.emit('M1:browser.name:');
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(transport.sent).toContain('R1:"b"');
+    });
+
+    it('awaits async handlers before sending R', async () => {
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      client.expose({slow: async (n: number) => n * 2});
+
+      transport.emit('M3:slow:21');
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(transport.sent).toContain('R3:42');
+    });
+
+    it('thrown handler errors surface as E with message', async () => {
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      client.expose({
+        boom: () => {
+          throw new Error('nope');
+        },
+      });
+
+      transport.emit('M9:boom:');
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(transport.sent).toContain('E9:{"code":-1,"message":"nope"}');
+    });
+
+    it('rejected promises surface as E', async () => {
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      client.expose({
+        reject: async () => {
+          throw new Error('async-bad');
+        },
+      });
+
+      transport.emit('M2:reject:');
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(transport.sent).toContain('E2:{"code":-1,"message":"async-bad"}');
+    });
+
+    it('unknown method emits E with "Method not found"', () => {
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      client.expose({});
+
+      transport.emit('M5:unknown:');
+
+      expect(transport.sent).toContain(
+        'E5:{"code":-1,"message":"Method not found: unknown"}',
+      );
+    });
+
+    it('partial dotted path that does not resolve to a function emits "Method not found"', () => {
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      client.expose({browser: {}});
+
+      transport.emit('M6:browser.missing:');
+
+      expect(transport.sent).toContain(
+        'E6:{"code":-1,"message":"Method not found: browser.missing"}',
+      );
+    });
+
+    it('inbound call before expose emits "Method not found"', () => {
+      const transport = new FakeTransport();
+      new RPCClient(transport, createContext());
+
+      transport.emit('M1:anything:');
+
+      expect(transport.sent).toContain(
+        'E1:{"code":-1,"message":"Method not found: anything"}',
+      );
+    });
+
+    it('re-exposing replaces the prior root', async () => {
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      client.expose({which: () => 'first'});
+      client.expose({which: () => 'second'});
+
+      transport.emit('M1:which:');
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(transport.sent).toContain('R1:"second"');
+    });
+  });
+
   describe('reconnect', () => {
     it('rejects in-flight RPCs with reconnection error', async () => {
       const transport1 = new FakeTransport();
