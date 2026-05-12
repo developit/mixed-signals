@@ -116,7 +116,7 @@ export function parseWireValue<T = unknown>(
 }
 
 function stringifyWireParams(params: readonly unknown[] = []): string {
-  return params.map((param) => JSON.stringify(param)).join(',');
+  return JSON.stringify(params).slice(1, -1);
 }
 
 export function formatCallMessage(
