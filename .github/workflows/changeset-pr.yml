@@ -6,13 +6,16 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
+  pull-requests: read
 
 jobs:
   changeset:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # `changeset status --since` needs the base branch in history.
+          fetch-depth: 0
       - uses: pnpm/action-setup@v4
         with:
           version: 10
@@ -21,9 +24,5 @@ jobs:
           node-version: '20'
           cache: 'pnpm'
       - run: pnpm install --frozen-lockfile
-      - name: Check for changeset and post guidance
-        uses: changesets/action@v1
-        with:
-          version: pnpm version-packages
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify a changeset is present
+        run: pnpm exec changeset status --since=origin/${{ github.base_ref }}
