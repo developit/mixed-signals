@@ -16,6 +16,10 @@
       "types": "./build/codecs.d.ts",
       "default": "./build/codecs.js"
     },
+    "./sync": {
+      "types": "./build/sync.d.ts",
+      "default": "./build/sync.js"
+    },
     "./disposable.d.ts": "./disposable.d.ts",
     "./package.json": "./package.json"
   },
@@ -24,7 +28,8 @@
     "server",
     "client",
     "codecs",
-    "shared"
+    "shared",
+    "sync"
   ],
   "scripts": {
     "test": "vitest",
