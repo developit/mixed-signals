@@ -194,6 +194,30 @@ export function isSyncablePromise(
 }
 
 /**
+ * Read-only inspection of a `SyncablePromise`'s claim state. Returns
+ * `null` if `value` is not a `SyncablePromise` produced by this
+ * module; otherwise returns a snapshot of the internal `consumed` /
+ * `consumer` fields. Does not mutate.
+ *
+ * Used by `RPCClient.wait` so a whole batch can be validated before
+ * any promise is claimed — the claim mutation must be atomic across
+ * the batch, otherwise an early failure mid-validation strands
+ * earlier promises in a `consumed=true` zombie state with no
+ * settlement path.
+ *
+ * @internal
+ */
+export function peekSyncableState(
+  value: unknown,
+):
+  | {consumed: boolean; consumer: 'async' | 'sync' | 'auto' | null}
+  | null {
+  const s = internals.get(value as object);
+  if (!s) return null;
+  return {consumed: s.consumed, consumer: s.consumer};
+}
+
+/**
  * Claim a `SyncablePromise` for the sync path. Returns the call
  * descriptor so the caller can batch it into the SAB envelope. Throws
  * `SyncRPCAlreadyWaitedError` if the promise has already been consumed,

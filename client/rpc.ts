@@ -16,10 +16,12 @@ import {
 import {
   SyncRPCAlreadyWaitedError,
   SyncRPCNoTransportWaitError,
+  SyncRPCUnsupportedContextError,
 } from '../sync/errors.ts';
 import {
   claimForSync,
   isSyncablePromise,
+  peekSyncableState,
   settleSyncable,
   type SyncablePromise,
 } from '../sync/syncable-promise.ts';
@@ -282,34 +284,60 @@ export class RPCClient {
           'client with a sync-capable transport (see mixed-signals/sync).',
       );
     }
+    if (!canCallAtomicsWaitInThisContext()) {
+      // Surface the documented `@throws SyncRPCUnsupportedContextError`
+      // ahead of the engine's `TypeError` from a main-thread
+      // `Atomics.wait`. A caller catching `SyncRPCError` (the family
+      // root) gets a typed error to handle; without this gate the
+      // failure surfaces as an untyped `TypeError`.
+      throw new SyncRPCUnsupportedContextError(
+        'rpc.wait(): the current context cannot call Atomics.wait. ' +
+          'Sync RPC requires a worker context with SharedArrayBuffer; ' +
+          'browser main threads, ServiceWorkers, and non-COI contexts ' +
+          'are not supported.',
+      );
+    }
     if (promises.length === 0) {
       throw new RangeError(
         'rpc.wait(): promises array must not be empty',
       );
     }
 
-    // Claim every promise up front. If any is invalid, throw before
-    // dispatching anything — partial claims would leave promises
-    // hanging with no settlement path.
-    const claimed: Array<{
-      promise: SyncablePromise<unknown>;
-      descriptor: ReturnType<typeof claimForSync>;
-    }> = [];
+    // Two-pass claim. Pass 1 validates every promise via a read-only
+    // peek; if anything fails, throw before mutating anyone. Pass 2
+    // claims atomically. The old single-pass loop claimed each promise
+    // before validating the next, which leaked partial claims into a
+    // permanent `consumed=true` zombie state if a later promise was
+    // invalid — the block's own comment forbids that, but the
+    // implementation achieved it.
     for (const p of promises) {
-      if (!isSyncablePromise(p)) {
+      const state = peekSyncableState(p);
+      if (state === null) {
         throw new SyncRPCAlreadyWaitedError(
           'rpc.wait(): each argument must be a SyncablePromise from ' +
             "this client's proxy (e.g. rpc.root.foo()); received a " +
-            'plain Promise or already-consumed value.',
+            'plain Promise or other value.',
         );
       }
-      claimed.push({promise: p, descriptor: claimForSync(p)});
+      if (state.consumed) {
+        throw new SyncRPCAlreadyWaitedError(
+          `rpc.wait(): SyncablePromise already consumed by '${
+            state.consumer ?? 'unknown path'
+          }'.`,
+        );
+      }
     }
+    const claimed = (promises as readonly SyncablePromise<unknown>[]).map(
+      (p) => ({promise: p, descriptor: claimForSync(p)}),
+    );
 
     // Build outbound WireMessages with brands substituted, using the
-    // same walker the async path uses so brand round-trip semantics are
-    // identical. Each call gets a fresh wire id from the shared counter
-    // so the host can't observe a collision with async-call ids.
+    // same walker the async path uses so brand round-trip semantics
+    // are identical. The wire `id` is unused on the sync path — the
+    // host wrapper re-stamps each call with a synth id starting at
+    // 1,000,000 and the response is correlated positionally, not by
+    // id — but we keep a non-zero placeholder so any future
+    // assertions on `WireMessage.id !== 0` don't trip.
     const calls: WireMessage[] = claimed.map(({descriptor}) => {
       const ctx: TransportContext = {};
       const walkedParams = substituteBrandsAndCollectTransferables(
@@ -325,7 +353,22 @@ export class RPCClient {
       };
     });
 
-    const results = this.transport.wait(calls, opts);
+    // Guard `transport.wait` so any throw (timeout, malformed handshake,
+    // future payload-too-large, etc.) settles every already-claimed
+    // promise with the error before propagating. Without this, claimed
+    // promises stay `consumed=true` with no resolve/reject path —
+    // `await` on them hangs forever. Matches the documented contract
+    // "every claimed promise is settled".
+    let results: WireMessage[];
+    try {
+      results = this.transport.wait(calls, opts);
+    } catch (err) {
+      const wrapped = err instanceof Error ? err : new Error(String(err));
+      for (const {promise} of claimed) {
+        settleSyncable(promise, {ok: false, error: wrapped});
+      }
+      throw wrapped;
+    }
 
     // Hydrate each value through the same path inbound messages take.
     // Identical hydration for sync and async is the contract that lets
