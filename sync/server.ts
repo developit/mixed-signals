@@ -1,6 +1,5 @@
 import type {
   RawTransport,
-  Transport,
   TransportContext,
   WireMessage,
 } from '../shared/protocol.ts';
@@ -91,7 +90,7 @@ function isSyncControl(data: unknown): data is SyncControl {
 export function enableSyncServer(
   transport: RawTransport,
   opts?: {dataSabSize?: number},
-): Transport {
+): RawTransport {
   const dataSabSize = opts?.dataSabSize ?? DEFAULT_DATA_SAB_BYTES;
 
   // SAB pair + views. Allocated lazily on first `hs-req`; reused on
