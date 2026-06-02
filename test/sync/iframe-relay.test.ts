@@ -7,7 +7,7 @@
  */
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {SyncRPCIframeBridgeError} from '../../sync/errors.ts';
-import {createIframeRelayBridge} from '../../sync/iframe-relay.ts';
+import {_createIframeRelayBridgeInternal} from '../../sync/iframe-relay.ts';
 
 // ── Stubs ────────────────────────────────────────────────────────────────
 
@@ -82,7 +82,7 @@ describe('createIframeRelayBridge — construction', () => {
     const parentWindow = makeFakeWindow();
     const worker = makeFakeWorker();
     expect(() =>
-      createIframeRelayBridge({
+      _createIframeRelayBridgeInternal({
         worker,
         parentOrigin: 'null',
         _localWindow: localWindow,
@@ -95,7 +95,7 @@ describe('createIframeRelayBridge — construction', () => {
     const localWindow = makeFakeWindow();
     const worker = makeFakeWorker();
     expect(() =>
-      createIframeRelayBridge({
+      _createIframeRelayBridgeInternal({
         worker,
         parentOrigin: 'https://example.test',
         _localWindow: localWindow,
@@ -117,7 +117,7 @@ describe('createIframeRelayBridge — forwarding', () => {
   });
 
   it('forwards worker → parent verbatim with the configured targetOrigin', () => {
-    const bridge = createIframeRelayBridge({
+    const bridge = _createIframeRelayBridgeInternal({
       worker,
       parentOrigin: 'https://example.test',
       _localWindow: localWindow,
@@ -135,7 +135,7 @@ describe('createIframeRelayBridge — forwarding', () => {
   });
 
   it('forwards parent → worker only when source and origin both match', () => {
-    const bridge = createIframeRelayBridge({
+    const bridge = _createIframeRelayBridgeInternal({
       worker,
       parentOrigin: 'https://example.test',
       _localWindow: localWindow,
@@ -194,7 +194,7 @@ describe('createIframeRelayBridge — heartbeat', () => {
   });
 
   it('does not arm the heartbeat before any worker message arrives', () => {
-    const bridge = createIframeRelayBridge({
+    const bridge = _createIframeRelayBridgeInternal({
       worker,
       parentOrigin: 'https://example.test',
       workerHeartbeatTimeoutMs: 1000,
@@ -216,7 +216,7 @@ describe('createIframeRelayBridge — heartbeat', () => {
   });
 
   it('fires client_dead upstream after timeoutMs of worker silence following first message', () => {
-    const bridge = createIframeRelayBridge({
+    const bridge = _createIframeRelayBridgeInternal({
       worker,
       parentOrigin: 'https://example.test',
       workerHeartbeatTimeoutMs: 1000,
@@ -265,7 +265,7 @@ describe('createIframeRelayBridge — heartbeat', () => {
   });
 
   it('resets the heartbeat on each subsequent worker message', () => {
-    const bridge = createIframeRelayBridge({
+    const bridge = _createIframeRelayBridgeInternal({
       worker,
       parentOrigin: 'https://example.test',
       workerHeartbeatTimeoutMs: 1000,
@@ -298,7 +298,7 @@ describe('createIframeRelayBridge — dispose', () => {
     const localWindow = makeFakeWindow();
     const worker = makeFakeWorker();
 
-    const bridge = createIframeRelayBridge({
+    const bridge = _createIframeRelayBridgeInternal({
       worker,
       parentOrigin: 'https://example.test',
       _localWindow: localWindow,
@@ -319,7 +319,7 @@ describe('createIframeRelayBridge — dispose', () => {
     const localWindow = makeFakeWindow();
     const worker = makeFakeWorker();
 
-    const bridge = createIframeRelayBridge({
+    const bridge = _createIframeRelayBridgeInternal({
       worker,
       parentOrigin: 'https://example.test',
       _localWindow: localWindow,
@@ -338,7 +338,7 @@ describe('createIframeRelayBridge — dispose', () => {
     const localWindow = makeFakeWindow();
     const worker = makeFakeWorker();
 
-    const bridge = createIframeRelayBridge({
+    const bridge = _createIframeRelayBridgeInternal({
       worker,
       parentOrigin: 'https://example.test',
       _localWindow: localWindow,
@@ -360,7 +360,7 @@ describe('createIframeRelayBridge — inspection façades', () => {
     const localWindow = makeFakeWindow();
     const worker = makeFakeWorker();
 
-    const bridge = createIframeRelayBridge({
+    const bridge = _createIframeRelayBridgeInternal({
       worker,
       parentOrigin: 'https://example.test',
       _localWindow: localWindow,
@@ -382,7 +382,7 @@ describe('createIframeRelayBridge — inspection façades', () => {
     const localWindow = makeFakeWindow();
     const worker = makeFakeWorker();
 
-    const bridge = createIframeRelayBridge({
+    const bridge = _createIframeRelayBridgeInternal({
       worker,
       parentOrigin: 'https://example.test',
       _localWindow: localWindow,
@@ -404,7 +404,7 @@ describe('createIframeRelayBridge — inspection façades', () => {
     const localWindow = makeFakeWindow();
     const worker = makeFakeWorker();
 
-    const bridge = createIframeRelayBridge({
+    const bridge = _createIframeRelayBridgeInternal({
       worker,
       parentOrigin: 'https://example.test',
       _localWindow: localWindow,

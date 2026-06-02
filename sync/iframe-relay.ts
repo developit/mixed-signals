@@ -39,7 +39,7 @@ type WindowLike = {
   ): void;
 };
 
-const DEFAULT_HEARTBEAT_TIMEOUT_MS = 5000;
+const DEFAULT_HEARTBEAT_TIMEOUT_MS = 30_000;
 
 /**
  * Same-origin iframe forwarder. Runs on the iframe's main thread and
@@ -83,12 +83,25 @@ const DEFAULT_HEARTBEAT_TIMEOUT_MS = 5000;
  *     intended use is to attach passive `onMessage` listeners for
  *     debug / observability hooks.
  *   - Worker heartbeat: after the first worker message arrives, a
- *     timer is armed for `workerHeartbeatTimeoutMs` (default 5000
- *     ms). If no further worker message lands within that window,
- *     the relay posts `{__sync: 'client_dead'}` upstream to the
- *     parent exactly once. The full worker-teardown lifecycle
- *     protocol lands in a later milestone; this hook is the
- *     detection point.
+ *     timer is armed for `workerHeartbeatTimeoutMs` (default
+ *     30000 ms). If no further worker message lands within that
+ *     window, the relay posts `{__sync: 'client_dead'}` upstream
+ *     to the parent exactly once. The full worker-teardown
+ *     lifecycle protocol lands in a later milestone; this hook is
+ *     the detection point.
+ *
+ * **Heartbeat threshold caveat.** A worker blocked in
+ * `Atomics.wait` for a sync round-trip is silent on postMessage
+ * for the duration of the call (`Atomics.notify` travels inside
+ * the SAB, not via postMessage), so a too-low threshold will
+ * declare a healthy-but-slow caller dead. `workerHeartbeatTimeoutMs`
+ * MUST exceed the P99 of the slowest expected `rpc.wait` round
+ * trip. Default 30000 ms matches the project's retention TTL
+ * default; lower it only with measured headroom. The
+ * `{__sync: 'client_dead'}` frame is also a producer-only signal
+ * in M001 — the host wrapper (`enableSyncServer`) silently drops
+ * it. The end-to-end teardown protocol lands with a later
+ * milestone; until then this hook is detection-only.
  *
  * **Constructing two relays against the same worker is forbidden.**
  * Worker postMessage events fan out to every attached listener, so
@@ -107,21 +120,23 @@ export function createIframeRelayBridge(opts: {
   parentOrigin: string;
   /** Heartbeat timeout for detecting blocked-worker death. */
   workerHeartbeatTimeoutMs?: number;
-  /**
-   * Local window the relay attaches its parent-side listener to.
-   * Defaults to the runtime `globalThis` cast as `Window`. Exposed
-   * so unit tests can inject a stub without a full DOM.
-   *
-   * @internal
-   */
+}): IframeRelayBridge {
+  return _createIframeRelayBridgeInternal(opts);
+}
+
+/**
+ * Test-only escape hatch for `createIframeRelayBridge` that accepts
+ * stubbed `Window` handles for unit tests without a real DOM. Not
+ * part of the public API; imported directly by tests and re-exported
+ * by `createIframeRelayBridge` above.
+ *
+ * @internal
+ */
+export function _createIframeRelayBridgeInternal(opts: {
+  worker: WorkerLike;
+  parentOrigin: string;
+  workerHeartbeatTimeoutMs?: number;
   _localWindow?: WindowLike;
-  /**
-   * Parent window to forward messages to. Defaults to
-   * `globalThis.parent` (the iframe's parent in browsers). Exposed
-   * so unit tests can inject a stub.
-   *
-   * @internal
-   */
   _parentWindow?: WindowLike;
 }): IframeRelayBridge {
   const {

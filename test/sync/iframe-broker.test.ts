@@ -9,7 +9,7 @@ import type {
   WireMessage,
 } from '../../shared/protocol.ts';
 import {SyncRPCIframeBridgeError} from '../../sync/errors.ts';
-import {createIframeBrokerBridge} from '../../sync/iframe-broker.ts';
+import {_createIframeBrokerBridgeInternal} from '../../sync/iframe-broker.ts';
 
 type MessageHandler = (event: MessageEvent) => void;
 
@@ -75,7 +75,7 @@ function makeFakeHostTransport(): FakeHostTransport {
 describe('createIframeBrokerBridge — construction', () => {
   it('throws SyncRPCIframeBridgeError when crossOriginIsolated is false', () => {
     expect(() =>
-      createIframeBrokerBridge({
+      _createIframeBrokerBridgeInternal({
         worker: makeFakeWorker(),
         hostTransport: makeFakeHostTransport(),
         _crossOriginIsolated: false,
@@ -85,7 +85,7 @@ describe('createIframeBrokerBridge — construction', () => {
 
   it('returns an IframeBrokerBridge with dispose, server, client when COI', () => {
     const host = makeFakeHostTransport();
-    const bridge = createIframeBrokerBridge({
+    const bridge = _createIframeBrokerBridgeInternal({
       worker: makeFakeWorker(),
       hostTransport: host,
       _crossOriginIsolated: true,
@@ -103,7 +103,7 @@ describe('createIframeBrokerBridge — handshake (sync)', () => {
   it('processes hs-req from the worker locally and replies via worker.postMessage', () => {
     const worker = makeFakeWorker();
     const host = makeFakeHostTransport();
-    const bridge = createIframeBrokerBridge({
+    const bridge = _createIframeBrokerBridgeInternal({
       worker,
       hostTransport: host,
       _crossOriginIsolated: true,
@@ -134,7 +134,7 @@ describe('createIframeBrokerBridge — async pass-through', () => {
   it('forwards normal WireMessages from the worker to the parent', () => {
     const worker = makeFakeWorker();
     const host = makeFakeHostTransport();
-    const bridge = createIframeBrokerBridge({
+    const bridge = _createIframeBrokerBridgeInternal({
       worker,
       hostTransport: host,
       _crossOriginIsolated: true,
@@ -157,7 +157,7 @@ describe('createIframeBrokerBridge — async pass-through', () => {
   it('forwards normal WireMessages from the parent to the worker', () => {
     const worker = makeFakeWorker();
     const host = makeFakeHostTransport();
-    const bridge = createIframeBrokerBridge({
+    const bridge = _createIframeBrokerBridgeInternal({
       worker,
       hostTransport: host,
       _crossOriginIsolated: true,
@@ -189,7 +189,7 @@ describe('createIframeBrokerBridge — heartbeat', () => {
   it('fires client_dead upstream after timeoutMs of worker silence following first message', () => {
     const worker = makeFakeWorker();
     const host = makeFakeHostTransport();
-    const bridge = createIframeBrokerBridge({
+    const bridge = _createIframeBrokerBridgeInternal({
       worker,
       hostTransport: host,
       _crossOriginIsolated: true,
@@ -222,7 +222,7 @@ describe('createIframeBrokerBridge — heartbeat', () => {
   it('does not arm the heartbeat before any worker message arrives', () => {
     const worker = makeFakeWorker();
     const host = makeFakeHostTransport();
-    const bridge = createIframeBrokerBridge({
+    const bridge = _createIframeBrokerBridgeInternal({
       worker,
       hostTransport: host,
       _crossOriginIsolated: true,
@@ -246,7 +246,7 @@ describe('createIframeBrokerBridge — dispose', () => {
   it('detaches the worker message listener', () => {
     const worker = makeFakeWorker();
     const host = makeFakeHostTransport();
-    const bridge = createIframeBrokerBridge({
+    const bridge = _createIframeBrokerBridgeInternal({
       worker,
       hostTransport: host,
       _crossOriginIsolated: true,
@@ -258,7 +258,7 @@ describe('createIframeBrokerBridge — dispose', () => {
   });
 
   it('dispose() is idempotent', () => {
-    const bridge = createIframeBrokerBridge({
+    const bridge = _createIframeBrokerBridgeInternal({
       worker: makeFakeWorker(),
       hostTransport: makeFakeHostTransport(),
       _crossOriginIsolated: true,
@@ -273,7 +273,7 @@ describe('createIframeBrokerBridge — dispose', () => {
   it('post-dispose worker messages are not forwarded', () => {
     const worker = makeFakeWorker();
     const host = makeFakeHostTransport();
-    const bridge = createIframeBrokerBridge({
+    const bridge = _createIframeBrokerBridgeInternal({
       worker,
       hostTransport: host,
       _crossOriginIsolated: true,

@@ -18,7 +18,7 @@ type WorkerLike = {
   ): void;
 };
 
-const DEFAULT_HEARTBEAT_TIMEOUT_MS = 5000;
+const DEFAULT_HEARTBEAT_TIMEOUT_MS = 30_000;
 
 /**
  * Cross-origin iframe active broker.
@@ -40,6 +40,19 @@ const DEFAULT_HEARTBEAT_TIMEOUT_MS = 5000;
  *     normal `WireMessage`s back and forth. **The SAB never
  *     crosses this hop** — cross-origin SAB postMessage is rejected
  *     at the agent-cluster boundary.
+ *
+ * **Heartbeat threshold caveat.** A worker blocked in
+ * `Atomics.wait` for a sync round-trip is silent on postMessage
+ * for the duration of the call (`Atomics.notify` travels inside
+ * the SAB, not via postMessage), so a too-low threshold will
+ * declare a healthy-but-slow caller dead. `workerHeartbeatTimeoutMs`
+ * MUST exceed the P99 of the slowest expected `rpc.wait` round
+ * trip. Default 30000 ms matches the project's retention TTL
+ * default; lower it only with measured headroom. The
+ * `{__sync: 'client_dead'}` frame is also a producer-only signal
+ * in M001 — the host wrapper (`enableSyncServer`) silently drops
+ * it. The end-to-end teardown protocol lands with a later
+ * milestone; until then this hook is detection-only.
  *
  * The worker still sees a fully synchronous `rpc.wait(...)`. The
  * parent sees only async RPC traffic. The broker absorbs the
@@ -87,13 +100,23 @@ export function createIframeBrokerBridge(opts: {
   dataSabSize?: number;
   /** Heartbeat timeout for detecting blocked-worker death. */
   workerHeartbeatTimeoutMs?: number;
-  /**
-   * Override the cross-origin-isolation check. Defaults to reading
-   * `globalThis.crossOriginIsolated`. Exposed so unit tests can
-   * inject the value without a real iframe.
-   *
-   * @internal
-   */
+}): IframeBrokerBridge {
+  return _createIframeBrokerBridgeInternal(opts);
+}
+
+/**
+ * Test-only escape hatch for `createIframeBrokerBridge` that accepts
+ * a stubbed `crossOriginIsolated` value for unit tests without a
+ * real COI runtime. Not part of the public API; imported directly
+ * by tests and re-exported by `createIframeBrokerBridge` above.
+ *
+ * @internal
+ */
+export function _createIframeBrokerBridgeInternal(opts: {
+  worker: WorkerLike;
+  hostTransport: RawTransport;
+  dataSabSize?: number;
+  workerHeartbeatTimeoutMs?: number;
   _crossOriginIsolated?: boolean;
 }): IframeBrokerBridge {
   const {
