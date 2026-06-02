@@ -187,6 +187,15 @@ export function enableSyncClient(
     const totalBytes = encoded.byteLength;
     const chunkBytes = dataU8.byteLength;
 
+    // Single deadline shared across the request and response loops.
+    // Computed once here so both legs of the round trip honour the
+    // same wall-clock budget; previously the request loop ignored
+    // the deadline entirely, so a host that stalled between MORE_REQ
+    // chunks blocked the worker forever despite `timeoutMs`.
+    const deadline =
+      waitOpts?.timeoutMs == null ? null : Date.now() + waitOpts.timeoutMs;
+    let chunkIndex = 0;
+
     // ── Request side ─────────────────────────────────────────────────────
     // `JSON.stringify({seq, calls})` always produces at least
     // `{"seq":N,"calls":[]}` — non-zero — so one iteration through
@@ -219,24 +228,44 @@ export function enableSyncClient(
       transport.send(doorbell);
 
       offset += thisChunkSize;
+      chunkIndex++;
 
       if (!isLast) {
         // Wait for the host to ack this chunk before writing the next.
         // Loop on exact target state to defend against spurious wakes
         // (`Atomics.wait` returning `'ok'` or `'not-equal'` without
-        // CHUNK_STATE actually advancing).
+        // CHUNK_STATE actually advancing). Deadline-bounded so a host
+        // that stalls mid-request can't wedge the worker forever.
         while (true) {
           const cur = Atomics.load(controlView, CTRL.CHUNK_STATE);
           if (cur === CHUNK_STATE.ACK_REQ) break;
-          Atomics.wait(controlView, CTRL.CHUNK_STATE, cur);
+          const remainingMs =
+            deadline == null
+              ? Number.POSITIVE_INFINITY
+              : deadline - Date.now();
+          if (deadline != null && remainingMs <= 0) {
+            throw new SyncRPCTimeoutError(
+              `rpc.wait(seq=${seq}) timed out awaiting ACK_REQ at chunk ${chunkIndex} after ${waitOpts!.timeoutMs} ms`,
+            );
+          }
+          const status = Atomics.wait(
+            controlView,
+            CTRL.CHUNK_STATE,
+            cur,
+            remainingMs,
+          );
+          if (status === 'timed-out') {
+            throw new SyncRPCTimeoutError(
+              `rpc.wait(seq=${seq}) timed out at chunk ${chunkIndex} (Atomics.wait status=timed-out)`,
+            );
+          }
+          // 'ok' or 'not-equal' — re-read CHUNK_STATE and loop.
         }
       }
     } while (offset < totalBytes);
 
     // ── Response side ────────────────────────────────────────────────────
-    const deadline =
-      waitOpts?.timeoutMs == null ? null : Date.now() + waitOpts.timeoutMs;
-    let chunkIndex = 0;
+    chunkIndex = 0;
     let responseAccumulator = new Uint8Array(0);
     while (true) {
       const cs = Atomics.load(controlView, CTRL.CHUNK_STATE);

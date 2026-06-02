@@ -234,6 +234,13 @@ function runWait(
   const totalBytes = encoded.byteLength;
   const chunkBytes = dataU8.byteLength;
 
+  // Single deadline shared across the request and response loops.
+  // Computed once here so both legs of the round trip honour the same
+  // wall-clock budget; the request loop previously had no timeout so
+  // a host stalled between MORE_REQ chunks wedged the worker forever.
+  const deadline =
+    timeoutMs == null ? null : Date.now() + timeoutMs;
+
   // ── Request side ──────────────────────────────────────────────────────
   // `JSON.stringify({seq, calls})` is never zero bytes (the wrapping
   // object always serializes to at least `{"seq":N,"calls":[]}`), so a
@@ -263,17 +270,37 @@ function runWait(
 
     if (!isLast) {
       // Wait for the host to ack this chunk before writing the next.
+      // Deadline-bounded so this reference fixture stays a faithful
+      // analog of the production wrapper — the request-side timeout
+      // is part of the protocol contract, not just the response side.
       while (true) {
         const cur = Atomics.load(controlView, CTRL.CHUNK_STATE);
         if (cur === CHUNK_STATE.ACK_REQ) break;
-        Atomics.wait(controlView, CTRL.CHUNK_STATE, cur);
+        const remainingMs =
+          deadline == null ? Number.POSITIVE_INFINITY : deadline - Date.now();
+        if (deadline != null && remainingMs <= 0) {
+          throw new Error(
+            `runWait(seq=${seq}) timed out awaiting ACK_REQ after ${timeoutMs} ms`,
+          );
+        }
+        const status = Atomics.wait(
+          controlView,
+          CTRL.CHUNK_STATE,
+          cur,
+          remainingMs,
+        );
+        if (status === 'timed-out') {
+          throw new Error(
+            `runWait(seq=${seq}) timed out (Atomics.wait status=timed-out, request side)`,
+          );
+        }
       }
     }
   } while (offset < totalBytes);
 
   // ── Response side ─────────────────────────────────────────────────────
-  const deadline =
-    timeoutMs == null ? null : Date.now() + timeoutMs;
+  // (`deadline` was lifted above the request loop so a stalling host
+  // on the request side can't wedge the worker forever.)
   let responseAccumulator = new Uint8Array(0);
   while (true) {
     const cs = Atomics.load(controlView, CTRL.CHUNK_STATE);
