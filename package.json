@@ -17,6 +17,10 @@
       "default": "./build/codecs.js"
     },
     "./sync": {
+      "node": {
+        "types": "./build/sync.node.d.ts",
+        "default": "./build/sync.node.js"
+      },
       "types": "./build/sync.d.ts",
       "default": "./build/sync.js"
     },

@@ -6,6 +6,7 @@ export default defineConfig({
     client: 'client/index.ts',
     codecs: 'codecs/index.ts',
     sync: 'sync/index.ts',
+    'sync.node': 'sync/index.node.ts',
   },
   format: 'esm',
   dts: true,
