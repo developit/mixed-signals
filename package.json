@@ -70,6 +70,7 @@
     "@biomejs/biome": "^2.4.2",
     "@changesets/cli": "^2.29.8",
     "@preact/signals-core": "^1.14.0",
+    "@types/node": "^25.9.1",
     "tsdown": "^0.20.0",
     "typedoc": "^0.28.13",
     "typescript": "^5.7.0",
