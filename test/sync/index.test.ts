@@ -9,6 +9,18 @@ import * as sync from '../../sync/index.ts';
  */
 describe('mixed-signals/sync public surface', () => {
   const EXPECTED_PUBLIC_RUNTIME_EXPORTS = [
+    // Capability check
+    'supportsSync',
+    // Transport wrappers
+    'enableSyncServer',
+    'enableSyncClient',
+    // Iframe topology helpers
+    'createIframeRelayBridge',
+    'createIframeBrokerBridge',
+    // Adapter helpers
+    'wrapWindowPostMessage',
+    'wrapMessagePort',
+    // Error classes (instanceof family rooted at SyncRPCError)
     'SyncRPCAlreadyWaitedError',
     'SyncRPCError',
     'SyncRPCIframeBridgeError',
@@ -18,7 +30,6 @@ describe('mixed-signals/sync public surface', () => {
     'SyncRPCReentrancyError',
     'SyncRPCTimeoutError',
     'SyncRPCUnsupportedContextError',
-    'supportsSync',
   ];
 
   it('exposes exactly the documented runtime exports', () => {
