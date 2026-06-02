@@ -240,10 +240,33 @@ export class RPCClient {
    * error in input order.
    *
    * @throws SyncRPCNoTransportWaitError — the bound transport does not
-   *   implement `wait?`.
-   * @throws SyncRPCAlreadyWaitedError — one of the supplied promises
-   *   is not a `SyncablePromise` from this client, or has already been
-   *   consumed.
+   *   implement `wait?`. Configure the client with a sync-capable
+   *   transport via `mixed-signals/sync`.
+   * @throws SyncRPCAlreadyWaitedError — one of the supplied values is
+   *   not a `SyncablePromise` from this client, or has already been
+   *   consumed by `await`, `.then` / `.catch` / `.finally`, the
+   *   auto-fire microtask, or a prior `rpc.wait`.
+   * @throws SyncRPCTimeoutError — the host did not respond within
+   *   `opts.timeoutMs`. There is no finite default (per design §14);
+   *   the timeout fires only when the caller supplies one.
+   * @throws SyncRPCIframeBridgeError — the SAB handshake failed in
+   *   the iframe chain (e.g. an attempted cross-origin SAB transfer
+   *   was rejected at the agent-cluster boundary; see design §6.3).
+   *   Raised by `enableSyncClient`'s handshake path and surfaced
+   *   through `rpc.wait` when the transport is built with the
+   *   broker / relay helpers.
+   * @throws SyncRPCUnsupportedContextError — the calling context
+   *   cannot run `Atomics.wait` (browser main thread, ServiceWorker,
+   *   or any context without `SharedArrayBuffer` / `Atomics`).
+   *   This class is reserved for explicit pre-flight checks and the
+   *   reentrancy throw site that future milestones wire; the actual
+   *   `Atomics.wait` rejection from a main-thread caller surfaces
+   *   as the JS engine's `TypeError` until then.
+   * @throws SyncRPCReentrancyError — a method invoked on a sync-
+   *   blocked client tried to call back into the same client, which
+   *   would deadlock. The reentrancy throw site is wired in a later
+   *   milestone; the class is declared here for forward
+   *   compatibility of `instanceof` checks.
    * @throws RangeError — `promises` is empty; an empty wait is a
    *   programmer error.
    */
