@@ -41,6 +41,23 @@ type BaseTransport<Outgoing, Incoming, Ctx> = {
    */
   decode?(value: unknown, ctx?: Ctx): unknown;
   ready?: Promise<void>;
+  /**
+   * @internal — invoked by `RPCClient#wait`. Sync-capable transports
+   * implement this with a SAB+Atomics protocol; async-only transports
+   * leave it undefined. Captured notifications (signal updates, promise
+   * settlements, etc.) dispatch via the existing `onMessage` callback
+   * before this method returns, so subsequent reactive reads on the
+   * caller side see post-call state.
+   *
+   * Implementations MUST handle structured outbound `WireMessage`s
+   * (with brands already substituted to `@H` markers) and return
+   * `WireMessage`s (with `@H` markers intact) in the same order as the
+   * input calls.
+   */
+  wait?(
+    calls: WireMessage[],
+    opts?: {timeoutMs?: number},
+  ): WireMessage[];
 };
 
 /**

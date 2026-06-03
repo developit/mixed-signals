@@ -392,6 +392,19 @@ handles with `@H` markers and collect Transferable values into
   - `new RPCClient(transport: Transport, _ctx?: any) => RPCClient`
 - Methods:
   - `call(method: string, params?: any) => Promise<any>`
+  - `canWait() => boolean` — True iff this client's transport implements a callable `wait?`
+method AND the current context can call `Atomics.wait` (i.e. is a
+worker thread with `SharedArrayBuffer` available). Returns `false`
+from browser main threads, ServiceWorkers, non-COI contexts, and
+contexts missing `SharedArrayBuffer` / `Atomics`.
+
+Node-side note: the context check is best-effort — from a Node
+main thread with a `wait?`-capable transport, `canWait()` may
+still return `true` because the client bundle can't import
+`node:worker_threads` without pulling a Node-only specifier into
+browser builds. The `Atomics.wait` call inside `wait()` throws if
+actually invoked from Node main. For a precise pre-flight check
+use `supportsSync()` from `mixed-signals/sync`.
   - `classOf(name: string) => () => any | undefined` — Resolve the constructor for a remote class by name. Every class instance
 the client has hydrated is built on a shared prototype, so you can use
 the returned function with `instanceof`:
@@ -404,6 +417,25 @@ received yet.
   - `notify(method: string, params?: any[]) => void`
   - `onNotification(cb: (method: string, params: any[]) => void) => () => void`
   - `reconnect(transport: Transport) => void`
+  - `wait(promises: T, opts?: { timeoutMs?: number }) => mapped` — Synchronously block on one or more in-flight RPC promises,
+resolving them via a single SAB round-trip and returning their
+hydrated values in input order.
+
+Each promise must be a `SyncablePromise` produced by this client's
+proxy — an unconsumed result from `rpc.root.something.foo(...)`.
+Mixing in already-consumed promises (awaited, `.then`-chained, or
+passed to a prior `rpc.wait`) throws `SyncRPCAlreadyWaitedError`
+synchronously, before any wire I/O.
+
+Results are hydrated through the same `Hydrator` path inbound
+async responses take, so `o`, `f`, `s`, and `p` handles round-trip
+with identical semantics — the same proxy identity, the same
+brand round-tripping, the same class cache.
+
+Error semantics mirror `Promise.all`: every claimed promise is
+settled (resolved or rejected) so any `.then` / `.catch` chains
+the user attached run normally; this method then throws the first
+error in input order.
 - Properties:
   - `ready: Promise<void>`
   - `root: any`

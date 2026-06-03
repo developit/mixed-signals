@@ -8,6 +8,10 @@ function makeHydrator() {
       calls.push([method, args]);
       return null;
     },
+    callSyncable: async (method: string, args: readonly unknown[]) => {
+      calls.push([method, args]);
+      return null;
+    },
     scheduleRelease: () => {},
     scheduleWatch: () => {},
     scheduleUnwatch: () => {},

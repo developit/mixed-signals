@@ -4,6 +4,10 @@ import {
   UNWATCH_SIGNALS_METHOD,
   WATCH_SIGNALS_METHOD,
 } from '../shared/protocol.ts';
+import {
+  type SyncablePromise,
+  SyncablePromiseImpl,
+} from '../sync/syncable-promise.ts';
 import type {RPCClient} from './rpc.ts';
 
 /** @internal — retained for the optional context parameter to `RPCClient`. */
@@ -59,6 +63,27 @@ export class ClientReflection implements HydrateEnv {
 
   call(method: string, args: readonly unknown[]): Promise<any> {
     return this.rpc.call(method, args);
+  }
+
+  /**
+   * Lazy-send variant of `call`. Returns a `SyncablePromise` holding the
+   * call descriptor; the wire send fires on first consumption (`await`,
+   * `.then`, `.catch`, `.finally`, or the auto-fire microtask) via
+   * `RPCClient._sendCall`, OR is claimed by `RPCClient.wait(...)` for
+   * batched SAB delivery.
+   *
+   * Used by `Hydrator`'s method-stub trap on object Proxies so
+   * `rpc.root.foo()` returns a syncable promise compatible with both
+   * `await` and `rpc.wait([...])`.
+   */
+  callSyncable(
+    method: string,
+    args: readonly unknown[],
+  ): SyncablePromise<any> {
+    const rpc = this.rpc;
+    return new SyncablePromiseImpl<any>({method, args}, (settle) => {
+      rpc._sendCall(method, args as unknown[], settle);
+    });
   }
 
   scheduleWatch(id: string): void {

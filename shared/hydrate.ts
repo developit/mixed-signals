@@ -14,8 +14,22 @@ import {
  * the server once client-owned handles land (separate follow-up commit).
  */
 export interface HydrateEnv {
-  /** Outgoing call (for method handles and function handles). */
+  /** Outgoing call (for function handles). */
   call(method: string, args: readonly unknown[]): Promise<any>;
+  /**
+   * Like `call` but the wire send is deferred until the returned promise
+   * is consumed (by `await` / `.then` / `rpc.wait`). Implementations
+   * without a sync transport return a plain `Promise<any>`; implementations
+   * with a sync transport return a `SyncablePromise<any>` so it can be
+   * claimed by `rpc.wait(...)` for batched SAB delivery.
+   *
+   * Used by the method-stub trap on object Proxies (`createObject`).
+   * Bare function-handle calls (`createFunction`) keep using `call`
+   * since they're invoked as plain callables — wrapping a returned
+   * function as syncable would have ambiguous semantics if the user
+   * stores it locally and calls it multiple times.
+   */
+  callSyncable(method: string, args: readonly unknown[]): Promise<any>;
   /**
    * Notify the owning peer we've released these handle ids. Batching is
    * handled inside the env implementation (debounced / coalesced).
@@ -343,7 +357,7 @@ export class Hydrator {
         // is stable across multiple accesses.
         let m = methodCache.get(key);
         if (!m) {
-          m = (...args: unknown[]) => env.call(`${id}#${key}`, args);
+          m = (...args: unknown[]) => env.callSyncable(`${id}#${key}`, args);
           methodCache.set(key, m);
         }
         return m;

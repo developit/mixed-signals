@@ -1,6 +1,6 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.4.7/schema.json",
-  "files": {"includes": ["**", "!**/build"]},
+  "files": {"includes": ["**", "!**/build", "!**/.ignore"]},
   "vcs": {"enabled": false},
   "formatter": {
     "indentStyle": "space",
