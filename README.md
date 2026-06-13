@@ -19,6 +19,28 @@ The only dependency is `@preact/signals-core` (>=1.8.0).
 - An **RPC** layer handles method calls (client → server) and signal updates (server → client)
 - Delta compression for arrays (append), objects (merge), and strings (append) minimizes bandwidth
 
+## Optimistic UI
+
+Reflected signals are server-owned, so client optimism should be layered on top instead of mutating the reflected signal. `createOptimisticList()` creates a computed overlay for list signals and removes optimistic items once the server reflects an item with the same application key.
+
+```ts
+import { createOptimisticList } from "mixed-signals/client";
+
+const messages = createOptimisticList(session.messages, {
+  key: (message) => message.clientId.value,
+});
+
+const operation = messages.insert(localUserMessage);
+
+try {
+  await session.send(localUserMessage.text.value, localUserMessage.clientId.value);
+} catch {
+  operation.rollback();
+}
+```
+
+Render `messages.value` instead of the reflected `session.messages` signal. The server should echo the client-generated key on the confirmed item so reconciliation is deterministic.
+
 ## Full Example
 
 ### `server.ts`
@@ -147,11 +169,54 @@ forwarded — no per-model declaration needed.
 
 ### `mixed-signals/client`
 
+#### `createOptimisticList`
+
+- Kind: **Function**
+- Signatures:
+  - `(source: ReadonlySignal<readonly T[]>, options: OptimisticListOptions<T, TKey>) => OptimisticList<T, TKey>` — Create a client-side optimistic overlay for a reflected list signal.
+The source signal is never mutated; server-confirmed items are reconciled by key.
+While optimistic items are pending, the source is subscribed so confirmations
+can be pruned even if the overlay is not currently observed.
+
 #### `createReflectedModel`
 
 - Kind: **Function**
 - Signatures:
   - `(signalProps: string[], methods: string[]) => ModelConstructor<T, tuple>`
+
+#### `OptimisticList`
+
+- Kind: **Interface**
+- Methods:
+  - `clear() => void` — Remove all pending optimistic operations.
+  - `dispose() => void` — Stop reconciliation effects and remove all pending optimistic operations.
+  - `insert(item: T) => OptimisticListOperation<T, TKey>` — Add an optimistic item without mutating the reflected source signal.
+  - `remove(operation: OptimisticListOperation<T, TKey>) => void` — Remove a previously inserted optimistic operation.
+- Properties:
+  - `pending: ReadonlySignal<readonly T[]>` — Optimistic items that have not been confirmed by the server source.
+  - `value: ReadonlySignal<readonly T[]>` — Server source list plus all currently unconfirmed optimistic items.
+
+#### `OptimisticListKey`
+
+- Kind: **Type alias**
+- Type: `string | number`
+
+#### `OptimisticListOperation`
+
+- Kind: **Interface**
+- Methods:
+  - `rollback() => void` — Remove this optimistic item, typically after the server rejects a call.
+- Properties:
+  - `id: number`
+  - `item: T`
+  - `key: TKey`
+
+#### `OptimisticListOptions`
+
+- Kind: **Interface**
+- Methods:
+  - `key(item: T) => TKey` — Return a stable application key used to reconcile optimistic items.
+  - `match?(serverItem: T, optimisticItem: T) => boolean` — Optionally match server-confirmed items that use a different key.
 
 #### `RPCClient`
 
@@ -160,8 +225,18 @@ forwarded — no per-model declaration needed.
   - `new RPCClient(transport: Transport, ctx?: any) => RPCClient`
 - Methods:
   - `call(method: string, params?: any) => Promise<any>`
+  - `expose(root: any) => void` — Publish an object as the dispatch target for peer-issued method
+calls. Mirrors the server's `RPC.expose`: an inbound `M{id}:method`
+frame is dispatched against this root using the same dot-notation
+lookup the server uses for nested methods (e.g. `"browser.logs"`
+walks `root.browser.logs`). Returning a non-promise sends `R{id}`
+with the value; throwing or rejecting sends `E{id}` with the
+`{code, message}` shape. Calling `expose` again replaces the prior
+root.
   - `notify(method: string, params?: any[]) => void`
   - `onNotification(cb: (method: string, params: any[]) => void) => () => void`
+  - `reconnect(transport: Transport) => void` — Replace the transport and reset internal state for a reconnection.
+A new `ready` promise is created that resolves on the next `@R` message.
   - `registerModel(typeName: string, ctor: any) => void`
 - Properties:
   - `ready: Promise<void>`
@@ -176,5 +251,4 @@ forwarded — no per-model declaration needed.
   - `onMessage(cb: (data: { toString: unknown }) => void) => void`
   - `send(data: string) => void`
 - Properties:
-  - `ready: Promise<void>`
-
+  - `ready?: Promise<void>`
