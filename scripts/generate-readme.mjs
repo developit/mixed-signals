@@ -51,6 +51,10 @@ function typeToString(t) {
   }
   if (t.type === 'intrinsic') return t.name;
   if (t.type === 'array') return `${typeToString(t.elementType)}[]`;
+  if (t.type === 'typeOperator')
+    return `${t.operator} ${typeToString(t.target)}`;
+  if (t.type === 'indexedAccess')
+    return `${typeToString(t.objectType)}[${typeToString(t.indexType)}]`;
   if (t.type === 'union') return t.types.map(typeToString).join(' | ');
   if (t.type === 'intersection') return t.types.map(typeToString).join(' & ');
   if (t.type === 'literal') return JSON.stringify(t.value);
@@ -131,8 +135,9 @@ function renderNode(node) {
     for (const m of methods) {
       const sig = m.signatures?.[0];
       const mDesc = commentText(sig?.comment);
+      const name = `${m.name}${m.flags?.isOptional ? '?' : ''}`;
       lines.push(
-        `  - \`${m.name}${sig ? sigToLine(sig) : '()'}\`${mDesc ? ' — ' + mDesc : ''}`,
+        `  - \`${name}${sig ? sigToLine(sig) : '()'}\`${mDesc ? ' — ' + mDesc : ''}`,
       );
     }
   }
@@ -142,8 +147,9 @@ function renderNode(node) {
     lines.push('- Properties:');
     for (const p of props) {
       const pDesc = commentText(p.comment);
+      const name = `${p.name}${p.flags?.isOptional ? '?' : ''}`;
       lines.push(
-        `  - \`${p.name}: ${typeToString(p.type)}\`${pDesc ? ' — ' + pDesc : ''}`,
+        `  - \`${name}: ${typeToString(p.type)}\`${pDesc ? ' — ' + pDesc : ''}`,
       );
     }
   }
