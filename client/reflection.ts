@@ -3,6 +3,12 @@ import {
   UNWATCH_SIGNALS_METHOD,
   WATCH_SIGNALS_METHOD,
 } from '../shared/protocol.ts';
+import {
+  applyDelta,
+  applyServerUpdate,
+  coerceDeltaMode,
+  linkSource,
+} from './optimistic.ts';
 import type {RPCClient} from './rpc.ts';
 
 /** @internal */
@@ -101,6 +107,7 @@ export class ClientReflection {
       },
     });
 
+    linkSource(createdSignal, createdSignal);
     this.signals.set(id, createdSignal);
     return createdSignal;
   }
@@ -135,41 +142,9 @@ export class ClientReflection {
     const sig = this.signals.get(id);
     if (!sig) return;
 
-    if (!mode) {
-      sig.value = value;
-      return;
-    }
+    const delta = coerceDeltaMode(mode);
+    if (applyServerUpdate(sig, value, delta)) return;
 
-    const current = sig.value;
-
-    switch (mode) {
-      case 'append':
-        // Streaming text and immutable array pushes both land here.
-        if (Array.isArray(current)) {
-          sig.value = [...current, ...value];
-        } else if (typeof current === 'string') {
-          sig.value = current + value;
-        }
-        break;
-
-      case 'merge':
-        if (current && typeof current === 'object') {
-          sig.value = {...current, ...value};
-        }
-        break;
-
-      case 'splice':
-        // Reserved for richer array diffs; keep client support even if rare today.
-        if (Array.isArray(current)) {
-          const {start, deleteCount, items} = value;
-          const nextArray = [...current];
-          nextArray.splice(start, deleteCount, ...items);
-          sig.value = nextArray;
-        }
-        break;
-
-      default:
-        sig.value = value;
-    }
+    sig.value = applyDelta(sig.peek(), value, delta);
   }
 }

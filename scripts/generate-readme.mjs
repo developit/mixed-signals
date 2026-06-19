@@ -131,8 +131,9 @@ function renderNode(node) {
     for (const m of methods) {
       const sig = m.signatures?.[0];
       const mDesc = commentText(sig?.comment);
+      const name = `${m.name}${m.flags?.isOptional ? '?' : ''}`;
       lines.push(
-        `  - \`${m.name}${sig ? sigToLine(sig) : '()'}\`${mDesc ? ' — ' + mDesc : ''}`,
+        `  - \`${name}${sig ? sigToLine(sig) : '()'}\`${mDesc ? ' — ' + mDesc : ''}`,
       );
     }
   }
@@ -142,8 +143,9 @@ function renderNode(node) {
     lines.push('- Properties:');
     for (const p of props) {
       const pDesc = commentText(p.comment);
+      const name = `${p.name}${p.flags?.isOptional ? '?' : ''}`;
       lines.push(
-        `  - \`${p.name}: ${typeToString(p.type)}\`${pDesc ? ' — ' + pDesc : ''}`,
+        `  - \`${name}: ${typeToString(p.type)}\`${pDesc ? ' — ' + pDesc : ''}`,
       );
     }
   }

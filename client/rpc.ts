@@ -18,7 +18,7 @@ function dlv(obj: any, path: string): any {
   return path.split('.').reduce((acc, key) => acc?.[key], obj);
 }
 
-export class RPCClient {
+export class RPCClient<TRoot = any> {
   private transport: Transport;
   private nextId = 1;
   private pending = new Map<
@@ -32,7 +32,7 @@ export class RPCClient {
   /** @internal */
   reflection: ClientReflection;
   private transportReady: Promise<void> | undefined;
-  root: any = undefined;
+  root = undefined as TRoot;
   ready: Promise<void>;
   private _resolveReady!: () => void;
 
