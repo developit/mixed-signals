@@ -65,6 +65,7 @@ function reflected<T>(
 interface Message {
   id: string;
   text: string;
+  cid?: string;
 }
 
 afterEach(() => {
@@ -75,8 +76,12 @@ describe('optimistic — core behaviour', () => {
   it('shows the optimistic value immediately on the rendered signal', () => {
     const {view} = reflected<Message[]>(1, [{id: 's1', text: 'a'}]);
 
-    optimistic(undefined, (tx) => {
-      tx.update(view, (messages) => [...messages, {id: 'tmp', text: 'b'}]);
+    optimistic(new Promise<never>(() => {}), (tx) => {
+      tx.update({
+        signal: view,
+        transform: (messages) => [...messages, {id: 'tmp', text: 'b'}],
+        key: (message) => message.id,
+      });
     });
 
     expect(view.peek()).toEqual([
@@ -88,7 +93,7 @@ describe('optimistic — core behaviour', () => {
   it('works on a raw reflected signal with no facade', () => {
     const {view} = reflected(1, 'hello', {raw: true});
 
-    optimistic(undefined, (tx) => tx.set(view, 'hello world'));
+    optimistic(undefined, (tx) => tx.set({signal: view, value: 'hello world'}));
 
     expect(view.peek()).toBe('hello world');
   });
@@ -97,7 +102,7 @@ describe('optimistic — core behaviour', () => {
     const {view, push} = reflected(1, 'real');
     const action = deferred();
 
-    optimistic(action.promise, (tx) => tx.set(view, 'optimistic'));
+    optimistic(action.promise, (tx) => tx.set({signal: view, value: 'optimistic'}));
     expect(view.peek()).toBe('optimistic');
 
     action.reject(new Error('server said no'));
@@ -111,7 +116,7 @@ describe('optimistic — core behaviour', () => {
   it('restores the server value on manual rollback without an action', () => {
     const {view} = reflected(1, 'real');
 
-    const handle = optimistic(undefined, (tx) => tx.set(view, 'optimistic'));
+    const handle = optimistic(undefined, (tx) => tx.set({signal: view, value: 'optimistic'}));
     expect(view.peek()).toBe('optimistic');
 
     handle.rollback();
@@ -122,7 +127,7 @@ describe('optimistic — core behaviour', () => {
     const {view, push} = reflected(1, 'real');
     const action = deferred();
 
-    const handle = optimistic(action.promise, (tx) => tx.set(view, 'optimistic'));
+    const handle = optimistic(action.promise, (tx) => tx.set({signal: view, value: 'optimistic'}));
     handle.rollback();
     action.resolve();
     await settle();
@@ -140,11 +145,12 @@ describe('asReflected — checked refinement', () => {
     // transport interface would, then recover the brand through asReflected.
     const loose: ReadonlySignal<Message[]> = view;
 
-    optimistic(undefined, (tx) =>
-      tx.update(asReflected(loose), (messages) => [
-        ...messages,
-        {id: 'tmp', text: 'b'},
-      ]),
+    optimistic(new Promise<never>(() => {}), (tx) =>
+      tx.update({
+        signal: asReflected(loose),
+        transform: (messages) => [...messages, {id: 'tmp', text: 'b'}],
+        key: (message) => message.id,
+      }),
     );
 
     expect(view.peek().map((message) => message.id)).toEqual(['s1', 'tmp']);
@@ -161,7 +167,7 @@ describe('optimistic — reconciliation', () => {
     const {view, rendered, push} = reflected(1, 'v1');
     const action = deferred();
 
-    optimistic(action.promise, (tx) => tx.set(view, 'v2'));
+    optimistic(action.promise, (tx) => tx.set({signal: view, value: 'v2'}));
     push('v2');
     action.resolve();
     await settle();
@@ -178,7 +184,7 @@ describe('optimistic — reconciliation', () => {
     const action = deferred();
 
     optimistic(action.promise, (tx) =>
-      tx.update(view, (object) => ({...object, title: 'new'})),
+      tx.update({signal: view, transform: (object) => ({...object, title: 'new'})}),
     );
     expect(view.peek()).toEqual({title: 'new', status: 'idle'});
 
@@ -196,7 +202,7 @@ describe('optimistic — reconciliation', () => {
     const {view, push} = reflected(1, 'server');
     const action = deferred();
 
-    optimistic(action.promise, (tx) => tx.set(view, 'optimistic'));
+    optimistic(action.promise, (tx) => tx.set({signal: view, value: 'optimistic'}));
     expect(view.peek()).toBe('optimistic');
 
     action.resolve();
@@ -215,14 +221,16 @@ describe('optimistic — until (source-driven reconciliation)', () => {
     const action = deferred();
 
     optimistic(action.promise, (tx) =>
-      tx.update(view, (messages) => [...messages, {id: 'tmp', text: 'b'}], {
-        until: (server) => server.length > 1,
+      tx.update({
+        signal: view,
+        transform: (messages) => [...messages, {id: 'tmp', text: 'b', cid: 'c1'}],
+        key: (message) => message.cid ?? message.id,
       }),
     );
     expect(view.peek().map((message) => message.id)).toEqual(['s1', 'tmp']);
 
     // The server append confirms the insert; the patch drops in the same update.
-    push([{id: 's2', text: 'b'}], 'append');
+    push([{id: 's2', text: 'b', cid: 'c1'}], 'append');
     expect(view.peek().map((message) => message.id)).toEqual(['s1', 's2']);
     // No flicker: the duplicate ['s1','s2','tmp'] is never rendered.
     expect(rendered.some((value) => value.length === 3)).toBe(false);
@@ -240,7 +248,9 @@ describe('optimistic — until (source-driven reconciliation)', () => {
     });
 
     optimistic(undefined, (tx) =>
-      tx.update(view, (object) => ({...object, title: 'new'}), {
+      tx.update({
+        signal: view,
+        transform: (object) => ({...object, title: 'new'}),
         until: (server) => server.title === 'new',
       }),
     );
@@ -260,7 +270,7 @@ describe('optimistic — until (source-driven reconciliation)', () => {
     const action = deferred();
 
     optimistic(action.promise, (tx) =>
-      tx.set(view, 'optimistic', {until: (server) => server === 'optimistic'}),
+      tx.set({signal: view, value: 'optimistic', until: (server) => server === 'optimistic'}),
     );
     expect(view.peek()).toBe('optimistic');
 
@@ -277,18 +287,26 @@ describe('optimistic — multiple changes', () => {
     const b = deferred();
 
     optimistic(a.promise, (tx) =>
-      tx.update(view, (messages) => [...messages, {id: 'a', text: 'A'}]),
+      tx.update({
+        signal: view,
+        transform: (messages) => [...messages, {id: 'a', text: 'A'}],
+        key: (message) => message.id,
+      }),
     );
     optimistic(b.promise, (tx) =>
-      tx.update(view, (messages) => [...messages, {id: 'b', text: 'B'}]),
+      tx.update({
+        signal: view,
+        transform: (messages) => [...messages, {id: 'b', text: 'B'}],
+        key: (message) => message.id,
+      }),
     );
     expect(view.peek().map((message) => message.id)).toEqual(['a', 'b']);
 
     push([{id: 'other', text: 'O'}], 'append');
     expect(view.peek().map((message) => message.id)).toEqual([
-      'other',
       'a',
       'b',
+      'other',
     ]);
 
     a.resolve();
@@ -306,10 +324,18 @@ describe('optimistic — multiple changes', () => {
     const b = deferred();
 
     const opA = optimistic(a.promise, (tx) =>
-      tx.update(view, (messages) => [...messages, {id: 'a', text: 'A'}]),
+      tx.update({
+        signal: view,
+        transform: (messages) => [...messages, {id: 'a', text: 'A'}],
+        key: (message) => message.id,
+      }),
     );
     optimistic(b.promise, (tx) =>
-      tx.update(view, (messages) => [...messages, {id: 'b', text: 'B'}]),
+      tx.update({
+        signal: view,
+        transform: (messages) => [...messages, {id: 'b', text: 'B'}],
+        key: (message) => message.id,
+      }),
     );
 
     opA.rollback();
@@ -322,8 +348,12 @@ describe('optimistic — multiple changes', () => {
     const action = deferred();
 
     optimistic(action.promise, (tx) => {
-      tx.update(list.view, (messages) => [...messages, {id: 'x', text: 'X'}]);
-      tx.set(title.view, 'New Title');
+      tx.update({
+        signal: list.view,
+        transform: (messages) => [...messages, {id: 'x', text: 'X'}],
+        key: (message) => message.id,
+      });
+      tx.set({signal: title.view, value: 'New Title'});
     });
     expect(list.view.peek().map((message) => message.id)).toEqual(['x']);
     expect(title.view.peek()).toBe('New Title');
@@ -346,11 +376,15 @@ describe('optimistic — compaction splice', () => {
     const action = deferred();
 
     optimistic(action.promise, (tx) =>
-      tx.update(view, (messages) => [
-        ...messages.slice(0, -1),
-        {id: 'compaction', text: 'compacting…'},
-        messages[messages.length - 1],
-      ]),
+      tx.update({
+        signal: view,
+        transform: (messages) => [
+          ...messages.slice(0, -1),
+          {id: 'compaction', text: 'compacting…'},
+          messages[messages.length - 1],
+        ],
+        key: (message) => message.id,
+      }),
     );
     expect(view.peek().map((message) => message.id)).toEqual([
       'm1',
@@ -381,7 +415,11 @@ describe('optimistic — wire delta guards', () => {
     const action = deferred();
 
     optimistic(action.promise, (tx) =>
-      tx.update(view, (messages) => [...messages, {id: 'tmp', text: 'b'}]),
+      tx.update({
+        signal: view,
+        transform: (messages) => [...messages, {id: 'tmp', text: 'b'}],
+        key: (message) => message.id,
+      }),
     );
 
     push({rogue: true}, 'merge');
@@ -393,7 +431,9 @@ describe('optimistic — wire delta guards', () => {
     const {view, push} = reflected<number[]>(1, [1, 2, 3]);
     const action = deferred();
 
-    optimistic(action.promise, (tx) => tx.update(view, (xs) => [...xs, 4]));
+    optimistic(action.promise, (tx) =>
+      tx.update({signal: view, transform: (xs) => [...xs, 4], key: (x) => x}),
+    );
 
     push({start: 1.5, deleteCount: 0, items: [9]}, 'splice');
 
@@ -402,30 +442,30 @@ describe('optimistic — wire delta guards', () => {
 });
 
 describe('optimistic — documented tradeoff of key-less reconciliation', () => {
-  it('briefly shows a duplicate for inserts when the push beats the reply', async () => {
+  it('rejects keyless array inserts instead of briefly showing duplicates', () => {
     const {view, rendered, push} = reflected<Message[]>(1, [
       {id: 's1', text: 'a'},
     ]);
-    const action = deferred();
 
-    optimistic(action.promise, (tx) =>
-      tx.update(view, (messages) => [...messages, {id: 'tmp', text: 'b'}]),
-    );
+    expect(() =>
+      optimistic(Promise.resolve(), (tx) =>
+        // @ts-expect-error array updates must declare a key
+        tx.update({
+          signal: view,
+          transform: (messages) => [...messages, {id: 'tmp', text: 'b'}],
+        }),
+      ),
+    ).toThrow(TypeError);
 
     push([{id: 's2', text: 'b'}], 'append');
-    expect(view.peek().map((message) => message.id)).toEqual(['s1', 's2', 'tmp']);
-    expect(rendered.some((value) => value.length === 3)).toBe(true);
-
-    action.resolve();
-    await settle();
-    expect(view.peek().map((message) => message.id)).toEqual(['s1', 's2']);
+    expect(rendered.some((value) => value.length === 3)).toBe(false);
   });
 
   it('reverts to the server base when the reply precedes the delta', async () => {
     const {view, rendered, push} = reflected(1, 'untitled');
     const action = deferred();
 
-    optimistic(action.promise, (tx) => tx.set(view, 'Renamed'));
+    optimistic(action.promise, (tx) => tx.set({signal: view, value: 'Renamed'}));
     expect(view.peek()).toBe('Renamed');
 
     action.resolve();
@@ -440,7 +480,7 @@ describe('optimistic — documented tradeoff of key-less reconciliation', () => 
   it('pins the optimistic value until rollback when there is no action', () => {
     const {view, push} = reflected(1, 'v1');
 
-    const handle = optimistic(undefined, (tx) => tx.set(view, 'optimistic'));
+    const handle = optimistic(undefined, (tx) => tx.set({signal: view, value: 'optimistic'}));
     push('v2');
     push('v3');
     expect(view.peek()).toBe('optimistic');
@@ -515,10 +555,11 @@ describe('optimistic — end-to-end over the wire', () => {
 
     const action = facade.send('hello');
     optimistic(action, (tx) =>
-      tx.update(facade.messages, (messages) => [
-        ...messages,
-        {id: 'tmp', text: 'hello'},
-      ]),
+      tx.update({
+        signal: facade.messages,
+        transform: (messages) => [...messages, {id: 'tmp', text: 'hello'}],
+        key: (message) => message.id,
+      }),
     );
     expect(facade.messages.peek().map((message) => message.text)).toEqual([
       'hello',
@@ -545,10 +586,11 @@ describe('optimistic — end-to-end over the wire', () => {
 
     const action = facade.boom();
     optimistic(action, (tx) =>
-      tx.update(facade.messages, (messages) => [
-        ...messages,
-        {id: 'tmp', text: 'never'},
-      ]),
+      tx.update({
+        signal: facade.messages,
+        transform: (messages) => [...messages, {id: 'tmp', text: 'never'}],
+        key: (message) => message.id,
+      }),
     );
     expect(facade.messages.peek().map((message) => message.text)).toEqual([
       'never',
@@ -575,7 +617,7 @@ describe('optimistic — end-to-end over the wire', () => {
     await flush();
 
     const action = facade.setTitle('Renamed');
-    optimistic(action, (tx) => tx.set(facade.title, 'Renamed'));
+    optimistic(action, (tx) => tx.set({signal: facade.title, value: 'Renamed'}));
     expect(facade.title.peek()).toBe('Renamed');
 
     await flush();
@@ -592,17 +634,21 @@ describe('optimistic — compile-time type safety', () => {
     const guard = (tx: OptimisticTransaction) => {
       const plain = signal('local');
       // @ts-expect-error a plain signal is not a ReflectedSignal
-      tx.set(plain, 'next');
+      tx.set({signal: plain, value: 'next'});
 
       const text = reflected(90, 'x').view;
       // @ts-expect-error the value must match the signal's type
-      tx.set(text, 123);
+      tx.set({signal: text, value: 123});
 
       const numbers = reflected<number[]>(91, []).view;
-      tx.update(numbers, (current) => {
-        // @ts-expect-error the current value is read-only
-        current.push(1);
-        return [...current];
+      tx.update({
+        signal: numbers,
+        transform: (current) => {
+          // @ts-expect-error the current value is read-only
+          current.push(1);
+          return [...current];
+        },
+        key: (number) => number,
       });
     };
 
@@ -617,10 +663,13 @@ describe('optimistic — compile-time type safety', () => {
   it('treats Map-valued reflected signals as read-only inside update', () => {
     const guard = (tx: OptimisticTransaction) => {
       const map = reflected<Map<string, number>>(95, new Map()).view;
-      tx.update(map, (current) => {
-        // @ts-expect-error a read-only map exposes no mutators
-        current.set('x', 1);
-        return new Map(current);
+      tx.update({
+        signal: map,
+        transform: (current) => {
+          // @ts-expect-error a read-only map exposes no mutators
+          current.set('x', 1);
+          return new Map(current);
+        },
       });
     };
 

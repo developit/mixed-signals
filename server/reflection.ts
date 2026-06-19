@@ -1,4 +1,5 @@
 import {Signal} from '@preact/signals-core';
+import type {DeltaMode, SpliceDelta} from '../shared/delta.ts';
 import {
   formatNotificationMessage,
   SIGNAL_UPDATE_METHOD,
@@ -7,7 +8,6 @@ import type {Instances} from './instances.ts';
 
 type SignalId = number;
 type ClientId = string;
-type DeltaMode = 'append' | 'merge';
 
 interface RpcSender {
   send(clientId: string, message: string): void;
@@ -258,6 +258,9 @@ export class Reflection {
       ) {
         return null;
       }
+
+      const splice = this.computeArraySplice(oldValue, newValue);
+      if (splice) return {value: splice, mode: 'splice'};
     }
 
     if (
@@ -297,5 +300,32 @@ export class Reflection {
     }
 
     return {value: newValue};
+  }
+
+  private computeArraySplice(oldValue: any[], newValue: any[]): SpliceDelta | null {
+    let start = 0;
+    while (
+      start < oldValue.length &&
+      start < newValue.length &&
+      oldValue[start] === newValue[start]
+    ) {
+      start++;
+    }
+
+    let oldEnd = oldValue.length - 1;
+    let newEnd = newValue.length - 1;
+    while (
+      oldEnd >= start &&
+      newEnd >= start &&
+      oldValue[oldEnd] === newValue[newEnd]
+    ) {
+      oldEnd--;
+      newEnd--;
+    }
+
+    const deleteCount = oldEnd - start + 1;
+    const items = newValue.slice(start, newEnd + 1);
+    if (deleteCount === 0 && items.length === 0) return null;
+    return {start, deleteCount, items};
   }
 }

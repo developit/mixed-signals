@@ -8,6 +8,7 @@ import {
   applyServerUpdate,
   coerceDeltaMode,
   linkSource,
+  resetOptimisticOverlay,
 } from './optimistic.ts';
 import type {RPCClient} from './rpc.ts';
 
@@ -34,6 +35,9 @@ export class ClientReflection {
 
   /** Clear cached signals and model facades so a reconnection gets fresh state. */
   reset() {
+    for (const signal of this.signals.values()) {
+      resetOptimisticOverlay(signal);
+    }
     this.signals.clear();
     this.models.clear();
     this.watchBatch.clear();

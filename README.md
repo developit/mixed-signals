@@ -17,7 +17,7 @@ The only dependency is `@preact/signals-core` (>=1.8.0).
 - **Server** models use `createModel()` from `mixed-signals/server` _(a thin wrapper around `@preact/signals-core`'s `createModel`)_
 - **Client** models use `createReflectedModel()` from `mixed-signals/client` to create local proxies that mirror server state
 - An **RPC** layer handles method calls (client → server) and signal updates (server → client)
-- Delta compression for arrays (append), objects (merge), and strings (append) minimizes bandwidth
+- Delta compression for arrays (append/splice), objects (merge), and strings (append) minimizes bandwidth
 
 ## Optimistic UI
 
@@ -27,13 +27,17 @@ Reflected signals are server-owned, but `optimistic()` lets you mutate the very 
 import { optimistic } from "mixed-signals/client";
 
 optimistic(session.send(text), (tx) => {
-  tx.update(session.messages, (messages) => [...messages, localUserMessage]);
+  tx.update({
+    signal: session.messages,
+    transform: (messages) => [...messages, localUserMessage],
+    key: (message) => message.clientMutationId ?? message.id,
+  });
 });
 ```
 
-`tx.set` replaces a value and `tx.update` derives the next one from a read-only view of the current value. Both only accept reflected signals (`ReflectedSignal<T>`, produced by `createReflectedModel`), so passing a plain local signal is a compile error. Without an action, drive the lifecycle yourself with the returned `handle.rollback()`.
+`tx.set` replaces a value and `tx.update` derives the next one from a read-only view of the current value. Both take a single named-arguments object (`{ signal, value | transform, ... }`) and only accept reflected signals (`ReflectedSignal<T>`, produced by `createReflectedModel`), so passing a plain local signal is a compile error. Array changes must declare a primitive, unique `key` so inserts, deletes, replaces, and moves reconcile by element identity instead of by position. Optimistic inserts require an action promise; if the server never reflects the inserted key, the action settlement drops or rolls back the provisional item.
 
-Reconciliation is driven by the server pushing the reflecting delta around the same time as the RPC reply (as the bundled `RPC` does), so the optimistic value stays on screen until the server-owned value takes over. Because there are no per-item keys, an `insert` may briefly show a duplicate if the append delta arrives before the reply.
+For optimistic inserts, the key must be present on the eventual server item as well, commonly via an app-level client mutation id echoed by the server. Without an action, drive non-insert lifecycles yourself with the returned `handle.rollback()`.
 
 ## Full Example
 
@@ -163,6 +167,21 @@ forwarded — no per-model declaration needed.
 
 ### `mixed-signals/client`
 
+#### `asReflected`
+
+- Kind: **Function**
+- Signatures:
+  - `(signal: ReadonlySignal<T>) => ReflectedSignal<T>` — Refine a signal to the reflected (server-owned) brand so it can be written
+optimistically via optimistic. Signals produced by the reflection
+layer carry the brand at runtime; this verifies it and narrows the static
+type, throwing if the signal is a plain local one.
+
+Use it when a reflected signal is typed more loosely than its runtime brand —
+e.g. a generated transport interface that describes the signal as a plain
+Signal/ReadonlySignal because the generator predates the
+brand. This is a checked narrowing, not a blind cast: misuse fails fast
+instead of producing an inert overlay.
+
 #### `createReflectedModel`
 
 - Kind: **Function**
@@ -179,11 +198,17 @@ declared ahead of time: each change is layered over the live signal while
 server deltas keep updating a hidden base, and the overlay reconciles to the
 server-owned value once `action` settles.
 
-Reconciliation assumes the server pushes the reflecting delta around the same
-time it replies (as the bundled `RPC` does). If the reply arrives first, or
-the signal is not being watched, the value briefly reverts to the server base
-until the delta lands. Without an `action`, reconcile manually with
-OptimisticHandle.rollback. Otherwise the patch is never dropped.
+Array changes require a primitive, unique `key`; each keyed
+insert/remove/replace/move reconciles independently the moment the server
+base reflects it. For keyed inserts the key must also appear on the eventual
+server item (commonly an echoed client-mutation-id); otherwise a one-frame
+duplicate may show until `action` settles and rolls the provisional item back.
+
+For non-array values, reconciliation assumes the server pushes the reflecting
+delta around the same time it replies (as the bundled `RPC` does). When the
+reply does not coincide with the delta, pass `until` so the change reconciles
+the moment the server reflects it. Without an `action`, reconcile manually
+with OptimisticHandle.rollback.
 
 #### `OptimisticHandle`
 
@@ -197,9 +222,13 @@ OptimisticHandle.rollback. Otherwise the patch is never dropped.
 - Kind: **Interface**
 - Records optimistic changes against reflected signals within a transaction.
 - Methods:
-  - `set(signal: ReflectedSignal<T>, value: T) => void` — Replace a reflected signal's value optimistically.
-  - `update(signal: ReflectedSignal<T>, transform: (current: Immutable<T>) => T) => void` — Derive a reflected signal's next value from its current (read-only) one.
-The transform must be pure: it may read `current` but must not mutate it.
+  - `set(args: SetArgs<T>) => void` — Replace a reflected signal's value optimistically. Array values require a
+`key`; for keyed inserts the key must also appear on the eventual server
+item, or a one-frame duplicate may show until the bound action settles.
+  - `update(args: UpdateArgs<T>) => void` — Derive a reflected signal's next value from its current (read-only) one.
+Array values require a `key`; for keyed inserts the key must also appear on
+the eventual server item, or a one-frame duplicate may show until the bound
+action settles.
 
 #### `ReflectedSignal`
 
@@ -207,8 +236,9 @@ The transform must be pure: it may read `current` but must not mutate it.
 - A reflected, server-owned signal that the UI renders read-only but may be
 mutated optimistically through optimistic. The brand is nominal:
 only signals produced by the reflection layer satisfy it, so passing a plain
-local signal is a compile error. `T` is invariant, so a wider/narrower view
-cannot be substituted to smuggle a mistyped write into the source.
+local signal is a compile error. `T` is invariant (`in out`), so a
+wider/narrower view cannot be substituted to smuggle a mistyped write into
+the source.
 - Methods:
   - `peek() => T`
   - `subscribe(fn: (value: T) => void) => () => void`
@@ -216,7 +246,6 @@ cannot be substituted to smuggle a mistyped write into the source.
   - `toString() => string`
   - `valueOf() => T`
 - Properties:
-  - `[INVARIANT]: (value: T) => T`
   - `[SOURCE]: Signal<T>`
   - `brand: query`
   - `value: T`
