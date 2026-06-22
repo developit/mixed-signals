@@ -37,7 +37,7 @@ optimistic(session.send(text), (tx) => {
 
 `tx.set` replaces a value and `tx.update` derives the next one from a read-only view of the current value. Both take a single named-arguments object (`{ signal, value | transform, ... }`) and only accept reflected signals (`ReflectedSignal<T>`, produced by `createReflectedModel`), so passing a plain local signal is a compile error. Array changes must declare a primitive, unique `key` so inserts, deletes, replaces, and moves reconcile by element identity instead of by position. Optimistic inserts require an action promise; if the server never reflects the inserted key, the action settlement drops or rolls back the provisional item.
 
-For optimistic inserts, the key must be present on the eventual server item as well, commonly via an app-level client mutation id echoed by the server. Without an action, drive non-insert lifecycles yourself with the returned `handle.rollback()`.
+For optimistic inserts, the key must be present on the eventual server item as well, commonly via an app-level client mutation id echoed by the server. When the server echoes that key, pass `echoed: true`: the insert then reconciles strictly by key-confirmation and a successful action never rolls it back (only a rejection does), so an action that settles before the echo arrives no longer drops the provisional item for a frame. Leave it unset when the server assigns its own id, where the action's settlement is what cleans up the provisional row. Without an action, drive non-insert lifecycles yourself with the returned `handle.rollback()`.
 
 ## Full Example
 

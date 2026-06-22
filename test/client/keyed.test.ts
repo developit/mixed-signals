@@ -210,6 +210,91 @@ describe('keyed optimistic — insert', () => {
   });
 });
 
+describe('keyed optimistic — echoed (source-driven, action rolls back only on failure)', () => {
+  const seenContinuously = (frames: Msg[][], text: string) => {
+    const appeared = frames.map((f) => f.some((m) => m.text === text));
+    const first = appeared.indexOf(true);
+    return first !== -1 && appeared.slice(first).every(Boolean);
+  };
+
+  it('a successful action settling before the echo does not remove-and-re-add the item', async () => {
+    const {view, frames, stop, push} = reflected(1, BASE);
+    const action = Promise.resolve();
+
+    optimistic(action, (tx) =>
+      tx.update({
+        signal: view,
+        transform: (m) => [...m, {id: 'tmp', role: 'user' as const, text: 'new', cid: 'c1'}],
+        key: (m) => m.cid ?? m.id,
+        echoed: true,
+      }),
+    );
+
+    await action;
+    await settle();
+    expect(userTexts(view.peek(), 'new')).toBe(1);
+
+    push([{id: 'srvU', role: 'user', text: 'new', cid: 'c1'}], 'append');
+    stop();
+
+    expect(seenContinuously(frames, 'new')).toBe(true);
+    expect(Math.max(...frames.map((f) => userTexts(f, 'new')))).toBe(1);
+    expect(ids(view.peek())).toEqual(['m0', 'm1', 'srvU']);
+  });
+
+  it('the echo confirms the insert in place, and the later settling action is a no-op', async () => {
+    const {view, frames, stop, push} = reflected(1, BASE);
+    const action = Promise.resolve();
+
+    optimistic(action, (tx) =>
+      tx.update({
+        signal: view,
+        transform: (m) => [...m, {id: 'tmp', role: 'user' as const, text: 'new', cid: 'c1'}],
+        key: (m) => m.cid ?? m.id,
+        echoed: true,
+      }),
+    );
+
+    push([{id: 'srvU', role: 'user', text: 'new', cid: 'c1'}], 'append');
+    expect(ids(view.peek())).toEqual(['m0', 'm1', 'srvU']);
+
+    await action;
+    await settle();
+    stop();
+
+    expect(seenContinuously(frames, 'new')).toBe(true);
+    expect(frames.some((f) => userTexts(f, 'new') > 1)).toBe(false);
+    expect(ids(view.peek())).toEqual(['m0', 'm1', 'srvU']);
+  });
+
+  it('a rejected action rolls the optimistic item back', async () => {
+    const {view, push} = reflected(1, BASE);
+    let reject!: (error: unknown) => void;
+    const action = new Promise((_resolve, rej) => {
+      reject = rej;
+    });
+
+    optimistic(action, (tx) =>
+      tx.update({
+        signal: view,
+        transform: (m) => [...m, {id: 'tmp', role: 'user' as const, text: 'new', cid: 'c1'}],
+        key: (m) => m.cid ?? m.id,
+        echoed: true,
+      }),
+    );
+    expect(ids(view.peek())).toEqual(['m0', 'm1', 'tmp']);
+
+    reject(new Error('server said no'));
+    await action.catch(() => {});
+    await settle();
+
+    expect(ids(view.peek())).toEqual(['m0', 'm1']);
+
+    push([{id: 'm2', role: 'user', text: 'fresh'}], 'append');
+    expect(ids(view.peek())).toEqual(['m0', 'm1', 'm2']);
+  });
+});
+
 describe('keyed optimistic — delete & replace', () => {
   it('delete by existing server id: hidden immediately, confirmed on reflect', () => {
     const m2: Msg = {id: 'm2', role: 'user', text: 'bye'};

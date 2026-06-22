@@ -559,9 +559,26 @@ export function applyServerUpdate(
 type ChangeOptions<T> = T extends ReadonlyArray<unknown>
   ? {
       key: (item: Immutable<T[number]>) => PropertyKey;
+      /**
+       * Declare that the server echoes this change's `key` on the real item — the
+       * documented keyed-insert contract. Reconciliation is then strictly
+       * source-driven: the provisional item stays until the server reflects the
+       * key (confirmed in the same delta, flicker-free), and a *successful* action
+       * never rolls it back. This matters when the action settles before the echo
+       * arrives (e.g. an action that resolves once the work is accepted and streams
+       * the echoing delta afterwards): without it, the settling action drops the
+       * provisional item for a frame until the echo re-adds it — a flash. The
+       * action's *rejection* still rolls the change back.
+       *
+       * Leave unset (default) for keys the server does not echo: there the action's
+       * settlement cleans up an unconfirmed insert (a one-frame duplicate may show),
+       * which is the safe behaviour when no echo is coming.
+       */
+      echoed?: boolean;
       until?: never;
     }
   : {
+      echoed?: never;
       /**
        * Reconcile as soon as the server-owned value satisfies the predicate —
        * i.e. the change is now reflected in the source — instead of waiting for
@@ -633,9 +650,10 @@ export function optimistic(
   action: Promise<unknown> | undefined,
   apply: (tx: OptimisticTransaction) => void,
 ): OptimisticHandle {
-  const drops: Array<() => void> = [];
+  const settleDrops: Array<() => void> = [];
+  const failureDrops: Array<() => void> = [];
 
-  type RecordOptions = {key?: KeyFn; until?: (base: any) => boolean};
+  type RecordOptions = {key?: KeyFn; echoed?: boolean; until?: (base: any) => boolean};
 
   // Internal recorder. Typed with `any` for the value because the public
   // `ReflectedSignal<T>` is invariant, which would otherwise block inference
@@ -650,7 +668,7 @@ export function optimistic(
 
     if (options.key) {
       const id = overlay.layerKeyed(transform, options.key, action !== undefined);
-      drops.push(() => overlay.drop(id));
+      (options.echoed ? failureDrops : settleDrops).push(() => overlay.drop(id));
       return;
     }
 
@@ -663,7 +681,13 @@ export function optimistic(
       throw new TypeError('optimistic: array changes require a key option');
     }
     const id = overlay.layer(transform, options.until);
-    drops.push(() => overlay.drop(id));
+    settleDrops.push(() => overlay.drop(id));
+  };
+
+  const dropAll = (...lists: Array<Array<() => void>>): void => {
+    batch(() => {
+      for (const list of lists) for (const drop of list) drop();
+    });
   };
 
   batch(() => {
@@ -677,18 +701,17 @@ export function optimistic(
     } catch (error) {
       // Atomicity: roll back any ops recorded before the callback threw so the
       // overlay is never left stuck without a handle to clear it.
-      for (const drop of drops) drop();
+      dropAll(settleDrops, failureDrops);
       throw error;
     }
   });
 
-  const rollback = () => {
-    batch(() => {
-      for (const drop of drops) drop();
-    });
-  };
+  const rollback = () => dropAll(settleDrops, failureDrops);
 
-  action?.then(rollback, rollback);
+  action?.then(
+    () => dropAll(settleDrops),
+    () => dropAll(settleDrops, failureDrops),
+  );
 
   return {rollback};
 }
