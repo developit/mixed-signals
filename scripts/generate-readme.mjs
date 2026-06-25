@@ -109,9 +109,7 @@ function renderNode(node) {
     lines.push('- Signatures:');
     for (const sig of node.signatures) {
       const sigDesc = commentText(sig.comment);
-      lines.push(
-        `  - \`${sigToLine(sig)}\`${sigDesc ? ' — ' + sigDesc : ''}`,
-      );
+      lines.push(`  - \`${sigToLine(sig)}\`${sigDesc ? ' — ' + sigDesc : ''}`);
     }
   }
 

@@ -20,14 +20,21 @@ type MessageHandler = (data: {toString(): string}) => void | Promise<void>;
 class FakeTransport implements Transport {
   sent: string[] = [];
   private handler?: MessageHandler;
+  private closeHandler?: (error?: unknown) => void;
   send(data: string) {
     this.sent.push(data);
   }
   onMessage(cb: (data: {toString(): string}) => void) {
     this.handler = cb;
   }
+  onClose(cb: (error?: unknown) => void) {
+    this.closeHandler = cb;
+  }
   async emit(data: string) {
     await this.handler?.({toString: () => data});
+  }
+  close(error?: unknown) {
+    this.closeHandler?.(error);
   }
 }
 
@@ -100,6 +107,165 @@ describe('RPC', () => {
     cleanup();
     rpc.notify('test', ['data']);
     expect(sent).toHaveLength(0);
+  });
+
+  it('transport close stops message delivery', () => {
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    rpc.expose(root);
+
+    const sent: string[] = [];
+    const transport = new FakeTransport();
+    transport.send = (data: string) => sent.push(data);
+    rpc.addClient(transport);
+    sent.length = 0;
+
+    transport.close();
+    rpc.notify('test', ['data']);
+
+    expect(sent).toHaveLength(0);
+  });
+
+  it('only marks a reused client id as resumed while retained state is active', () => {
+    const rpc = new RPC({count: signal(1)});
+    const first = new FakeTransport();
+    const cleanup = rpc.addClient(first, 'client-1');
+    const firstInfo = parseNotification(first.sent[0]).params[1] as any;
+
+    const replacement = new FakeTransport();
+    const cleanupReplacement = rpc.addClient(replacement, 'client-1');
+    const replacementInfo = parseNotification(replacement.sent[0])
+      .params[1] as any;
+
+    cleanup();
+    cleanupReplacement();
+
+    const afterCleanup = new FakeTransport();
+    rpc.addClient(afterCleanup, 'client-1');
+    const afterCleanupInfo = parseNotification(afterCleanup.sent[0])
+      .params[1] as any;
+
+    expect(firstInfo).toMatchObject({
+      connectionId: 'client-1',
+      resumed: false,
+    });
+    expect(replacementInfo).toMatchObject({
+      connectionId: 'client-1',
+      resumed: true,
+      processId: firstInfo.processId,
+    });
+    expect(afterCleanupInfo).toMatchObject({
+      connectionId: 'client-1',
+      resumed: false,
+      processId: firstInfo.processId,
+    });
+  });
+
+  it('sends a full root snapshot when a client id reconnects before old cleanup', () => {
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    rpc.expose(root);
+
+    const first = new FakeTransport();
+    rpc.addClient(first, 'client-1');
+
+    const second = new FakeTransport();
+    rpc.addClient(second, 'client-1');
+
+    const payload = parseNotification(second.sent[0]).params;
+    expect(payload[0] as any).toMatchObject({
+      '@M': 'Counter#0',
+      count: {'@S': expect.any(Number), v: 0},
+    });
+  });
+
+  it('refreshes serialized models by marker', async () => {
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    root.count.value = 7;
+    rpc.expose(root);
+
+    const transport = new FakeTransport();
+    rpc.addClient(transport, 'client-1');
+    transport.sent.length = 0;
+
+    await transport.emit(formatCallMessage(1, '@M', ['Counter#0']));
+
+    const message = parseWireMessage(transport.sent[0]);
+    expect(message?.type).toBe('result');
+    if (message?.type === 'result') {
+      expect(parseWireValue(message.payload)).toMatchObject([
+        {
+          '@M': 'Counter#0',
+          count: {'@S': expect.any(Number), v: 7},
+        },
+      ]);
+    }
+  });
+
+  it('returns null for model markers that cannot be resolved', async () => {
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    rpc.expose(new Counter());
+
+    const transport = new FakeTransport();
+    rpc.addClient(transport, 'client-1');
+    transport.sent.length = 0;
+
+    await transport.emit(formatCallMessage(1, '@M', ['Counter#missing']));
+
+    const message = parseWireMessage(transport.sent[0]);
+    expect(message?.type).toBe('result');
+    if (message?.type === 'result') {
+      expect(parseWireValue(message.payload)).toEqual([null]);
+    }
+  });
+
+  it('late cleanup from an old transport does not delete a reconnected client id', () => {
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    rpc.expose(new Counter());
+
+    const first = new FakeTransport();
+    const cleanupFirst = rpc.addClient(first, 'client-1');
+    first.sent.length = 0;
+
+    const second = new FakeTransport();
+    rpc.addClient(second, 'client-1');
+    second.sent.length = 0;
+
+    cleanupFirst();
+    rpc.notify('test', ['data'], 'client-1');
+
+    expect(first.sent).toHaveLength(0);
+    expect(second.sent).toEqual(['N:test:"data"']);
+  });
+
+  it('does not deliver async results from an old transport to a replacement client id', async () => {
+    let resolveSlow!: (value: string) => void;
+    const slow = new Promise<string>((resolve) => {
+      resolveSlow = resolve;
+    });
+    const rpc = new RPC({slow: () => slow});
+
+    const first = new FakeTransport();
+    rpc.addClient(first, 'client-1');
+    first.sent.length = 0;
+
+    const handling = first.emit(formatCallMessage(1, 'slow', []));
+
+    const second = new FakeTransport();
+    rpc.addClient(second, 'client-1');
+    second.sent.length = 0;
+
+    resolveSlow('done');
+    await handling;
+
+    expect(first.sent).toHaveLength(0);
+    expect(second.sent).toHaveLength(0);
   });
 
   it('routes nested root methods and returns results', async () => {

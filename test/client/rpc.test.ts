@@ -1,4 +1,4 @@
-import {describe, expect, it} from 'vitest';
+import {afterEach, describe, expect, it, vi} from 'vitest';
 import type {WireContext} from '../../client/reflection.ts';
 import {RPCClient} from '../../client/rpc.ts';
 import type {Transport} from '../../shared/protocol.ts';
@@ -7,9 +7,17 @@ import {ReflectedCounter} from '../helpers.ts';
 class FakeTransport implements Transport {
   sent: string[] = [];
   ready?: Promise<void>;
+  onOpen?: (cb: () => void) => void;
   private handler?: (data: {toString(): string}) => void;
-  constructor(ready?: Promise<void>) {
+  private closeHandler?: (error?: unknown) => void;
+  private openHandler?: () => void;
+  constructor(ready?: Promise<void>, reconnectable = false) {
     this.ready = ready;
+    if (reconnectable) {
+      this.onOpen = (cb: () => void) => {
+        this.openHandler = cb;
+      };
+    }
   }
   send(data: string) {
     this.sent.push(data);
@@ -17,8 +25,17 @@ class FakeTransport implements Transport {
   onMessage(cb: (data: {toString(): string}) => void) {
     this.handler = cb;
   }
+  onClose(cb: (error?: unknown) => void) {
+    this.closeHandler = cb;
+  }
   emit(data: string) {
     this.handler?.({toString: () => data});
+  }
+  open() {
+    this.openHandler?.();
+  }
+  close(error?: unknown) {
+    this.closeHandler?.(error);
   }
 }
 
@@ -27,6 +44,10 @@ function createContext(): WireContext {
     rpc: {call: async () => undefined} as Partial<RPCClient>,
   } as unknown as WireContext;
 }
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe('RPCClient', () => {
   describe('message parsing', () => {
@@ -118,6 +139,40 @@ describe('RPCClient', () => {
       await pending;
     });
 
+    it('rejects calls if the transport disconnects before transport.ready', async () => {
+      const ready = new Promise<void>(() => undefined);
+      const transport = new FakeTransport(ready);
+      const client = new RPCClient(transport, createContext());
+      void client.ready.catch(() => undefined);
+
+      const pending = client.call('ping', []);
+      expect(transport.sent).toHaveLength(0);
+
+      transport.close();
+
+      await expect(pending).rejects.toThrow('Transport disconnected');
+    });
+
+    it('allows calls after a reconnectable transport opens again', async () => {
+      let rejectReady!: (error: Error) => void;
+      const ready = new Promise<void>((_, reject) => {
+        rejectReady = reject;
+      });
+      const transport = new FakeTransport(ready, true);
+      const client = new RPCClient(transport, createContext());
+      void client.ready.catch(() => undefined);
+
+      transport.close(new Error('closed'));
+      rejectReady(new Error('closed'));
+      await Promise.resolve();
+
+      transport.open();
+      const pending = client.call('ping', []);
+      expect(transport.sent[0]).toBe('M1:ping:');
+      transport.emit('R1:"pong"');
+      await expect(pending).resolves.toBe('pong');
+    });
+
     it('resolves and rejects pending calls from result and error frames', async () => {
       const transport = new FakeTransport();
       const client = new RPCClient(transport, createContext());
@@ -130,6 +185,19 @@ describe('RPCClient', () => {
       const sum2 = client.call('sum', []);
       transport.emit('E2:{"message":"boom"}');
       await expect(sum2).rejects.toThrow('boom');
+    });
+
+    it('rejects pending calls when the transport disconnects', async () => {
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      void client.ready.catch(() => undefined);
+
+      const pending = client.call('sum', [1, 2]);
+      expect(transport.sent[0]).toBe('M1:sum:1,2');
+
+      transport.close();
+
+      await expect(pending).rejects.toThrow('Transport disconnected');
     });
   });
 
@@ -173,6 +241,36 @@ describe('RPCClient', () => {
       const client = new RPCClient(transport, createContext());
       transport.emit('N:@R:{"value":"root-data"}');
       await client.ready;
+      expect(client.root).toEqual({value: 'root-data'});
+    });
+
+    it('rejects ready when a non-reconnectable transport disconnects before root arrives', async () => {
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+
+      transport.close();
+
+      await expect(client.ready).rejects.toThrow('Transport disconnected');
+    });
+
+    it('keeps ready pending for reconnectable transports until root arrives', async () => {
+      vi.useFakeTimers();
+      const transport = new FakeTransport(undefined, true);
+      const client = new RPCClient(transport, createContext());
+
+      transport.close();
+
+      let resolved = false;
+      client.ready.then(() => {
+        resolved = true;
+      });
+      await vi.advanceTimersByTimeAsync(20);
+      expect(resolved).toBe(false);
+
+      transport.open();
+      transport.emit('N:@R:{"value":"root-data"}');
+      await client.ready;
+
       expect(client.root).toEqual({value: 'root-data'});
     });
 
@@ -423,7 +521,43 @@ describe('RPCClient', () => {
       expect(transport2.sent[0]).toMatch(/^M\d+:ping:/);
     });
 
-    it('clears reflection state so new signals are created fresh', () => {
+    it('ignores stale messages from an old transport after reconnect', async () => {
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+      transport1.emit('N:@R:{"v":1}');
+      await client.ready;
+
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+      transport1.emit('N:@R:{"v":999}');
+      expect(client.root).toEqual({v: 1});
+
+      transport2.emit('N:@R:{"v":2}');
+      await client.ready;
+      expect(client.root).toEqual({v: 2});
+    });
+
+    it('does not send calls queued on an old transport.ready after reconnect', async () => {
+      let resolveReady!: () => void;
+      const ready = new Promise<void>((resolve) => {
+        resolveReady = resolve;
+      });
+      const transport1 = new FakeTransport(ready);
+      const client = new RPCClient(transport1, createContext());
+
+      const pending = client.call('ping', []);
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+      await expect(pending).rejects.toThrow('Transport reconnected');
+
+      resolveReady();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(transport1.sent).toHaveLength(0);
+      expect(transport2.sent).toHaveLength(0);
+    });
+
+    it('keeps reflection state so reconnect snapshots can refresh existing signals', () => {
       const transport1 = new FakeTransport();
       const client = new RPCClient(transport1, createContext());
 
@@ -433,10 +567,57 @@ describe('RPCClient', () => {
       const transport2 = new FakeTransport();
       client.reconnect(transport2);
 
-      // Same ID but should get a new signal instance
       const newSig = client.reflection.getOrCreateSignal(1, 'fresh');
-      expect(newSig).not.toBe(oldSig);
-      expect(newSig.peek()).toBe('fresh');
+      expect(newSig).toBe(oldSig);
+      expect(newSig.peek()).toBe('old');
+    });
+
+    it('refreshes existing root signals from the reconnect root snapshot', async () => {
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+      transport1.emit('N:@R:{"count":{"@S":1,"v":1}}');
+      await client.ready;
+
+      const root = client.root;
+      const count = client.root.count;
+
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+      transport2.emit('N:@R:{"count":{"@S":1,"v":2}}');
+      await client.ready;
+
+      expect(client.root).toBe(root);
+      expect(client.root.count).toBe(count);
+      expect(count.peek()).toBe(2);
+    });
+
+    it('rebinds active root signals when a new process assigns different signal ids', async () => {
+      vi.useFakeTimers();
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+      transport1.emit(
+        'N:@R:{"count":{"@S":1,"v":1}},{"connectionId":"c1","processId":"p1","resumed":false}',
+      );
+      await client.ready;
+
+      const count = client.root.count;
+      count.subscribe(() => undefined);
+      vi.advanceTimersByTime(1);
+      expect(transport1.sent).toContain('N:@W:1');
+
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+      transport2.emit(
+        'N:@R:{"count":{"@S":9,"v":9}},{"connectionId":"c1","processId":"p2","resumed":false}',
+      );
+      await client.ready;
+
+      expect(client.root.count).toBe(count);
+      expect(count.peek()).toBe(9);
+      expect(transport2.sent).toContain('N:@W:9');
+
+      transport2.emit('N:@S:9,10');
+      expect(count.peek()).toBe(10);
     });
 
     it('processes messages on the new transport', () => {
@@ -465,6 +646,159 @@ describe('RPCClient', () => {
         'N:@R:{"@M":"Counter#1","count":{"@S":1,"v":0},"name":{"@S":2,"v":"x"},"items":{"@S":3,"v":[]},"meta":{"@S":4,"v":{}}}',
       );
       expect(client.root.id.peek()).toBe('1');
+    });
+
+    it('refreshes existing reflected model facades across process changes', async () => {
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+      client.registerModel('Counter', ReflectedCounter);
+      transport1.emit(
+        'N:@R:{"@M":"Counter#1","count":{"@S":1,"v":0},"name":{"@S":2,"v":"x"},"items":{"@S":3,"v":[]},"meta":{"@S":4,"v":{}}},{"connectionId":"c1","processId":"p1","resumed":false}',
+      );
+      await client.ready;
+
+      const model = client.root;
+      const count = model.count;
+      expect(count.peek()).toBe(0);
+
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+      transport2.emit(
+        'N:@R:{"@M":"Counter#1","count":{"@S":10,"v":5},"name":{"@S":20,"v":"y"},"items":{"@S":30,"v":[]},"meta":{"@S":40,"v":{}}},{"connectionId":"c1","processId":"p2","resumed":false}',
+      );
+      await client.ready;
+
+      expect(client.root).toBe(model);
+      expect(model.count).toBe(count);
+      expect(count.peek()).toBe(5);
+
+      expect(transport2.sent[0]).toBe('M1:@M:"Counter#1"');
+
+      const pending = model.increment();
+      expect(transport2.sent.at(-1)).toBe('M2:1#increment:');
+      transport2.emit('R2:null');
+      await pending;
+    });
+
+    it('does not reuse raw signal ids across different server processes', async () => {
+      vi.useFakeTimers();
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+      client.registerModel('Counter', ReflectedCounter);
+      transport1.emit(
+        'N:@R:{"root":true},{"connectionId":"c1","processId":"p1","resumed":false}',
+      );
+      await client.ready;
+
+      const held = client.reflection.createModelFacade({
+        '@M': 'Counter#held',
+        count: client.reflection.getOrCreateSignal(1, 1),
+        name: client.reflection.getOrCreateSignal(2, 'x'),
+        items: client.reflection.getOrCreateSignal(3, []),
+        meta: client.reflection.getOrCreateSignal(4, {}),
+      });
+      const heldCount = held.count;
+      heldCount.subscribe(() => undefined);
+      vi.advanceTimersByTime(1);
+      expect(transport1.sent).toContain('N:@W:1');
+
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+      transport2.emit(
+        'N:@R:{"label":{"@S":1,"v":"new-root-signal"}},{"connectionId":"c1","processId":"p2","resumed":false}',
+      );
+      await client.ready;
+
+      expect(client.root.label).not.toBe(heldCount);
+      expect(client.root.label.peek()).toBe('new-root-signal');
+      expect(heldCount.peek()).toBe(1);
+
+      transport2.emit(
+        'R1:[{"@M":"Counter#held","count":{"@S":2,"v":5},"name":{"@S":3,"v":"y"},"items":{"@S":4,"v":[]},"meta":{"@S":5,"v":{}}}]',
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+      vi.advanceTimersByTime(1);
+
+      expect(heldCount.peek()).toBe(5);
+      expect(transport2.sent).toContain('N:@W:2');
+    });
+
+    it('refreshes held model facades that are not present in the reconnect root', async () => {
+      vi.useFakeTimers();
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+      client.registerModel('Counter', ReflectedCounter);
+      transport1.emit('N:@R:{"root":true}');
+      await client.ready;
+
+      const held = client.reflection.createModelFacade({
+        '@M': 'Counter#held',
+        count: client.reflection.getOrCreateSignal(1, 1),
+        name: client.reflection.getOrCreateSignal(2, 'x'),
+        items: client.reflection.getOrCreateSignal(3, []),
+        meta: client.reflection.getOrCreateSignal(4, {}),
+      });
+      const count = held.count;
+      count.subscribe(() => undefined);
+      vi.advanceTimersByTime(1);
+      expect(transport1.sent).toContain('N:@W:1');
+
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+      transport2.emit('N:@R:{"root":true}');
+      await client.ready;
+      expect(transport2.sent[0]).toBe('M1:@M:"Counter#held"');
+
+      transport2.emit(
+        'R1:[{"@M":"Counter#held","count":{"@S":10,"v":5},"name":{"@S":20,"v":"y"},"items":{"@S":30,"v":[]},"meta":{"@S":40,"v":{}}}]',
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+      vi.advanceTimersByTime(1);
+
+      expect(held.count).toBe(count);
+      expect(count.peek()).toBe(5);
+      expect(transport2.sent).toContain('N:@W:10');
+
+      transport2.emit('N:@S:10,6');
+      expect(count.peek()).toBe(6);
+    });
+
+    it('watches refreshed reflected model signals after process changes', async () => {
+      vi.useFakeTimers();
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+      client.registerModel('Counter', ReflectedCounter);
+      transport1.emit(
+        'N:@R:{"@M":"Counter#1","count":{"@S":1,"v":0},"name":{"@S":2,"v":"x"},"items":{"@S":3,"v":[]},"meta":{"@S":4,"v":{}}},{"connectionId":"c1","processId":"p1","resumed":false}',
+      );
+      await client.ready;
+
+      const count = client.root.count;
+      count.subscribe(() => undefined);
+      vi.advanceTimersByTime(1);
+      expect(transport1.sent).toContain('N:@W:1');
+
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+      transport2.emit(
+        'N:@R:{"@M":"Counter#1","count":{"@S":10,"v":5},"name":{"@S":20,"v":"y"},"items":{"@S":30,"v":[]},"meta":{"@S":40,"v":{}}},{"connectionId":"c1","processId":"p2","resumed":false}',
+      );
+      await client.ready;
+      expect(transport2.sent[0]).toBe('M1:@M:"Counter#1"');
+      transport2.emit(
+        'R1:[{"@M":"Counter#1","count":{"@S":10,"v":5},"name":{"@S":20,"v":"y"},"items":{"@S":30,"v":[]},"meta":{"@S":40,"v":{}}}]',
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+      vi.advanceTimersByTime(1);
+
+      expect(count.peek()).toBe(5);
+      expect(transport2.sent).toContain('N:@W:10');
+
+      transport2.emit('N:@S:10,6');
+      expect(count.peek()).toBe(6);
     });
   });
 });

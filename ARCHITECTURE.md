@@ -12,7 +12,7 @@ No manual subscriptions, no event emitters — just signals.
 
 | Concept                  | Description                                                                                                             |
 | ------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
-| **Transport**            | Any object with `send(data: string)` and `onMessage(cb)`. Typically a WebSocket.                                        |
+| **Transport**            | Any object with `send(data: string)` and `onMessage(cb)`, plus optional `onOpen(cb)`, `onClose(cb)`, and `ready`. Typically a WebSocket. |
 | **RPC**                  | Server-side hub. Wraps a root object, routes incoming method calls, manages connected clients.                          |
 | **Reflection**           | Server-side signal tracker. Serializes signal values, computes deltas, and pushes updates to subscribed clients.        |
 | **Instances**            | Registry that maps numeric IDs to server-side model instances, enabling instance-method routing.                        |
@@ -194,9 +194,10 @@ Reserved methods:
 
 | method | dir | payload           | meaning                       |
 | :----: | :-: | ----------------- | ----------------------------- |
-|  `@W`  | c→s | `id,id,...`       | subscribe to these signal ids |
-|  `@U`  | c→s | `id,id,...`       | unsubscribe                   |
-|  `@S`  | s→c | `id,value[,mode]` | signal `id` changed           |
+|  `@W`  | c→s | `id,id,...`       | subscribe to these signal ids                    |
+|  `@U`  | c→s | `id,id,...`       | unsubscribe                                      |
+|  `@M`  | c→s | `"Type#id",...`  | refresh held model facades by marker            |
+|  `@S`  | s→c | `id,value[,mode]` | signal `id` changed                              |
 
 Routing on server (`callMethod`):
 
@@ -280,10 +281,29 @@ The client also handles `splice` mode; the server doesn't currently emit it.
                                                         reflection.removeClient(id)
                                                           - drop from all subs sets
                                                           - purge lastSentValues
+                                                          - dispose source signal subscriptions
 ```
 
 Batching coalesces the "20 signals arrive in one response, 20 effects
 subscribe on the same tick" case into one `@W` frame.
+
+On reconnect, the client keeps existing roots/signals/model facades alive until
+it receives a fresh `@R` root snapshot. That snapshot refreshes signal values,
+rebases root signals if a different backend process assigned different signal
+ids, refreshes cached model facades with their new underlying signal sources,
+requests fresh snapshots for held model facades via `M{id}:@M:...`, replays
+currently watched signal ids once from the root snapshot immediately, and
+replays them again after held-model refreshes bind any additional signal ids.
+Held facades that are not present in the new root can recover when the server
+process can resolve their `Type#id` marker from its `Instances` registry.
+
+The server includes connection metadata as a second `@R` parameter:
+`{connectionId, processId, resumed}`. `connectionId` is opaque and can be fed
+back into `RPC.addClient(transport, connectionId)` on a later WebSocket
+connection. `processId` tells the client which server process produced the
+snapshot, and `resumed` tells whether this connection replaced active retained
+state for that id. Once a client has disconnected and cleanup has run, a later
+connection with the same id is not reported as resumed.
 
 ---
 
@@ -362,5 +382,5 @@ propagates without the UI knowing.
   Redundant `sig.value = same` writes never touch the wire.
 - **Lazy fan-out** — a server signal with zero watchers has zero
   `.subscribe()` callbacks attached to it.
-- **Transport-agnostic** — `Transport = { send(str), onMessage(cb), ready? }`.
+- **Transport-agnostic** — `Transport = { send(str), onMessage(cb), onOpen?(cb), onClose?(cb), ready? }`.
   WebSocket, MessagePort, stdin/stdout all fit.

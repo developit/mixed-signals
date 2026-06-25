@@ -23,6 +23,7 @@ export class Reflection {
   private signalIds = new WeakMap<Signal<any>, SignalId>();
   private signals = new Map<SignalId, Signal<any>>();
   private subscriptions = new Map<SignalId, Set<ClientId>>();
+  private signalUnsubscribers = new Map<SignalId, () => void>();
   private lastSentValues = new Map<string, any>();
   private sentModels = new Map<ClientId, Set<string>>();
   private nextSignalId = 1;
@@ -169,6 +170,22 @@ export class Reflection {
     return JSON.parse(JSON.stringify(serialized));
   }
 
+  serializeModelMarker(marker: string, clientId?: ClientId): any {
+    const hashIdx = marker.lastIndexOf('#');
+    if (hashIdx === -1) return null;
+
+    const typeName = marker.slice(0, hashIdx);
+    const id = marker.slice(hashIdx + 1);
+    const instance = this.instances.get(id);
+    if (!instance || this.getModelType(instance) !== typeName) return null;
+
+    if (clientId) {
+      this.sentModels.get(clientId)?.delete(marker);
+    }
+
+    return this.serialize(instance, clientId);
+  }
+
   watch(clientId: ClientId, signalId: SignalId) {
     let subs = this.subscriptions.get(signalId);
     if (!subs) {
@@ -176,27 +193,29 @@ export class Reflection {
       this.subscriptions.set(signalId, subs);
     }
 
-    const isFirst = subs.size === 0;
     subs.add(clientId);
 
-    if (isFirst) {
+    if (!this.signalUnsubscribers.has(signalId)) {
       const sig = this.signals.get(signalId);
       if (sig) {
         // The server only subscribes to source signals once a client cares.
-        sig.subscribe(() => {
+        const unsubscribe = sig.subscribe(() => {
           this.notifySubscribers(signalId);
         });
+        this.signalUnsubscribers.set(signalId, unsubscribe);
       }
     }
   }
 
   unwatch(clientId: ClientId, signalId: SignalId) {
     this.subscriptions.get(signalId)?.delete(clientId);
+    this.disposeSignalIfUnwatched(signalId);
   }
 
   removeClient(clientId: ClientId) {
-    for (const subs of this.subscriptions.values()) {
+    for (const [signalId, subs] of this.subscriptions) {
       subs.delete(clientId);
+      this.disposeSignalIfUnwatched(signalId);
     }
 
     const prefix = `${clientId}:`;
@@ -205,6 +224,15 @@ export class Reflection {
     }
 
     this.sentModels.delete(clientId);
+  }
+
+  private disposeSignalIfUnwatched(signalId: SignalId) {
+    const subs = this.subscriptions.get(signalId);
+    if (subs && subs.size > 0) return;
+
+    this.subscriptions.delete(signalId);
+    this.signalUnsubscribers.get(signalId)?.();
+    this.signalUnsubscribers.delete(signalId);
   }
 
   private notifySubscribers(signalId: SignalId) {

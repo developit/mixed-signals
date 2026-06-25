@@ -472,6 +472,67 @@ describe('Integration: Server <-> Client', () => {
     expect(rpcClient.root.count.peek()).toBe(10);
   });
 
+  it('refreshes held models and replays watches when reconnecting to a new RPC process', async () => {
+    vi.useFakeTimers();
+    const rpc1 = new RPC();
+    rpc1.registerModel('Counter', Counter);
+    const root1 = new Counter();
+    root1.count.value = 1;
+    rpc1.expose(root1);
+
+    const firstPair = createLinkedTransportPair();
+    const ctx = {rpc: null as any};
+    const client = new RPCClient(firstPair.clientTransport, ctx);
+    ctx.rpc = client;
+    client.registerModel('Counter', ReflectedCounter);
+    const cleanup1 = rpc1.addClient(firstPair.serverTransport, 'stable-client');
+
+    await firstPair.flush();
+    await client.ready;
+
+    const model = client.root;
+    const count = model.count;
+    const stop = count.subscribe(() => undefined);
+    vi.advanceTimersByTime(1);
+    await firstPair.flush();
+
+    root1.count.value = 2;
+    await firstPair.flush();
+    expect(count.peek()).toBe(2);
+
+    cleanup1();
+
+    const rpc2 = new RPC();
+    rpc2.registerModel('Counter', Counter);
+    const root2 = new Counter();
+    root2.count.value = 20;
+    rpc2.expose(root2);
+    const secondPair = createLinkedTransportPair();
+
+    client.reconnect(secondPair.clientTransport);
+    rpc2.addClient(secondPair.serverTransport, client.connectionId);
+    await secondPair.flush();
+    await client.ready;
+
+    expect(client.connectionInfo?.resumed).toBe(false);
+    expect(client.root).toBe(model);
+    expect(client.root.count).toBe(count);
+    expect(count.peek()).toBe(20);
+
+    root2.count.value = 21;
+    await secondPair.flush();
+    expect(count.peek()).toBe(21);
+
+    const increment = model.increment();
+    await secondPair.flush();
+    await increment;
+    expect(root2.count.peek()).toBe(22);
+
+    await secondPair.flush();
+    expect(count.peek()).toBe(22);
+    stop();
+  });
+
   it('rpc.call from client still works with method routing', async () => {
     vi.useFakeTimers();
     const rpc = new RPC();
