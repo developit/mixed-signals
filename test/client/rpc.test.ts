@@ -620,6 +620,59 @@ describe('RPCClient', () => {
       expect(count.peek()).toBe(10);
     });
 
+    it('replaces unbranded nested arrays and plain objects on reconnect', async () => {
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+      transport1.emit(
+        'N:@R:{"items":[{"name":"old"}],"settings":{"mode":"light"},"count":{"@S":1,"v":1}}',
+      );
+      await client.ready;
+
+      const root = client.root;
+      const items = root.items;
+      const settings = root.settings;
+      const count = root.count;
+
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+      transport2.emit(
+        'N:@R:{"items":[{"name":"new"}],"settings":{"mode":"dark"},"count":{"@S":1,"v":2}}',
+      );
+      await client.ready;
+
+      expect(client.root).toBe(root);
+      expect(client.root.count).toBe(count);
+      expect(count.peek()).toBe(2);
+      expect(client.root.items).not.toBe(items);
+      expect(client.root.items).toEqual([{name: 'new'}]);
+      expect(client.root.settings).not.toBe(settings);
+      expect(client.root.settings).toEqual({mode: 'dark'});
+    });
+
+    it('does not rebind signals inside replaced nested plain objects across process changes', async () => {
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+      transport1.emit(
+        'N:@R:{"settings":{"theme":{"@S":1,"v":"light"}}},{"connectionId":"c1","processId":"p1","resumed":false}',
+      );
+      await client.ready;
+
+      const settings = client.root.settings;
+      const theme = settings.theme;
+
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+      transport2.emit(
+        'N:@R:{"settings":{"theme":{"@S":9,"v":"dark"}}},{"connectionId":"c1","processId":"p2","resumed":false}',
+      );
+      await client.ready;
+
+      expect(client.root.settings).not.toBe(settings);
+      expect(client.root.settings.theme).not.toBe(theme);
+      expect(theme.peek()).toBe('light');
+      expect(client.root.settings.theme.peek()).toBe('dark');
+    });
+
     it('processes messages on the new transport', () => {
       const transport1 = new FakeTransport();
       const client = new RPCClient(transport1, createContext());

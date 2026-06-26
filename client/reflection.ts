@@ -236,7 +236,26 @@ export class ClientReflection {
   }
 
   reconcileRoot(previousRoot: any, nextRoot: any): any {
-    return this.reconcileValue(previousRoot, nextRoot);
+    // Preserve only identities the protocol can prove. The root shell is kept
+    // stable for ergonomics, but unbranded nested objects/arrays are replaced.
+    if (isPlainObject(previousRoot) && isPlainObject(nextRoot)) {
+      for (const key of Object.keys(previousRoot)) {
+        if (!(key in nextRoot)) {
+          delete previousRoot[key];
+        }
+      }
+
+      for (const [key, value] of Object.entries(nextRoot)) {
+        previousRoot[key] = this.reconcileIdentifiedValue(
+          previousRoot[key],
+          value,
+        );
+      }
+
+      return previousRoot;
+    }
+
+    return this.reconcileIdentifiedValue(previousRoot, nextRoot);
   }
 
   /** @internal */
@@ -247,7 +266,7 @@ export class ClientReflection {
     return this.rebindSignal(previousSignal, nextSignal);
   }
 
-  private reconcileValue(previousValue: any, nextValue: any): any {
+  private reconcileIdentifiedValue(previousValue: any, nextValue: any): any {
     if (previousValue === nextValue) return previousValue;
 
     if (
@@ -255,31 +274,6 @@ export class ClientReflection {
       nextValue instanceof SignalCtor
     ) {
       return this.rebindSignal(previousValue, nextValue);
-    }
-
-    if (Array.isArray(previousValue) && Array.isArray(nextValue)) {
-      previousValue.length = nextValue.length;
-      for (let index = 0; index < nextValue.length; index++) {
-        previousValue[index] = this.reconcileValue(
-          previousValue[index],
-          nextValue[index],
-        );
-      }
-      return previousValue;
-    }
-
-    if (isPlainObject(previousValue) && isPlainObject(nextValue)) {
-      for (const key of Object.keys(previousValue)) {
-        if (!(key in nextValue)) {
-          delete previousValue[key];
-        }
-      }
-
-      for (const [key, value] of Object.entries(nextValue)) {
-        previousValue[key] = this.reconcileValue(previousValue[key], value);
-      }
-
-      return previousValue;
     }
 
     return nextValue;

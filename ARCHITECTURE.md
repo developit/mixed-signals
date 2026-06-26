@@ -294,8 +294,12 @@ ids, refreshes cached model facades with their new underlying signal sources,
 requests fresh snapshots for held model facades via `M{id}:@M:...`, replays
 currently watched signal ids once from the root snapshot immediately, and
 replays them again after held-model refreshes bind any additional signal ids.
-Held facades that are not present in the new root can recover when the server
-process can resolve their `Type#id` marker from its `Instances` registry.
+Only explicit protocol identities are preserved: `@S` signals and `@M` model
+facades. The top-level plain root object can be updated in place for ergonomics,
+but unbranded nested arrays and plain objects are replaced instead of reconciled
+by index or shape. Held facades that are not present in the new root can recover
+when the server process can resolve their `Type#id` marker from its `Instances`
+registry.
 
 The server includes connection metadata as a second `@R` parameter:
 `{connectionId, processId, resumed}`. `connectionId` is opaque and can be fed
