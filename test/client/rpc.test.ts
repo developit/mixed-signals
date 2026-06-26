@@ -777,6 +777,54 @@ describe('RPCClient', () => {
       expect(transport2.sent).toContain('N:@W:2');
     });
 
+    it('treats reconnect root snapshots without connection metadata as process changes', async () => {
+      vi.useFakeTimers();
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+      client.registerModel('Counter', ReflectedCounter);
+      transport1.emit('N:@R:{"root":true}');
+      await client.ready;
+
+      const held = client.reflection.createModelFacade({
+        '@M': 'Counter#held',
+        count: client.reflection.getOrCreateSignal(1, 1),
+        name: client.reflection.getOrCreateSignal(2, 'x'),
+        items: client.reflection.getOrCreateSignal(3, []),
+        meta: client.reflection.getOrCreateSignal(4, {}),
+      });
+      const heldCount = held.count;
+      heldCount.subscribe(() => undefined);
+      vi.advanceTimersByTime(1);
+      expect(transport1.sent).toContain('N:@W:1');
+
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+      transport2.emit('N:@R:{"label":{"@S":1,"v":"new-root-signal"}}');
+      await client.ready;
+
+      expect(client.connectionInfo).toBeUndefined();
+      expect(client.connectionId).toBeUndefined();
+      expect(client.root.label).not.toBe(heldCount);
+      expect(client.root.label.peek()).toBe('new-root-signal');
+      expect(heldCount.peek()).toBe(1);
+    });
+
+    it('clears stale connection metadata when a root snapshot omits it', async () => {
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      transport.emit(
+        'N:@R:{"count":{"@S":1,"v":1}},{"connectionId":"c1","processId":"p1","resumed":false}',
+      );
+      await client.ready;
+      expect(client.connectionId).toBe('c1');
+
+      transport.emit('N:@R:{"count":{"@S":1,"v":2}}');
+
+      expect(client.connectionInfo).toBeUndefined();
+      expect(client.connectionId).toBeUndefined();
+      expect(client.root.count.peek()).toBe(2);
+    });
+
     it('refreshes held model facades that are not present in the reconnect root', async () => {
       vi.useFakeTimers();
       const transport1 = new FakeTransport();

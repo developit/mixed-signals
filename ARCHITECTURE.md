@@ -307,7 +307,9 @@ back into `RPC.addClient(transport, connectionId)` on a later WebSocket
 connection. `processId` tells the client which server process produced the
 snapshot, and `resumed` tells whether this connection replaced active retained
 state for that id. Once a client has disconnected and cleanup has run, a later
-connection with the same id is not reported as resumed.
+connection with the same id is not reported as resumed. If the second `@R`
+parameter is absent, the client treats any snapshot after the initial root as an
+unknown/new process and clears raw signal-id mappings before hydration.
 
 ---
 

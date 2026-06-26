@@ -139,8 +139,10 @@ snapshot. If the client reconnects with the same `connectionId`, the server's
 `resumed` flag tells you whether this connection replaced active retained state
 for that id. Same-process reconnects keep matching signal ids; different-process
 reconnects still work when the new root snapshot contains the same logical model
-ids. Held model facades can also recover when the new server process can resolve
-their `Type#id` markers from its instance registry.
+ids. If a root snapshot omits connection metadata, the client treats it as an
+unknown/new process once a root already exists, which keeps legacy servers safe
+by avoiding raw signal-id reuse. Held model facades can also recover when the new
+server process can resolve their `Type#id` markers from its instance registry.
 
 ## API
 

@@ -188,10 +188,15 @@ export class RPCClient {
 
   private prepareForRootSnapshot(params: unknown[]) {
     const [, maybeConnectionInfo] = params;
+    const nextConnectionInfo = isConnectionInfo(maybeConnectionInfo)
+      ? maybeConnectionInfo
+      : undefined;
+
     if (
-      isConnectionInfo(maybeConnectionInfo) &&
-      this.connectionInfo &&
-      maybeConnectionInfo.processId !== this.connectionInfo.processId
+      this.root !== undefined &&
+      (!nextConnectionInfo ||
+        !this.connectionInfo ||
+        nextConnectionInfo.processId !== this.connectionInfo.processId)
     ) {
       this.reflection.prepareProcessChange();
     }
@@ -449,6 +454,9 @@ export class RPCClient {
       if (isConnectionInfo(maybeConnectionInfo)) {
         this.connectionInfo = maybeConnectionInfo;
         this.connectionId = maybeConnectionInfo.connectionId;
+      } else {
+        this.connectionInfo = undefined;
+        this.connectionId = undefined;
       }
 
       this.root = hadRoot
