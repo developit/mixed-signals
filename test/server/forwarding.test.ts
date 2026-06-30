@@ -136,6 +136,19 @@ class BrokerSessions {
   }
 }
 
+class BrokerFactory {
+  id = signal('factory');
+  private _secret: BrokerSession;
+
+  constructor(secret: BrokerSession) {
+    this._secret = secret;
+  }
+
+  createSecret() {
+    return this._secret;
+  }
+}
+
 class BrokerSession {
   id: Signal<string>;
   messages = signal<BrokerMessage[]>([]);
@@ -188,6 +201,11 @@ interface SessionsApi {
   status: Signal<string>;
   sessions: Signal<any[]>;
   createSession(): Promise<any>;
+}
+
+interface FactoryApi {
+  id: Signal<string>;
+  createSecret(): Promise<SessionApi>;
 }
 
 interface SessionApi {
@@ -433,6 +451,74 @@ describe('protocol-level forwarding', () => {
     await flush();
     expect(getSignalUpdateValues(firstMessages)).not.toContain('Third update');
     expect(getSignalUpdateValues(secondMessages)).not.toContain('Third update');
+  });
+
+  it('does not broadcast method-returned model updates to clients that never saw the model', async () => {
+    const {
+      brokerTransport,
+      serverUpstreamTransport,
+      serverDownstreamTransport,
+      browserTransport,
+      createDownstreamPair,
+      flush,
+    } = createLinkedTransports();
+    const second = createDownstreamPair('second');
+    const secondMessages: string[] = [];
+    second.browserTransport.onMessage((data) => {
+      secondMessages.push(data.toString());
+    });
+
+    const brokerRpc = new RPC();
+    brokerRpc.registerModel('BrokerFactory', BrokerFactory);
+    brokerRpc.registerModel('BrokerSession', BrokerSession);
+    brokerRpc.registerModel('BrokerMessage', BrokerMessage);
+    const secret = new BrokerSession('secret-1');
+    brokerRpc.expose({factory: new BrokerFactory(secret)});
+    brokerRpc.addClient(brokerTransport);
+
+    const serverRpc = new RPC();
+    serverRpc.addUpstream(serverUpstreamTransport);
+    await flush();
+
+    const FactoryModel = createReflectedModel<FactoryApi>(
+      ['id'],
+      ['createSecret'],
+    );
+    const SessionModel = createReflectedModel<SessionApi>(
+      ['id', 'messages', 'status'],
+      ['submit', 'stop'],
+    );
+    const MessageModel = createReflectedModel<MessageApi>(
+      ['id', 'role', 'content', 'status'],
+      [],
+    );
+
+    let browser!: RPCClient;
+    const ctx = {
+      rpc: {call: (m, p) => browser.call(m, p)} satisfies Partial<RPCClient>,
+    } as WireContext;
+    browser = new RPCClient(browserTransport, ctx);
+    browser.registerModel('BrokerFactory', FactoryModel);
+    browser.registerModel('BrokerSession', SessionModel);
+    browser.registerModel('BrokerMessage', MessageModel);
+
+    serverRpc.addClient(serverDownstreamTransport, 'browser-1');
+    serverRpc.addClient(second.serverTransport, 'browser-2');
+    await flush();
+    await browser.ready;
+
+    secondMessages.length = 0;
+    const createSecret = browser.root.factory.createSecret();
+    await flush();
+    const secretModel = await createSecret;
+    expect(secretModel.status.value).toBe('idle');
+
+    secondMessages.length = 0;
+    secret.status.value = 'running';
+    await flush();
+
+    expect(secretModel.status.value).toBe('running');
+    expect(getSignalUpdateValues(secondMessages)).not.toContain('running');
   });
 
   it('forwards method results containing new model instances', async () => {

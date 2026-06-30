@@ -309,7 +309,10 @@ snapshot, and `resumed` tells whether this connection replaced active retained
 state for that id. Once a client has disconnected and cleanup has run, a later
 connection with the same id is not reported as resumed. If the second `@R`
 parameter is absent, the client treats any snapshot after the initial root as an
-unknown/new process and clears raw signal-id mappings before hydration.
+unknown/new process and clears raw signal-id mappings before hydration. For
+reconnectable transports (`onOpen` present), `RPCClient.ready` stays pending if
+the transport disconnects before the first root and never opens again; callers
+that need a hard failure should wrap it in their own timeout or abort signal.
 
 ---
 

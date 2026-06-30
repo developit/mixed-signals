@@ -103,6 +103,30 @@ function needsRewrite(rawPayload: string): boolean {
   return rawPayload.includes('"@S"') || rawPayload.includes('"@M"');
 }
 
+function collectSignalIds(
+  value: any,
+  ids = new Set<SignalId>(),
+): Set<SignalId> {
+  if (value === null || value === undefined || typeof value !== 'object') {
+    return ids;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) collectSignalIds(item, ids);
+    return ids;
+  }
+
+  const signalId = value['@S'];
+  if (typeof signalId === 'number' || typeof signalId === 'string') {
+    ids.add(signalId);
+  }
+
+  for (const nested of Object.values(value)) {
+    collectSignalIds(nested, ids);
+  }
+  return ids;
+}
+
 interface UpstreamHost {
   send(clientId: string, message: string): void;
   /** Called when the upstream root changes. Host should re-merge and broadcast. */
@@ -138,7 +162,9 @@ export class ForwardedUpstream {
   private nextUpstreamCallId = 1;
 
   private clients = new Set<string>();
+  private rootSignalIds = new Set<SignalId>();
   private signalSubscriptions = new Map<SignalId, Set<string>>();
+  private signalVisibility = new Map<SignalId, Set<string>>();
 
   constructor(prefix: string, transport: Transport, host: UpstreamHost) {
     this.prefix = prefix;
@@ -155,6 +181,7 @@ export class ForwardedUpstream {
 
   setClient(clientId: string) {
     this.clients.add(clientId);
+    this.rememberVisibleSignals(clientId, this.rootSignalIds);
   }
 
   private handleUpstreamMessage(msg: string) {
@@ -166,6 +193,10 @@ export class ForwardedUpstream {
     if (parsed.type === 'notification') {
       if (parsed.method === ROOT_NOTIFICATION_METHOD) {
         const [rootValue] = parseWireParams(parsed.payload);
+        this.rootSignalIds = collectSignalIds(rootValue);
+        for (const clientId of this.clients) {
+          this.rememberVisibleSignals(clientId, this.rootSignalIds);
+        }
         this.root = addPrefix(this.prefix, rootValue);
         this._resolveReady();
         this.host.onUpstreamRootChanged();
@@ -177,9 +208,10 @@ export class ForwardedUpstream {
         const params = parseWireParams(parsed.payload);
         const [signalId, value, mode] = params;
         const subscribers = this.signalSubscriptions.get(signalId as SignalId);
+        const visibleClients = this.signalVisibility.get(signalId as SignalId);
         const recipients =
-          subscribers && subscribers.size > 0 ? subscribers : this.clients;
-        if (recipients.size === 0) return;
+          subscribers && subscribers.size > 0 ? subscribers : visibleClients;
+        if (!recipients || recipients.size === 0) return;
 
         const prefixedId = `${this.prefix}${SEP}${signalId}`;
 
@@ -212,6 +244,10 @@ export class ForwardedUpstream {
       const rewritten = needsRewrite(parsed.payload)
         ? addPrefix(this.prefix, result)
         : result;
+
+      if (pending.clientId) {
+        this.rememberVisibleSignals(pending.clientId, collectSignalIds(result));
+      }
 
       if ('resolve' in pending) {
         pending.resolve(rewritten);
@@ -274,11 +310,39 @@ export class ForwardedUpstream {
     );
   }
 
+  private rememberVisibleSignals(
+    clientId: string,
+    signalIds: Iterable<SignalId>,
+  ) {
+    for (const signalId of signalIds) {
+      let clients = this.signalVisibility.get(signalId);
+      if (!clients) {
+        clients = new Set();
+        this.signalVisibility.set(signalId, clients);
+      }
+      clients.add(clientId);
+    }
+  }
+
+  private forgetVisibleSignals(
+    clientId: string,
+    signalIds: Iterable<SignalId>,
+  ) {
+    for (const signalId of signalIds) {
+      const clients = this.signalVisibility.get(signalId);
+      if (!clients) continue;
+      clients.delete(clientId);
+      if (clients.size === 0) this.signalVisibility.delete(signalId);
+    }
+  }
+
   /**
    * Forward watch requests to the upstream.
    */
   forwardWatch(clientId: string, signalIds: SignalId[]) {
     const toWatch: SignalId[] = [];
+
+    this.rememberVisibleSignals(clientId, signalIds);
 
     for (const signalId of new Set(signalIds)) {
       let subscribers = this.signalSubscriptions.get(signalId);
@@ -304,6 +368,8 @@ export class ForwardedUpstream {
    */
   forwardUnwatch(clientId: string, signalIds: SignalId[]) {
     const toUnwatch: SignalId[] = [];
+
+    this.forgetVisibleSignals(clientId, signalIds);
 
     for (const signalId of new Set(signalIds)) {
       const subscribers = this.signalSubscriptions.get(signalId);
@@ -356,6 +422,11 @@ export class ForwardedUpstream {
     this.clients.delete(clientId);
     this.clearPendingCallsForClient(clientId);
 
+    for (const [signalId, clients] of this.signalVisibility) {
+      clients.delete(clientId);
+      if (clients.size === 0) this.signalVisibility.delete(signalId);
+    }
+
     const toUnwatch: SignalId[] = [];
     for (const [signalId, subscribers] of this.signalSubscriptions) {
       if (!subscribers.delete(clientId)) continue;
@@ -379,7 +450,9 @@ export class ForwardedUpstream {
   dispose() {
     this.disposed = true;
     this.clients.clear();
+    this.rootSignalIds.clear();
     this.signalSubscriptions.clear();
+    this.signalVisibility.clear();
     this.clearPendingCalls(new Error('Upstream disposed'));
   }
 }

@@ -263,7 +263,7 @@ export class ClientReflection {
     previousSignal: Signal<any>,
     nextSignal: Signal<any>,
   ): Signal<any> {
-    return this.rebindSignal(previousSignal, nextSignal);
+    return this.rebindSignal(previousSignal, nextSignal, true);
   }
 
   private reconcileIdentifiedValue(previousValue: any, nextValue: any): any {
@@ -282,19 +282,36 @@ export class ClientReflection {
   private rebindSignal(
     previousSignal: Signal<any>,
     nextSignal: Signal<any>,
+    preferExisting = false,
   ): Signal<any> {
     const nextId = this.signalIds.get(nextSignal);
     if (nextId !== undefined) {
+      const existingSignal = this.signals.get(nextId);
+      if (
+        preferExisting &&
+        existingSignal &&
+        existingSignal !== previousSignal
+      ) {
+        this.transferActiveSignal(previousSignal, existingSignal);
+        this.transferActiveSignal(nextSignal, existingSignal);
+        previousSignal.value = existingSignal.peek();
+        return existingSignal;
+      }
+
       this.rememberSignal(nextId, previousSignal);
     }
 
-    if (this.activeSignals.has(nextSignal)) {
-      this.activeSignals.delete(nextSignal);
-      this.activeSignals.add(previousSignal);
-    }
+    this.transferActiveSignal(nextSignal, previousSignal);
 
     previousSignal.value = nextSignal.peek();
     return previousSignal;
+  }
+
+  private transferActiveSignal(from: Signal<any>, to: Signal<any>) {
+    if (from !== to && this.activeSignals.has(from)) {
+      this.activeSignals.delete(from);
+      this.activeSignals.add(to);
+    }
   }
 
   createModelFacade(serialized: any): any {

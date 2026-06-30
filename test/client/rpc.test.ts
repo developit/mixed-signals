@@ -777,6 +777,52 @@ describe('RPCClient', () => {
       expect(transport2.sent).toContain('N:@W:2');
     });
 
+    it('keeps root signals live when held model refresh shares the same new signal id', async () => {
+      vi.useFakeTimers();
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+      client.registerModel('Counter', ReflectedCounter);
+      transport1.emit(
+        'N:@R:{"shared":{"@S":1,"v":1}},{"connectionId":"c1","processId":"p1","resumed":false}',
+      );
+      await client.ready;
+
+      const shared = client.root.shared;
+      const held = client.reflection.createModelFacade({
+        '@M': 'Counter#held',
+        count: client.reflection.getOrCreateSignal(2, 1),
+        name: client.reflection.getOrCreateSignal(3, 'x'),
+        items: client.reflection.getOrCreateSignal(4, []),
+        meta: client.reflection.getOrCreateSignal(5, {}),
+      });
+      const heldCount = held.count;
+      shared.subscribe(() => undefined);
+      heldCount.subscribe(() => undefined);
+      vi.advanceTimersByTime(1);
+
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+      transport2.emit(
+        'N:@R:{"shared":{"@S":9,"v":5}},{"connectionId":"c1","processId":"p2","resumed":false}',
+      );
+      await client.ready;
+      transport2.emit(
+        'R1:[{"@M":"Counter#held","count":{"@S":9,"v":5},"name":{"@S":10,"v":"y"},"items":{"@S":11,"v":[]},"meta":{"@S":12,"v":{}}}]',
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(client.root.shared).toBe(shared);
+      expect(held.count).toBe(heldCount);
+      expect(shared.peek()).toBe(5);
+      expect(heldCount.peek()).toBe(5);
+
+      transport2.emit('N:@S:9,6');
+
+      expect(shared.peek()).toBe(6);
+      expect(heldCount.peek()).toBe(6);
+    });
+
     it('treats reconnect root snapshots without connection metadata as process changes', async () => {
       vi.useFakeTimers();
       const transport1 = new FakeTransport();
