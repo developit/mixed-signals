@@ -1,4 +1,5 @@
 import {Signal} from '@preact/signals-core';
+import type {DeltaMode, SpliceDelta} from '../shared/delta.ts';
 import {
   formatNotificationMessage,
   SIGNAL_UPDATE_METHOD,
@@ -7,7 +8,7 @@ import type {Instances} from './instances.ts';
 
 type SignalId = number;
 type ClientId = string;
-type DeltaMode = 'append' | 'merge';
+type CallContext = {clientId: ClientId; callId: number} | undefined;
 
 interface RpcSender {
   send(clientId: string, message: string): void;
@@ -30,6 +31,7 @@ export class Reflection {
   private instances: Instances;
   private modelRegistry = new Map<ModelConstructor, string>();
   private autoIds = new WeakMap<object, string>();
+  private activeCall: CallContext;
 
   constructor(rpc: RpcSender, instances: Instances) {
     this.rpc = rpc;
@@ -38,6 +40,26 @@ export class Reflection {
 
   registerModel(name: string, Ctor: ModelConstructor) {
     this.modelRegistry.set(Ctor, name);
+  }
+
+  /**
+   * @internal Tag signal updates produced during a client call so they are
+   * echoed to that client with the call id, letting the client confirm its
+   * optimistic change by mutation identity. Returns the previous context to
+   * restore via {@link Reflection.endCall}, keeping nested calls correct.
+   */
+  beginCall(clientId: ClientId, callId: number): CallContext {
+    const previous = this.activeCall;
+    this.activeCall = {clientId, callId};
+    return previous;
+  }
+
+  /**
+   * @internal Restore the call context saved by {@link Reflection.beginCall},
+   * ending the current call's tagging window so later writes are untagged.
+   */
+  endCall(previous: CallContext) {
+    this.activeCall = previous;
   }
 
   isModel(val: any): boolean {
@@ -222,9 +244,12 @@ export class Reflection {
       if (!update) continue;
 
       const serializedValue = this.serialize(update.value, clientId);
-      const params = update.mode
-        ? [signalId, serializedValue, update.mode]
-        : [signalId, serializedValue];
+      const cmid =
+        this.activeCall?.clientId === clientId ? this.activeCall.callId : undefined;
+      const params: unknown[] = [signalId, serializedValue];
+      if (update.mode !== undefined) params.push(update.mode);
+      else if (cmid !== undefined) params.push(null);
+      if (cmid !== undefined) params.push(cmid);
 
       this.rpc.send(
         clientId,
@@ -235,8 +260,10 @@ export class Reflection {
   }
 
   /**
-   * Compute the delta between the last-sent value and the new value.
-   * Returns null if the values are shallow-equal (no update needed).
+   * Compute the delta between the last-sent value and the new value. Returns
+   * null if the values are shallow-equal (no update needed). A removed object
+   * key forces a full replacement, since a merge delta cannot express deletion
+   * and would leave the stale key in place on the client.
    */
   private computeDelta(
     oldValue: any,
@@ -258,6 +285,9 @@ export class Reflection {
       ) {
         return null;
       }
+
+      const splice = this.computeArraySplice(oldValue, newValue);
+      if (splice) return {value: splice, mode: 'splice'};
     }
 
     if (
@@ -277,13 +307,17 @@ export class Reflection {
         }
       }
 
-      // No changed keys and no removed keys — no update needed.
-      if (!hasChanges) {
-        const oldKeys = Object.keys(oldValue);
-        const newKeys = Object.keys(newValue);
-        if (oldKeys.length === newKeys.length) return null;
+      let removedKey = false;
+      for (const key in oldValue) {
+        if (!(key in newValue)) {
+          removedKey = true;
+          break;
+        }
       }
 
+      if (!hasChanges && !removedKey) return null;
+
+      if (removedKey) return {value: newValue};
       if (hasChanges) return {value: changes, mode: 'merge'};
     }
 
@@ -297,5 +331,32 @@ export class Reflection {
     }
 
     return {value: newValue};
+  }
+
+  private computeArraySplice(oldValue: any[], newValue: any[]): SpliceDelta | null {
+    let start = 0;
+    while (
+      start < oldValue.length &&
+      start < newValue.length &&
+      oldValue[start] === newValue[start]
+    ) {
+      start++;
+    }
+
+    let oldEnd = oldValue.length - 1;
+    let newEnd = newValue.length - 1;
+    while (
+      oldEnd >= start &&
+      newEnd >= start &&
+      oldValue[oldEnd] === newValue[newEnd]
+    ) {
+      oldEnd--;
+      newEnd--;
+    }
+
+    const deleteCount = oldEnd - start + 1;
+    const items = newValue.slice(start, newEnd + 1);
+    if (deleteCount === 0 && items.length === 0) return null;
+    return {start, deleteCount, items};
   }
 }

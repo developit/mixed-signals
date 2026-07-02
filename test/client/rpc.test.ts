@@ -1,6 +1,6 @@
 import {describe, expect, it} from 'vitest';
 import type {WireContext} from '../../client/reflection.ts';
-import {RPCClient} from '../../client/rpc.ts';
+import {RPCClient, TransportClosedError} from '../../client/rpc.ts';
 import type {Transport} from '../../shared/protocol.ts';
 import {ReflectedCounter} from '../helpers.ts';
 
@@ -27,6 +27,9 @@ function createContext(): WireContext {
     rpc: {call: async () => undefined} as Partial<RPCClient>,
   } as unknown as WireContext;
 }
+
+const pendingSize = (client: RPCClient): number =>
+  (client as unknown as {pending: Map<number, unknown>}).pending.size;
 
 describe('RPCClient', () => {
   describe('message parsing', () => {
@@ -130,6 +133,29 @@ describe('RPCClient', () => {
       const sum2 = client.call('sum', []);
       transport.emit('E2:{"message":"boom"}');
       await expect(sum2).rejects.toThrow('boom');
+    });
+
+    it('rejects and clears pending when transport.ready rejects', async () => {
+      const ready = Promise.reject(new Error('handshake failed'));
+      const transport = new FakeTransport(ready);
+      const client = new RPCClient(transport, createContext());
+
+      const pending = client.call('ping', []);
+      await expect(pending).rejects.toThrow('handshake failed');
+      expect(pendingSize(client)).toBe(0);
+      expect(transport.sent).toHaveLength(0);
+    });
+
+    it('rejects and clears pending when a synchronous send throws', async () => {
+      const transport = new FakeTransport();
+      transport.send = () => {
+        throw new Error('socket closed');
+      };
+      const client = new RPCClient(transport, createContext());
+
+      const pending = client.call('ping', []);
+      await expect(pending).rejects.toThrow('socket closed');
+      expect(pendingSize(client)).toBe(0);
     });
   });
 
@@ -374,7 +400,7 @@ describe('RPCClient', () => {
   });
 
   describe('reconnect', () => {
-    it('rejects in-flight RPCs with reconnection error', async () => {
+    it('rejects in-flight RPCs with a typed transport-closed error', async () => {
       const transport1 = new FakeTransport();
       const client = new RPCClient(transport1, createContext());
 
@@ -382,7 +408,7 @@ describe('RPCClient', () => {
       const transport2 = new FakeTransport();
       client.reconnect(transport2);
 
-      await expect(pending).rejects.toThrow('Transport reconnected');
+      await expect(pending).rejects.toBeInstanceOf(TransportClosedError);
     });
 
     it('resets the ready gate until new @R arrives', async () => {
@@ -405,6 +431,26 @@ describe('RPCClient', () => {
       transport2.emit('N:@R:{"v":2}');
       await client.ready;
       expect(client.root).toEqual({v: 2});
+    });
+
+    it('does not send a call superseded by reconnect once ready resolves', async () => {
+      let resolveReady!: () => void;
+      const ready = new Promise<void>((r) => {
+        resolveReady = r;
+      });
+      const transport1 = new FakeTransport(ready);
+      const client = new RPCClient(transport1, createContext());
+
+      const pending = client.call('ping', []);
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+      await expect(pending).rejects.toBeInstanceOf(TransportClosedError);
+
+      resolveReady();
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(transport1.sent).toHaveLength(0);
+      expect(transport2.sent).toHaveLength(0);
     });
 
     it('uses the new transport for subsequent calls', async () => {

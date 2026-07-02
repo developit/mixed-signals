@@ -10,7 +10,22 @@ import {
   SIGNAL_UPDATE_METHOD,
   type Transport,
 } from '../shared/protocol.ts';
+import {registerCall} from './optimistic.ts';
 import {ClientReflection} from './reflection.ts';
+
+/**
+ * Rejection reason for a call that was in flight when the transport was
+ * replaced by {@link RPCClient.reconnect}. The outcome is *unknown*, not
+ * failed: the mutation may already have committed on the previous connection.
+ * Callers that need at-most-once semantics should retry idempotently (e.g.
+ * keyed by a client mutation id) rather than treating it as a server error.
+ */
+export class TransportClosedError extends Error {
+  constructor() {
+    super('mixed-signals: transport reconnected before the call resolved');
+    this.name = 'TransportClosedError';
+  }
+}
 
 // Walk a dotted path like "browser.logs" against an object so peer-issued
 // calls can target nested methods on the exposed root.
@@ -18,7 +33,7 @@ function dlv(obj: any, path: string): any {
   return path.split('.').reduce((acc, key) => acc?.[key], obj);
 }
 
-export class RPCClient {
+export class RPCClient<TRoot = any> {
   private transport: Transport;
   private nextId = 1;
   private pending = new Map<
@@ -32,7 +47,7 @@ export class RPCClient {
   /** @internal */
   reflection: ClientReflection;
   private transportReady: Promise<void> | undefined;
-  root: any = undefined;
+  root = undefined as TRoot;
   ready: Promise<void>;
   private _resolveReady!: () => void;
 
@@ -47,23 +62,26 @@ export class RPCClient {
   }
 
   /**
-   * Replace the transport and reset internal state for a reconnection.
-   * A new `ready` promise is created that resolves on the next `@R` message.
+   * Replace the transport and reset internal state for a reconnection. A new
+   * `ready` promise is created that resolves on the next `@R` message.
+   *
+   * In-flight calls reject with {@link TransportClosedError} (outcome unknown,
+   * not failed) and optimistic overlays roll back to the last server value,
+   * since a fresh connection may land on a different node whose snapshot the
+   * client has not yet seen. The bound optimistic change is therefore undone;
+   * re-issue the mutation after `ready` if it must survive the reconnect.
    */
   reconnect(transport: Transport) {
     this.transport = transport;
     this.transportReady = transport.ready;
 
-    // Reject all in-flight RPCs
     for (const {reject} of this.pending.values()) {
-      reject(new Error('Transport reconnected'));
+      reject(new TransportClosedError());
     }
     this.pending.clear();
 
-    // Clear reflection caches so the fresh @R rebuilds everything
     this.reflection.reset();
 
-    // Fresh ready gate
     this.ready = new Promise((resolve) => {
       this._resolveReady = resolve;
     });
@@ -180,11 +198,36 @@ export class RPCClient {
       );
   }
 
-  async call(method: string, params?: any): Promise<any> {
-    if (this.transportReady) await this.transportReady;
-    return new Promise((resolve, reject) => {
-      this.sendCall(method, params, resolve, reject);
+  /**
+   * Issue a method call and resolve with its response. Not `async`: the exact
+   * promise returned here is registered against the call's wire id, so passing
+   * it straight to `optimistic()` binds the change to this mutation. Wrapping it
+   * (`.then`, `Promise.all`) forfeits that binding and falls back to value-based
+   * reconciliation.
+   */
+  call(method: string, params?: any): Promise<any> {
+    const id = this.nextId++;
+    const promise = new Promise((resolve, reject) => {
+      this.pending.set(id, {resolve, reject});
+      const send = () => {
+        if (!this.pending.has(id)) return;
+        this.transport.send(formatCallMessage(id, method, params || []));
+      };
+      const fail = (error: unknown) => {
+        this.pending.delete(id);
+        reject(error);
+      };
+      if (this.transportReady) this.transportReady.then(send).catch(fail);
+      else {
+        try {
+          send();
+        } catch (error) {
+          fail(error);
+        }
+      }
     });
+    registerCall(promise, id);
+    return promise;
   }
 
   notify(method: string, params?: any[]) {
@@ -194,17 +237,6 @@ export class RPCClient {
     } else {
       this.transport.send(message);
     }
-  }
-
-  private sendCall(
-    method: string,
-    params: any,
-    resolve: (v: any) => void,
-    reject: (e: any) => void,
-  ) {
-    const id = this.nextId++;
-    this.pending.set(id, {resolve, reject});
-    this.transport.send(formatCallMessage(id, method, params || []));
   }
 
   onNotification(cb: (method: string, params: any[]) => void): () => void {
@@ -219,8 +251,8 @@ export class RPCClient {
       this.root = params[0];
       this._resolveReady();
     } else if (method === SIGNAL_UPDATE_METHOD) {
-      const [id, value, mode] = params;
-      this.reflection.handleUpdate(id, value, mode);
+      const [id, value, mode, callId] = params;
+      this.reflection.handleUpdate(id, value, mode, callId);
     } else {
       for (const listener of this.notificationListeners) {
         listener(method, params);

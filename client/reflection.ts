@@ -3,11 +3,29 @@ import {
   UNWATCH_SIGNALS_METHOD,
   WATCH_SIGNALS_METHOD,
 } from '../shared/protocol.ts';
+import {
+  applyDelta,
+  applyServerUpdate,
+  coerceDeltaMode,
+  linkSource,
+  resetOptimisticOverlay,
+} from './optimistic.ts';
 import type {RPCClient} from './rpc.ts';
 
 /** @internal */
 export interface WireContext {
   rpc: RPCClient;
+}
+
+/**
+ * Last-resort reporter for a throw raised while applying a server delta. Kept
+ * off the wire: it only guards the local read loop. Per-transaction failures
+ * are surfaced through {@link OptimisticOptions.onError}; this catches anything
+ * outside a transaction (a malformed delta, say).
+ */
+function reportReflectionError(error: unknown): void {
+  // biome-ignore lint/suspicious/noConsole: last-resort diagnostic, no wire I/O
+  console.error('mixed-signals: failed to apply signal update', error);
 }
 
 export class ClientReflection {
@@ -28,6 +46,9 @@ export class ClientReflection {
 
   /** Clear cached signals and model facades so a reconnection gets fresh state. */
   reset() {
+    for (const signal of this.signals.values()) {
+      resetOptimisticOverlay(signal);
+    }
     this.signals.clear();
     this.models.clear();
     this.watchBatch.clear();
@@ -101,6 +122,7 @@ export class ClientReflection {
       },
     });
 
+    linkSource(createdSignal, createdSignal);
     this.signals.set(id, createdSignal);
     return createdSignal;
   }
@@ -131,45 +153,16 @@ export class ClientReflection {
     return model;
   }
 
-  handleUpdate(id: number | string, value: any, mode?: string) {
+  handleUpdate(id: number | string, value: any, mode?: string, callId?: number) {
     const sig = this.signals.get(id);
     if (!sig) return;
 
-    if (!mode) {
-      sig.value = value;
-      return;
-    }
-
-    const current = sig.value;
-
-    switch (mode) {
-      case 'append':
-        // Streaming text and immutable array pushes both land here.
-        if (Array.isArray(current)) {
-          sig.value = [...current, ...value];
-        } else if (typeof current === 'string') {
-          sig.value = current + value;
-        }
-        break;
-
-      case 'merge':
-        if (current && typeof current === 'object') {
-          sig.value = {...current, ...value};
-        }
-        break;
-
-      case 'splice':
-        // Reserved for richer array diffs; keep client support even if rare today.
-        if (Array.isArray(current)) {
-          const {start, deleteCount, items} = value;
-          const nextArray = [...current];
-          nextArray.splice(start, deleteCount, ...items);
-          sig.value = nextArray;
-        }
-        break;
-
-      default:
-        sig.value = value;
+    const delta = coerceDeltaMode(mode);
+    try {
+      if (applyServerUpdate(sig, value, delta, callId)) return;
+      sig.value = applyDelta(sig.peek(), value, delta);
+    } catch (error) {
+      reportReflectionError(error);
     }
   }
 }

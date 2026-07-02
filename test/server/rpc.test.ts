@@ -354,6 +354,39 @@ describe('RPC', () => {
     expect(transport.sent).toHaveLength(0);
   });
 
+  it('coalesces repeated writes to one signal in a call into a single delta', async () => {
+    const value = signal(0);
+    const root = {
+      value,
+      bump() {
+        value.value = value.peek() + 1;
+        value.value = value.peek() + 1;
+      },
+    };
+    const rpc = new RPC(root);
+    const transport = new FakeTransport();
+    rpc.addClient(transport, 'c1');
+
+    const rootNotification = parseNotification(transport.sent[0]);
+    const rootObj = rootNotification.params[0] as Record<string, any>;
+    const signalId = rootObj.value['@S'] as number;
+
+    await transport.emit(
+      formatNotificationMessage(WATCH_SIGNALS_METHOD, [signalId]),
+    );
+    transport.sent.length = 0;
+
+    await transport.emit(formatCallMessage(1, 'bump', []));
+
+    const deltas = transport.sent.filter((message) =>
+      message.startsWith(`N:${SIGNAL_UPDATE_METHOD}:`),
+    );
+    expect(deltas).toHaveLength(1);
+    const params = parseNotification(deltas[0]).params;
+    expect(params[0]).toBe(signalId);
+    expect(params[1]).toBe(2);
+  });
+
   it('sends notification to specific client', () => {
     const rpc = new RPC();
 

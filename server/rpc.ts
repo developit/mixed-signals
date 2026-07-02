@@ -1,3 +1,4 @@
+import {batch} from '@preact/signals-core';
 import {
   formatErrorMessage,
   formatNotificationMessage,
@@ -296,7 +297,17 @@ export class RPC {
     }
 
     try {
-      const result = await this.callMethod(method, params);
+      let pending: unknown;
+      const previousCall =
+        id !== undefined ? this.reflection.beginCall(clientId, id) : undefined;
+      try {
+        batch(() => {
+          pending = this.callMethod(method, params);
+        });
+      } finally {
+        if (id !== undefined) this.reflection.endCall(previousCall);
+      }
+      const result = await pending;
       const serialized = this.reflection.serialize(result, clientId);
 
       if (id !== undefined) {
@@ -309,7 +320,7 @@ export class RPC {
     }
   }
 
-  private async callMethod(method: string, params: any) {
+  private callMethod(method: string, params: any) {
     const args = params || [];
 
     let instance = this.root;

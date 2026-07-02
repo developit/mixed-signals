@@ -391,6 +391,25 @@ describe('Reflection', () => {
       expect(last).not.toContain('"append"');
     });
 
+    it('sends splice delta for a single contiguous middle array change', () => {
+      const clientId = 'c1';
+      const {counter, itemsId} = setupCounter(reflection, instances, clientId);
+      reflection.watch(clientId, itemsId);
+      counter.items.value = ['a', 'b', 'c', 'd'];
+      sender.sent.length = 0;
+
+      counter.items.value = ['a', 'b', 'x', 'y', 'd'];
+
+      const relevant = sender.sent.filter((m) => m.clientId === clientId);
+      expect(relevant.length).toBeGreaterThan(0);
+      const [id, value, mode] = parseUpdate(
+        relevant[relevant.length - 1].message,
+      );
+      expect(id).toBe(itemsId);
+      expect(value).toEqual({start: 2, deleteCount: 1, items: ['x', 'y']});
+      expect(mode).toBe('splice');
+    });
+
     it('sends delta for object merge', () => {
       const clientId = 'c1';
       const {counter, metaId} = setupCounter(reflection, instances, clientId);
@@ -404,6 +423,21 @@ describe('Reflection', () => {
       expect(id).toBe(metaId);
       expect(value).toEqual({version: 2});
       expect(mode).toBe('merge');
+    });
+
+    it('sends full replacement when an object key is removed', () => {
+      const clientId = 'c1';
+      const {counter, metaId} = setupCounter(reflection, instances, clientId);
+      reflection.watch(clientId, metaId);
+      counter.meta.value = {added: true};
+      const relevant = sender.sent.filter((m) => m.clientId === clientId);
+      expect(relevant.length).toBeGreaterThan(0);
+      const [id, value, mode] = parseUpdate(
+        relevant[relevant.length - 1].message,
+      );
+      expect(id).toBe(metaId);
+      expect(value).toEqual({added: true});
+      expect(mode).toBeUndefined();
     });
 
     it('sends delta for string append', () => {

@@ -18,7 +18,7 @@ No manual subscriptions, no event emitters — just signals.
 | **Instances**            | Registry that maps numeric IDs to server-side model instances, enabling instance-method routing.                        |
 | **RPCClient**            | Client-side hub. Sends method calls, awaits responses, and dispatches incoming notifications.                           |
 | **ClientReflection**     | Client-side signal manager. Creates/updates `Signal` objects from server data, batches `@W`/`@U` subscription messages. |
-| **createReflectedModel** | Factory that produces a Preact Model constructor whose signal props and methods mirror a server model.                   |
+| **createReflectedModel** | Factory that produces a Preact Model constructor whose signal props and methods mirror a server model.                  |
 
 ## Overview
 
@@ -66,11 +66,11 @@ All messages are compact, newline-free text strings.
 
 #### Server → Client
 
-| Message                      | Meaning                                                                    |
-| ---------------------------- | -------------------------------------------------------------------------- |
-| `R{id}:{result}`             | Successful response to call `{id}`. `{result}` is a single JSON value.     |
-| `E{id}:{error}`              | Error response to call `{id}`. `{error}` is `{"code":-1,"message":"..."}`. |
-| `N:@S:{id},{value}[,{mode}]` | Signal update notification. `{mode}` is omitted for full replacement.      |
+| Message                             | Meaning                                                                    |
+| ----------------------------------- | -------------------------------------------------------------------------- |
+| `R{id}:{result}`                    | Successful response to call `{id}`. `{result}` is a single JSON value.     |
+| `E{id}:{error}`                     | Error response to call `{id}`. `{error}` is `{"code":-1,"message":"..."}`. |
+| `N:@S:{id},{value}[,{mode}[,{callId}]]` | Signal update notification. `{mode}` is omitted (or `null`) for full replacement. `{callId}` is the wire id of the call that produced this update, echoed only to that call's originating client so optimistic changes confirm by mutation identity. |
 
 #### Method Routing
 
@@ -192,11 +192,11 @@ Plaintext, regex-parseable, one message per frame.
 
 Reserved methods:
 
-| method | dir | payload           | meaning                       |
-| :----: | :-: | ----------------- | ----------------------------- |
-|  `@W`  | c→s | `id,id,...`       | subscribe to these signal ids |
-|  `@U`  | c→s | `id,id,...`       | unsubscribe                   |
-|  `@S`  | s→c | `id,value[,mode]` | signal `id` changed           |
+| method | dir | payload                    | meaning                       |
+| :----: | :-: | -------------------------- | ----------------------------- |
+|  `@W`  | c→s | `id,id,...`                | subscribe to these signal ids |
+|  `@U`  | c→s | `id,id,...`                | unsubscribe                   |
+|  `@S`  | s→c | `id,value[,mode[,callId]]` | signal `id` changed (`callId` echoed only to the originating client) |
 
 Routing on server (`callMethod`):
 
@@ -239,21 +239,22 @@ Server holds `lastSentValues["<client>:<signal>"]`. On change it computes the
 smallest patch that reconstructs `newValue` from `oldValue`:
 
 ```
-                                      ┌─────────┐
-  old            new           mode   │ client  │
-  ───            ───           ────   │ applies │
-  [a,b]       →  [a,b,c,d]     append │ [...cur, ...Δ]
-  "foo"       →  "foobar"      append │ cur + Δ
-  {x:1,y:2}   →  {x:1,y:9}     merge  │ {...cur, ...Δ}    (sends {y:9} only)
-  anything    →  unrelated     —      │ Δ                 (full replace)
-                                      └─────────┘
+                                      ┌─────────────────────────────────────────┐
+  old            new           mode   │ client                                  │
+  ───            ───           ────   │ applies                                 │
+  [a,b]       →  [a,b,c,d]     append │ [...cur, ...Δ]                          │
+  [a,b,c,d]   →  [a,b,x,d]     splice │ slice()+splice(start, delCount, ...Δ)   │
+  "foo"       →  "foobar"      append │ cur + Δ                                 │
+  {x:1,y:2}   →  {x:1,y:9}     merge  │ {...cur, ...Δ}    (sends {y:9} only).   │
+  anything    →  unrelated     —      │ Δ                 (full replace)        │
+                                      └─────────────────────────────────────────┘
 ```
 
-Array-append is detected by prefix identity (`===` per element), so it only
-fires when the _same_ elements are reused — i.e. immutable push patterns like
-`sig.value = [...sig.value, item]`.
-
-The client also handles `splice` mode; the server doesn't currently emit it.
+Array append and splice are detected by identity (`===` per unchanged element),
+so they only fire when the _same_ elements are reused — i.e. immutable update
+patterns like `sig.value = [...sig.value, item]` or a single contiguous
+insert/delete/replace. Multi-range edits and rebuilt arrays fall back to full
+replacement.
 
 ---
 
@@ -309,7 +310,7 @@ Generates a Preact `createModel` constructor that mirrors a server model.
 │                                                                             │
 │  ┌──────────────── per method ─────────────────────┐                        │
 │  │                                                 │                        │
-│  │  ctx.rpc.call(`${wireId}#${m}`, args)            │   instance route       │
+│  │  ctx.rpc.call(`${wireId}#${m}`, args)           │   instance route       │
 │  └─────────────────────────────────────────────────┘                        │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
