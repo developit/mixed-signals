@@ -724,12 +724,11 @@ describe('RPCClient', () => {
       expect(client.root).toBe(model);
       expect(model.count).toBe(count);
       expect(count.peek()).toBe(5);
-
-      expect(transport2.sent[0]).toBe('M1:@M:"Counter#1"');
+      expect(transport2.sent).not.toContain('M1:@M:"Counter#1"');
 
       const pending = model.increment();
-      expect(transport2.sent.at(-1)).toBe('M2:1#increment:');
-      transport2.emit('R2:null');
+      expect(transport2.sent.at(-1)).toBe('M1:1#increment:');
+      transport2.emit('R1:null');
       await pending;
     });
 
@@ -871,6 +870,29 @@ describe('RPCClient', () => {
       expect(client.root.count.peek()).toBe(2);
     });
 
+    it('does not refresh inactive held model facades on reconnect', async () => {
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+      client.registerModel('Counter', ReflectedCounter);
+      transport1.emit('N:@R:{"root":true}');
+      await client.ready;
+
+      client.reflection.createModelFacade({
+        '@M': 'Counter#held',
+        count: client.reflection.getOrCreateSignal(1, 1),
+        name: client.reflection.getOrCreateSignal(2, 'x'),
+        items: client.reflection.getOrCreateSignal(3, []),
+        meta: client.reflection.getOrCreateSignal(4, {}),
+      });
+
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+      transport2.emit('N:@R:{"root":true}');
+      await client.ready;
+
+      expect(transport2.sent).toHaveLength(0);
+    });
+
     it('refreshes held model facades that are not present in the reconnect root', async () => {
       vi.useFakeTimers();
       const transport1 = new FakeTransport();
@@ -933,12 +955,7 @@ describe('RPCClient', () => {
         'N:@R:{"@M":"Counter#1","count":{"@S":10,"v":5},"name":{"@S":20,"v":"y"},"items":{"@S":30,"v":[]},"meta":{"@S":40,"v":{}}},{"connectionId":"c1","processId":"p2","resumed":false}',
       );
       await client.ready;
-      expect(transport2.sent[0]).toBe('M1:@M:"Counter#1"');
-      transport2.emit(
-        'R1:[{"@M":"Counter#1","count":{"@S":10,"v":5},"name":{"@S":20,"v":"y"},"items":{"@S":30,"v":[]},"meta":{"@S":40,"v":{}}}]',
-      );
-      await Promise.resolve();
-      await Promise.resolve();
+      expect(transport2.sent).not.toContain('M1:@M:"Counter#1"');
       vi.advanceTimersByTime(1);
 
       expect(count.peek()).toBe(5);

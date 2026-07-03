@@ -181,7 +181,17 @@ export class RPCClient {
         this.prepareForRootSnapshot(rawParams);
       }
 
-      const params = parseWireParams(message.payload, reviver);
+      let params: unknown[];
+      if (message.method === ROOT_NOTIFICATION_METHOD) {
+        this.reflection.beginRootSnapshot();
+        try {
+          params = parseWireParams(message.payload, reviver);
+        } finally {
+          this.reflection.endRootSnapshot();
+        }
+      } else {
+        params = parseWireParams(message.payload, reviver);
+      }
       this.handleNotification(generation, message.method, params);
     });
   }
@@ -421,7 +431,7 @@ export class RPCClient {
   }
 
   private async refreshHeldModelsAndReplay(generation: number) {
-    const markers = this.reflection.getModelMarkers();
+    const markers = this.reflection.getActiveHeldModelMarkers();
     if (markers.length === 0) {
       this.reflection.replayActiveSignals();
       return;

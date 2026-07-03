@@ -291,9 +291,10 @@ On reconnect, the client keeps existing roots/signals/model facades alive until
 it receives a fresh `@R` root snapshot. That snapshot refreshes signal values,
 rebases root signals if a different backend process assigned different signal
 ids, refreshes cached model facades with their new underlying signal sources,
-requests fresh snapshots for held model facades via `M{id}:@M:...`, replays
-currently watched signal ids once from the root snapshot immediately, and
-replays them again after held-model refreshes bind any additional signal ids.
+requests fresh snapshots for active held model facades that were not present in
+the reconnect root via `M{id}:@M:...`, replays currently watched signal ids once
+from the root snapshot immediately, and replays them again after held-model
+refreshes bind any additional signal ids.
 Only explicit protocol identities are preserved: `@S` signals and `@M` model
 facades. The top-level plain root object can be updated in place for ergonomics,
 but unbranded nested arrays and plain objects are replaced instead of reconciled

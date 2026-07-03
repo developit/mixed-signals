@@ -5,8 +5,14 @@ import type {WireContext} from './reflection.ts';
 export const REFRESH_REFLECTED_MODEL = Symbol('mixed-signals.refreshModel');
 
 /** @internal */
+export const GET_REFLECTED_MODEL_SIGNALS = Symbol(
+  'mixed-signals.getModelSignals',
+);
+
+/** @internal */
 export interface RefreshableReflectedModel {
   [REFRESH_REFLECTED_MODEL]?(data: any): void;
+  [GET_REFLECTED_MODEL_SIGNALS]?(): Signal<any>[];
 }
 
 export function createReflectedModel<T>(
@@ -34,6 +40,13 @@ export function createReflectedModel<T>(
         return ctx.rpc.call(`${wireId.peek()}#${method}`, args);
       };
     }
+
+    Object.defineProperty(model, GET_REFLECTED_MODEL_SIGNALS, {
+      enumerable: false,
+      value() {
+        return Array.from(signalSources.values(), (source) => source.peek());
+      },
+    });
 
     Object.defineProperty(model, REFRESH_REFLECTED_MODEL, {
       enumerable: false,
