@@ -870,6 +870,38 @@ describe('RPCClient', () => {
       expect(client.root.count.peek()).toBe(2);
     });
 
+    it('refreshes active root models when the reconnect root only includes a marker reference', async () => {
+      vi.useFakeTimers();
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+      client.registerModel('Counter', ReflectedCounter);
+      transport1.emit(
+        'N:@R:{"@M":"Counter#1","count":{"@S":1,"v":0},"name":{"@S":2,"v":"x"},"items":{"@S":3,"v":[]},"meta":{"@S":4,"v":{}}},{"connectionId":"c1","processId":"p1","resumed":false}',
+      );
+      await client.ready;
+
+      const count = client.root.count;
+      count.subscribe(() => undefined);
+      vi.advanceTimersByTime(1);
+
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+      transport2.emit(
+        'N:@R:{"@M":"Counter#1"},{"connectionId":"c1","processId":"p2","resumed":false}',
+      );
+      await client.ready;
+
+      expect(transport2.sent[0]).toBe('M1:@M:"Counter#1"');
+      transport2.emit(
+        'R1:[{"@M":"Counter#1","count":{"@S":10,"v":5},"name":{"@S":20,"v":"y"},"items":{"@S":30,"v":[]},"meta":{"@S":40,"v":{}}}]',
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(count.peek()).toBe(5);
+      expect(transport2.sent).toContain('N:@W:10');
+    });
+
     it('does not refresh inactive held model facades on reconnect', async () => {
       const transport1 = new FakeTransport();
       const client = new RPCClient(transport1, createContext());

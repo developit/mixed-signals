@@ -374,7 +374,12 @@ export class ClientReflection {
     const typeName = hashIdx !== -1 ? raw.slice(0, hashIdx) : raw;
     const wireId = hashIdx !== -1 ? raw.slice(hashIdx + 1) : undefined;
     const data = {...serialized, '@wireId': wireId};
-    if (this.collectingRootModels) this.rootModelMarkers.add(raw);
+    if (
+      this.collectingRootModels &&
+      Object.keys(serialized).some((key) => key !== '@M')
+    ) {
+      this.rootModelMarkers.add(raw);
+    }
 
     const existing = this.models.get(raw) as
       | RefreshableReflectedModel
