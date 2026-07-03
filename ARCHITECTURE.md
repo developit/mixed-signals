@@ -294,7 +294,10 @@ ids, refreshes cached model facades with their new underlying signal sources,
 requests fresh snapshots for active held model facades that were not present in
 the reconnect root via `M{id}:@M:...`, replays currently watched signal ids once
 from the root snapshot immediately, and replays them again after held-model
-refreshes bind any additional signal ids.
+refreshes bind any additional signal ids. After a process change, inactive held
+facades remain marked stale; if one of their signal props becomes watched later,
+the client lazily refreshes that facade and then replays the newly rebound signal
+ids.
 Only explicit protocol identities are preserved: `@S` signals and `@M` model
 facades. The top-level plain root object can be updated in place for ergonomics,
 but unbranded nested arrays and plain objects are replaced instead of reconciled

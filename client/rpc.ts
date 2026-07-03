@@ -437,6 +437,7 @@ export class RPCClient {
       return;
     }
 
+    const modelRefreshGeneration = this.reflection.beginModelRefresh(markers);
     const refresh = this.call(REFRESH_MODELS_METHOD, markers);
     const replayed = this.reflection.replayActiveSignals();
 
@@ -446,6 +447,7 @@ export class RPCClient {
       // The reconnect may have been superseded or disconnected again. In both
       // cases replaying whatever ids we currently know is the safest fallback.
     } finally {
+      this.reflection.finishModelRefresh(markers, modelRefreshGeneration);
       if (generation === this.transportGeneration) {
         this.reflection.replayActiveSignals(replayed);
       }

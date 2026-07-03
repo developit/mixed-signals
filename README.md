@@ -128,12 +128,14 @@ existing root object, signals, and reflected model facades alive. The next `@R`
 root snapshot refreshes existing signal values, rebinds root signals if the new
 server process assigned different signal ids, refreshes cached model facades,
 requests fresh snapshots for active held model facades that were not present in
-the reconnect root, and replays currently watched signal subscriptions. Only
-explicit protocol identities are preserved: `@S` signals and `@M` model facades.
-Unbranded nested arrays and plain objects are replaced instead of reconciled by
-index or shape. Watches are replayed once immediately from the ids already known
-in the root snapshot and again after held-model refreshes bind any additional
-signal ids.
+the reconnect root, and replays currently watched signal subscriptions. After a
+process change, inactive held facades are marked stale; if one of their signal
+props becomes watched later, the client lazily refreshes that facade before
+replaying the new signal id. Only explicit protocol identities are preserved:
+`@S` signals and `@M` model facades. Unbranded nested arrays and plain objects
+are replaced instead of reconciled by index or shape. Watches are replayed once
+immediately from the ids already known in the root snapshot and again after
+held-model refreshes bind any additional signal ids.
 
 Servers include an opaque `connectionId` and `processId` with each root
 snapshot. If the client reconnects with the same `connectionId`, the server's

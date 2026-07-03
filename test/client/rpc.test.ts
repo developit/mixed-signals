@@ -925,6 +925,91 @@ describe('RPCClient', () => {
       expect(transport2.sent).toHaveLength(0);
     });
 
+    it('lazily refreshes inactive held models when they become watched after a process change', async () => {
+      vi.useFakeTimers();
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+      client.registerModel('Counter', ReflectedCounter);
+      transport1.emit(
+        'N:@R:{"root":true},{"connectionId":"c1","processId":"p1","resumed":false}',
+      );
+      await client.ready;
+
+      const held = client.reflection.createModelFacade({
+        '@M': 'Counter#held',
+        count: client.reflection.getOrCreateSignal(1, 1),
+        name: client.reflection.getOrCreateSignal(2, 'x'),
+        items: client.reflection.getOrCreateSignal(3, []),
+        meta: client.reflection.getOrCreateSignal(4, {}),
+      });
+      const count = held.count;
+
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+      transport2.emit(
+        'N:@R:{"root":true},{"connectionId":"c1","processId":"p2","resumed":false}',
+      );
+      await client.ready;
+      expect(transport2.sent).toHaveLength(0);
+
+      count.subscribe(() => undefined);
+      expect(transport2.sent[0]).toBe('M1:@M:"Counter#held"');
+      vi.advanceTimersByTime(1);
+      expect(transport2.sent).not.toContain('N:@W:1');
+
+      transport2.emit(
+        'R1:[{"@M":"Counter#held","count":{"@S":10,"v":5},"name":{"@S":20,"v":"y"},"items":{"@S":30,"v":[]},"meta":{"@S":40,"v":{}}}]',
+      );
+      await vi.waitFor(() => {
+        expect(transport2.sent).toContain('N:@W:10');
+      });
+
+      expect(held.count).toBe(count);
+      expect(count.peek()).toBe(5);
+    });
+
+    it('deduplicates lazy stale model refreshes while one is in flight', async () => {
+      vi.useFakeTimers();
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+      client.registerModel('Counter', ReflectedCounter);
+      transport1.emit(
+        'N:@R:{"root":true},{"connectionId":"c1","processId":"p1","resumed":false}',
+      );
+      await client.ready;
+
+      const held = client.reflection.createModelFacade({
+        '@M': 'Counter#held',
+        count: client.reflection.getOrCreateSignal(1, 1),
+        name: client.reflection.getOrCreateSignal(2, 'x'),
+        items: client.reflection.getOrCreateSignal(3, []),
+        meta: client.reflection.getOrCreateSignal(4, {}),
+      });
+
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+      transport2.emit(
+        'N:@R:{"root":true},{"connectionId":"c1","processId":"p2","resumed":false}',
+      );
+      await client.ready;
+
+      held.count.subscribe(() => undefined);
+      held.name.subscribe(() => undefined);
+      vi.advanceTimersByTime(1);
+
+      expect(transport2.sent.filter((msg) => msg.includes(':@M:'))).toEqual([
+        'M1:@M:"Counter#held"',
+      ]);
+      expect(transport2.sent).not.toContain('N:@W:1,2');
+
+      transport2.emit(
+        'R1:[{"@M":"Counter#held","count":{"@S":10,"v":5},"name":{"@S":20,"v":"y"},"items":{"@S":30,"v":[]},"meta":{"@S":40,"v":{}}}]',
+      );
+      await vi.waitFor(() => {
+        expect(transport2.sent).toContain('N:@W:10,20');
+      });
+    });
+
     it('refreshes held model facades that are not present in the reconnect root', async () => {
       vi.useFakeTimers();
       const transport1 = new FakeTransport();

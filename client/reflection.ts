@@ -1,5 +1,6 @@
 import {type Signal, Signal as SignalCtor, signal} from '@preact/signals-core';
 import {
+  REFRESH_MODELS_METHOD,
   UNWATCH_SIGNALS_METHOD,
   WATCH_SIGNALS_METHOD,
 } from '../shared/protocol.ts';
@@ -39,7 +40,10 @@ export class ClientReflection {
   private activeSignals = new Set<Signal<any>>();
   private models = new Map<string, any>();
   private modelSignals = new Map<string, Set<Signal<any>>>();
-  private rootModelMarkers = new Set<string>();
+  private refreshedRootModelMarkers = new Set<string>();
+  private staleModelMarkers = new Set<string>();
+  private refreshingModelMarkers = new Set<string>();
+  private modelRefreshGeneration = 0;
   private collectingRootModels = false;
   private modelRegistry = new Map<string, any>();
   private rpc: RPCClient;
@@ -64,7 +68,10 @@ export class ClientReflection {
     this.activeSignals.clear();
     this.models.clear();
     this.modelSignals.clear();
-    this.rootModelMarkers.clear();
+    this.refreshedRootModelMarkers.clear();
+    this.staleModelMarkers.clear();
+    this.refreshingModelMarkers.clear();
+    this.modelRefreshGeneration++;
     this.collectingRootModels = false;
     this.watchedSignals.clear();
   }
@@ -77,6 +84,8 @@ export class ClientReflection {
   prepareReconnect() {
     this.clearPendingWatchTraffic();
     this.watchedSignals.clear();
+    this.refreshingModelMarkers.clear();
+    this.modelRefreshGeneration++;
   }
 
   /**
@@ -88,11 +97,16 @@ export class ClientReflection {
     this.prepareReconnect();
     this.signals.clear();
     this.signalIds = new WeakMap();
+    this.staleModelMarkers = new Set(this.models.keys());
   }
 
   /** Replay all currently watched signal ids on a freshly connected transport. */
   replayActiveSignals(exclude?: Iterable<SignalId>): SignalId[] {
     this.clearPendingWatchTraffic();
+    return this.sendActiveSignalWatches(exclude);
+  }
+
+  private sendActiveSignalWatches(exclude?: Iterable<SignalId>): SignalId[] {
     const excluded = exclude ? new Set(exclude) : undefined;
     const signals = Array.from(this.activeSignals).filter((sig) => {
       const id = this.signalIds.get(sig);
@@ -110,20 +124,44 @@ export class ClientReflection {
     this.modelRegistry.set(typeName, ctor);
   }
 
+  /** @internal */
   beginRootSnapshot() {
-    this.rootModelMarkers = new Set();
+    this.refreshedRootModelMarkers = new Set();
     this.collectingRootModels = true;
   }
 
+  /** @internal */
   endRootSnapshot() {
     this.collectingRootModels = false;
   }
 
+  /** @internal */
   getActiveHeldModelMarkers(): string[] {
     return Array.from(this.models.keys()).filter(
       (marker) =>
-        !this.rootModelMarkers.has(marker) && this.isModelMarkerActive(marker),
+        !this.refreshedRootModelMarkers.has(marker) &&
+        !this.refreshingModelMarkers.has(marker) &&
+        this.isModelMarkerActive(marker),
     );
+  }
+
+  /** @internal */
+  beginModelRefresh(markers: string[]): number {
+    const generation = this.modelRefreshGeneration;
+    for (const marker of markers) {
+      this.refreshingModelMarkers.add(marker);
+    }
+    return generation;
+  }
+
+  /** @internal */
+  finishModelRefresh(markers: string[], generation: number): boolean {
+    if (generation !== this.modelRefreshGeneration) return false;
+
+    for (const marker of markers) {
+      this.refreshingModelMarkers.delete(marker);
+    }
+    return true;
   }
 
   private clearPendingWatchTraffic() {
@@ -234,6 +272,7 @@ export class ClientReflection {
     createdSignal = signal(initialValue, {
       watched: () => {
         this.activeSignals.add(createdSignal);
+        this.refreshStaleModelsForSignal(createdSignal);
         // Only tell the server once the client actually observes this signal.
         this.scheduleWatch(createdSignal);
       },
@@ -320,12 +359,44 @@ export class ClientReflection {
     marker: string,
     model: RefreshableReflectedModel,
     data: Record<string, any>,
+    hasModelData = true,
   ) {
     const signals = model[GET_REFLECTED_MODEL_SIGNALS]?.();
-    this.modelSignals.set(
-      marker,
-      signals ? new Set(signals) : this.collectModelSignals(data),
-    );
+    if (signals) {
+      this.modelSignals.set(marker, new Set(signals));
+    } else if (hasModelData) {
+      this.modelSignals.set(marker, this.collectModelSignals(data));
+    }
+  }
+
+  private refreshStaleModelsForSignal(sig: Signal<any>) {
+    const markers: string[] = [];
+    for (const [marker, signals] of this.modelSignals) {
+      if (
+        this.staleModelMarkers.has(marker) &&
+        signals.has(sig) &&
+        !this.refreshingModelMarkers.has(marker)
+      ) {
+        markers.push(marker);
+      }
+    }
+
+    if (markers.length === 0) return;
+
+    const generation = this.beginModelRefresh(markers);
+
+    void this.rpc
+      .call(REFRESH_MODELS_METHOD, markers)
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.finishModelRefresh(markers, generation)) {
+          this.sendActiveSignalWatches();
+        }
+      });
+  }
+
+  private markModelFresh(marker: string) {
+    this.staleModelMarkers.delete(marker);
   }
 
   private rebindSignal(
@@ -374,11 +445,9 @@ export class ClientReflection {
     const typeName = hashIdx !== -1 ? raw.slice(0, hashIdx) : raw;
     const wireId = hashIdx !== -1 ? raw.slice(hashIdx + 1) : undefined;
     const data = {...serialized, '@wireId': wireId};
-    if (
-      this.collectingRootModels &&
-      Object.keys(serialized).some((key) => key !== '@M')
-    ) {
-      this.rootModelMarkers.add(raw);
+    const hasModelData = Object.keys(serialized).some((key) => key !== '@M');
+    if (this.collectingRootModels && hasModelData) {
+      this.refreshedRootModelMarkers.add(raw);
     }
 
     const existing = this.models.get(raw) as
@@ -386,7 +455,8 @@ export class ClientReflection {
       | undefined;
     if (existing) {
       existing[REFRESH_REFLECTED_MODEL]?.(data);
-      this.rememberModelSignals(raw, existing, data);
+      this.rememberModelSignals(raw, existing, data, hasModelData);
+      if (hasModelData) this.markModelFresh(raw);
       return existing;
     }
 
@@ -397,7 +467,8 @@ export class ClientReflection {
 
     const model = new ModelCtor(this.ctx, data);
     this.models.set(raw, model);
-    this.rememberModelSignals(raw, model, data);
+    this.rememberModelSignals(raw, model, data, hasModelData);
+    if (hasModelData) this.markModelFresh(raw);
     return model;
   }
 
