@@ -57,6 +57,27 @@ describe('ClientReflection', () => {
       expect(sig1.peek()).toBe('a');
       expect(sig2.peek()).toBe('b');
     });
+
+    it('stores signal cache entries behind dereferenceable refs', () => {
+      const {reflection} = setup();
+      const sig = reflection.getOrCreateSignal(1, 'a');
+      const cachedRef = (reflection as any).signals.get(1);
+
+      expect(cachedRef).not.toBe(sig);
+      expect(cachedRef.deref()).toBe(sig);
+    });
+
+    it('sweeps collected signal cache entries', () => {
+      const {reflection} = setup();
+      const sig = reflection.getOrCreateSignal(1, 'live');
+      (reflection as any).signals.set(2, {deref: () => undefined});
+
+      reflection.sweepCollectedEntries();
+
+      expect((reflection as any).signals.get(1).deref()).toBe(sig);
+      expect((reflection as any).signals.has(2)).toBe(false);
+      expect(reflection.getOrCreateSignal(2, 'new').peek()).toBe('new');
+    });
   });
 
   describe('watch/unwatch batching', () => {
@@ -327,6 +348,47 @@ describe('ClientReflection', () => {
       const a = reflection.createModelFacade({'@M': 'Counter#1'});
       const b = reflection.createModelFacade({'@M': 'Counter#2'});
       expect(a).not.toBe(b);
+    });
+
+    it('stores model facades and their signals behind dereferenceable refs', () => {
+      const {reflection} = setup();
+      reflection.registerModel('Task', TaskModel);
+
+      const title = reflection.getOrCreateSignal(1, 'Ship');
+      const facade = reflection.createModelFacade({
+        '@M': 'Task#1',
+        title,
+      });
+
+      const modelRef = (reflection as any).models.get('Task#1');
+      const [signalRef] = (reflection as any).modelSignals.get('Task#1');
+
+      expect(modelRef).not.toBe(facade);
+      expect(modelRef.deref()).toBe(facade);
+      expect(signalRef).not.toBe(title);
+      expect(signalRef.deref()).toBe(title);
+    });
+
+    it('sweeps collected model facades and signal indexes', () => {
+      const {reflection} = setup();
+      (reflection as any).models.set('Task#dead', {deref: () => undefined});
+      (reflection as any).modelSignals.set(
+        'Task#dead',
+        new Set([{deref: () => undefined}]),
+      );
+      (reflection as any).staleModelMarkers.add('Task#dead');
+      (reflection as any).refreshingModelMarkers.add('Task#dead');
+
+      reflection.sweepCollectedEntries();
+
+      expect((reflection as any).models.has('Task#dead')).toBe(false);
+      expect((reflection as any).modelSignals.has('Task#dead')).toBe(false);
+      expect((reflection as any).staleModelMarkers.has('Task#dead')).toBe(
+        false,
+      );
+      expect((reflection as any).refreshingModelMarkers.has('Task#dead')).toBe(
+        false,
+      );
     });
   });
 

@@ -34,12 +34,32 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return prototype === Object.prototype || prototype === null;
 }
 
+type CacheRef<T extends object> = WeakRef<T> | StrongCacheRef<T>;
+
+class StrongCacheRef<T extends object> {
+  constructor(private value: T) {}
+
+  deref(): T {
+    return this.value;
+  }
+}
+
+const weakRefsAvailable = typeof WeakRef !== 'undefined';
+
+function createCacheRef<T extends object>(value: T): CacheRef<T> {
+  return weakRefsAvailable ? new WeakRef(value) : new StrongCacheRef(value);
+}
+
 export class ClientReflection {
-  private signals = new Map<SignalId, Signal<any>>();
+  private signals = new Map<SignalId, CacheRef<Signal<any>>>();
   private signalIds = new WeakMap<Signal<any>, SignalId>();
+  private signalFinalizerTokens = new WeakMap<Signal<any>, object>();
+  private signalFinalizer?: FinalizationRegistry<SignalId>;
   private activeSignals = new Set<Signal<any>>();
-  private models = new Map<string, any>();
-  private modelSignals = new Map<string, Set<Signal<any>>>();
+  private models = new Map<string, CacheRef<object>>();
+  private modelFinalizerTokens = new WeakMap<object, object>();
+  private modelFinalizer?: FinalizationRegistry<string>;
+  private modelSignals = new Map<string, Set<CacheRef<Signal<any>>>>();
   private refreshedRootModelMarkers = new Set<string>();
   private staleModelMarkers = new Set<string>();
   private refreshingModelMarkers = new Set<string>();
@@ -58,6 +78,18 @@ export class ClientReflection {
   constructor(rpc: RPCClient, ctx?: any) {
     this.rpc = rpc;
     this.ctx = ctx && ctx.rpc === rpc ? ctx : {rpc};
+
+    if (weakRefsAvailable && typeof FinalizationRegistry !== 'undefined') {
+      // Finalizers are cache hygiene only. A wire id or marker may be rebound
+      // to a newer object before an older one is collected, so each callback
+      // checks the current cache entry before deleting it.
+      this.signalFinalizer = new FinalizationRegistry((id) => {
+        if (!this.signals.get(id)?.deref()) this.signals.delete(id);
+      });
+      this.modelFinalizer = new FinalizationRegistry((marker) => {
+        if (!this.models.get(marker)?.deref()) this.forgetModel(marker);
+      });
+    }
   }
 
   /** Clear all cached client state. Prefer prepareReconnect() for reconnects. */
@@ -97,6 +129,7 @@ export class ClientReflection {
     this.prepareReconnect();
     this.signals.clear();
     this.signalIds = new WeakMap();
+    this.sweepCollectedEntries();
     this.staleModelMarkers = new Set(this.models.keys());
   }
 
@@ -137,6 +170,7 @@ export class ClientReflection {
 
   /** @internal */
   getActiveHeldModelMarkers(): string[] {
+    this.sweepCollectedEntries();
     return Array.from(this.models.keys()).filter(
       (marker) =>
         !this.refreshedRootModelMarkers.has(marker) &&
@@ -177,16 +211,122 @@ export class ClientReflection {
     this.unwatchBatch.clear();
   }
 
+  private getSignalById(id: SignalId): Signal<any> | undefined {
+    const ref = this.signals.get(id);
+    if (!ref) return undefined;
+
+    const sig = ref.deref();
+    if (!sig) {
+      this.signals.delete(id);
+      return undefined;
+    }
+
+    return sig;
+  }
+
   private rememberSignal(id: SignalId, sig: Signal<any>) {
     const previousId = this.signalIds.get(sig);
     if (previousId !== undefined && previousId !== id) {
-      if (this.signals.get(previousId) === sig) {
+      if (this.getSignalById(previousId) === sig) {
         this.signals.delete(previousId);
       }
     }
 
-    this.signals.set(id, sig);
+    this.signals.set(id, createCacheRef(sig));
     this.signalIds.set(sig, id);
+    this.registerSignalFinalizer(id, sig);
+  }
+
+  private registerSignalFinalizer(id: SignalId, sig: Signal<any>) {
+    if (!this.signalFinalizer) return;
+
+    const previousToken = this.signalFinalizerTokens.get(sig);
+    if (previousToken) this.signalFinalizer.unregister(previousToken);
+
+    const token = {};
+    this.signalFinalizerTokens.set(sig, token);
+    this.signalFinalizer.register(sig, id, token);
+  }
+
+  private getModel(marker: string): RefreshableReflectedModel | undefined {
+    const ref = this.models.get(marker);
+    if (!ref) return undefined;
+
+    const model = ref.deref() as RefreshableReflectedModel | undefined;
+    if (!model) {
+      this.forgetModel(marker);
+      return undefined;
+    }
+
+    return model;
+  }
+
+  private rememberModel(marker: string, model: RefreshableReflectedModel) {
+    this.models.set(marker, createCacheRef(model));
+    this.registerModelFinalizer(marker, model);
+  }
+
+  private registerModelFinalizer(
+    marker: string,
+    model: RefreshableReflectedModel,
+  ) {
+    if (
+      !this.modelFinalizer ||
+      model === null ||
+      (typeof model !== 'object' && typeof model !== 'function')
+    ) {
+      return;
+    }
+
+    const previousToken = this.modelFinalizerTokens.get(model);
+    if (previousToken) this.modelFinalizer.unregister(previousToken);
+
+    const token = {};
+    this.modelFinalizerTokens.set(model, token);
+    this.modelFinalizer.register(model, marker, token);
+  }
+
+  private forgetModel(marker: string) {
+    this.models.delete(marker);
+    this.modelSignals.delete(marker);
+    this.refreshedRootModelMarkers.delete(marker);
+    this.staleModelMarkers.delete(marker);
+    this.refreshingModelMarkers.delete(marker);
+  }
+
+  private liveModelSignals(marker: string): Signal<any>[] {
+    const refs = this.modelSignals.get(marker);
+    if (!refs) return [];
+
+    const signals: Signal<any>[] = [];
+    for (const ref of refs) {
+      const sig = ref.deref();
+      if (sig) {
+        signals.push(sig);
+      } else {
+        refs.delete(ref);
+      }
+    }
+    return signals;
+  }
+
+  /** @internal */
+  sweepCollectedEntries() {
+    for (const id of this.signals.keys()) {
+      this.getSignalById(id);
+    }
+
+    for (const marker of this.models.keys()) {
+      this.getModel(marker);
+    }
+
+    for (const marker of this.modelSignals.keys()) {
+      if (!this.models.has(marker)) {
+        this.modelSignals.delete(marker);
+      } else {
+        this.liveModelSignals(marker);
+      }
+    }
   }
 
   private static queueGlobalWatchFlush() {
@@ -264,7 +404,7 @@ export class ClientReflection {
   }
 
   getOrCreateSignal(id: SignalId, initialValue: any): Signal<any> {
-    const existingSignal = this.signals.get(id);
+    const existingSignal = this.getSignalById(id);
     if (existingSignal) return existingSignal;
 
     let createdSignal!: Signal<any>;
@@ -338,10 +478,7 @@ export class ClientReflection {
   }
 
   private isModelMarkerActive(marker: string): boolean {
-    const signals = this.modelSignals.get(marker);
-    if (!signals) return false;
-
-    for (const sig of signals) {
+    for (const sig of this.liveModelSignals(marker)) {
       if (this.activeSignals.has(sig)) return true;
     }
     return false;
@@ -363,19 +500,45 @@ export class ClientReflection {
   ) {
     const signals = model[GET_REFLECTED_MODEL_SIGNALS]?.();
     if (signals) {
-      this.modelSignals.set(marker, new Set(signals));
+      this.modelSignals.set(marker, this.createSignalRefs(signals));
     } else if (hasModelData) {
-      this.modelSignals.set(marker, this.collectModelSignals(data));
+      this.modelSignals.set(
+        marker,
+        this.createSignalRefs(this.collectModelSignals(data)),
+      );
     }
+  }
+
+  private createSignalRefs(
+    signals: Iterable<Signal<any>>,
+  ): Set<CacheRef<Signal<any>>> {
+    return new Set(Array.from(signals, (sig) => createCacheRef(sig)));
+  }
+
+  private modelHasLiveSignal(marker: string, target: Signal<any>): boolean {
+    const refs = this.modelSignals.get(marker);
+    if (!refs) return false;
+
+    let found = false;
+    for (const ref of refs) {
+      const sig = ref.deref();
+      if (sig) {
+        if (sig === target) found = true;
+      } else {
+        refs.delete(ref);
+      }
+    }
+
+    return found;
   }
 
   private refreshStaleModelsForSignal(sig: Signal<any>) {
     const markers: string[] = [];
-    for (const [marker, signals] of this.modelSignals) {
+    for (const marker of this.staleModelMarkers) {
       if (
-        this.staleModelMarkers.has(marker) &&
-        signals.has(sig) &&
-        !this.refreshingModelMarkers.has(marker)
+        !this.refreshingModelMarkers.has(marker) &&
+        this.getModel(marker) &&
+        this.modelHasLiveSignal(marker, sig)
       ) {
         markers.push(marker);
       }
@@ -406,14 +569,14 @@ export class ClientReflection {
   ): Signal<any> {
     const nextId = this.signalIds.get(nextSignal);
     if (nextId !== undefined) {
-      const existingSignal = this.signals.get(nextId);
+      const existingSignal = this.getSignalById(nextId);
       if (
         preferExisting &&
         existingSignal &&
         existingSignal !== previousSignal
       ) {
-        this.transferActiveSignal(previousSignal, existingSignal);
-        this.transferActiveSignal(nextSignal, existingSignal);
+        this.transferSignalState(previousSignal, existingSignal);
+        this.transferSignalState(nextSignal, existingSignal);
         previousSignal.value = existingSignal.peek();
         return existingSignal;
       }
@@ -421,17 +584,27 @@ export class ClientReflection {
       this.rememberSignal(nextId, previousSignal);
     }
 
-    this.transferActiveSignal(nextSignal, previousSignal);
+    this.transferSignalState(nextSignal, previousSignal);
 
     previousSignal.value = nextSignal.peek();
     return previousSignal;
   }
 
-  private transferActiveSignal(from: Signal<any>, to: Signal<any>) {
-    if (from !== to && this.activeSignals.has(from)) {
+  private transferSignalState(from: Signal<any>, to: Signal<any>) {
+    if (from === to) return;
+
+    if (this.activeSignals.has(from)) {
       this.activeSignals.delete(from);
       this.activeSignals.add(to);
     }
+
+    if (this.watchedSignals.has(from)) {
+      this.watchedSignals.delete(from);
+      this.watchedSignals.add(to);
+    }
+
+    if (this.watchBatch.delete(from)) this.watchBatch.add(to);
+    if (this.unwatchBatch.delete(from)) this.unwatchBatch.add(to);
   }
 
   createModelFacade(serialized: any): any {
@@ -450,9 +623,7 @@ export class ClientReflection {
       this.refreshedRootModelMarkers.add(raw);
     }
 
-    const existing = this.models.get(raw) as
-      | RefreshableReflectedModel
-      | undefined;
+    const existing = this.getModel(raw);
     if (existing) {
       existing[REFRESH_REFLECTED_MODEL]?.(data);
       this.rememberModelSignals(raw, existing, data, hasModelData);
@@ -466,14 +637,14 @@ export class ClientReflection {
     }
 
     const model = new ModelCtor(this.ctx, data);
-    this.models.set(raw, model);
+    this.rememberModel(raw, model);
     this.rememberModelSignals(raw, model, data, hasModelData);
     if (hasModelData) this.markModelFresh(raw);
     return model;
   }
 
   handleUpdate(id: SignalId, value: any, mode?: string) {
-    const sig = this.signals.get(id);
+    const sig = this.getSignalById(id);
     if (!sig) return;
 
     if (!mode) {

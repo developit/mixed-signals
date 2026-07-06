@@ -155,7 +155,7 @@ signal while ≥1 client is watching, and pushes diffs via `N:@S:`.
 │ CLIENT                                                                      │
 │                                 ┌──────────────────────────────┐            │
 │   JSON.parse(reviver) ────────▶ │ ClientReflection             │            │
-│    sees "@S" → calls            │  signals: Map<id,Signal>     │            │
+│    sees "@S" → calls            │  signals: Map<id,WeakRef>    │            │
 │    getOrCreateSignal(7,0)       │  watchBatch / unwatchBatch   │ ── 1ms ──▶ │
 │                                 └────────────┬─────────────────┘    flush   │
 │                                              │                              │
@@ -286,6 +286,15 @@ The client also handles `splice` mode; the server doesn't currently emit it.
 
 Batching coalesces the "20 signals arrive in one response, 20 effects
 subscribe on the same tick" case into one `@W` frame.
+
+Client reflection caches are weak where the runtime supports `WeakRef` and
+`FinalizationRegistry`: signal id → signal, model marker → facade, and model →
+signal index entries do not by themselves keep unwatched objects alive. Active
+signals are still held strongly by `activeSignals` while they are watched so the
+client can deterministically send `@U` and replay subscriptions on reconnect.
+Root objects, signal values, reflected model facades held by application code,
+and Preact subscriptions remain ordinary strong references; once those are gone,
+the weak reflection entries can be collected and opportunistically swept.
 
 On reconnect, the client keeps existing roots/signals/model facades alive until
 it receives a fresh `@R` root snapshot. That snapshot refreshes signal values,

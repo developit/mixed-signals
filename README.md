@@ -137,6 +137,12 @@ are replaced instead of reconciled by index or shape. Watches are replayed once
 immediately from the ids already known in the root snapshot and again after
 held-model refreshes bind any additional signal ids.
 
+Client reflection caches use weak references when the runtime supports them, so
+cached signal ids and reflected model markers do not by themselves keep
+unwatched, otherwise-unheld client objects alive. Watched signals remain strongly
+tracked until their `@U` can be sent and so reconnect replay remains
+deterministic.
+
 Servers include an opaque `connectionId` and `processId` with each root
 snapshot. If the client reconnects with the same `connectionId`, the server's
 `resumed` flag tells you whether this connection replaced active retained state
