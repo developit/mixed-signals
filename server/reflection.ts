@@ -3,6 +3,7 @@ import {
   formatNotificationMessage,
   SIGNAL_UPDATE_METHOD,
 } from '../shared/protocol.ts';
+import {type CacheRef, createCacheRef, weakRefsAvailable} from './cache-ref.ts';
 import type {Instances} from './instances.ts';
 
 type SignalId = number;
@@ -21,11 +22,11 @@ type ModelConstructor =
 
 export class Reflection {
   private signalIds = new WeakMap<Signal<any>, SignalId>();
-  private signals = new Map<SignalId, Signal<any>>();
+  private signals = new Map<SignalId, CacheRef<Signal<any>>>();
+  private signalFinalizer?: FinalizationRegistry<SignalId>;
   private subscriptions = new Map<SignalId, Set<ClientId>>();
   private signalUnsubscribers = new Map<SignalId, () => void>();
   private lastSentValues = new Map<string, any>();
-  private sentModels = new Map<ClientId, Set<string>>();
   private nextSignalId = 1;
   private rpc: RpcSender;
   private instances: Instances;
@@ -35,6 +36,12 @@ export class Reflection {
   constructor(rpc: RpcSender, instances: Instances) {
     this.rpc = rpc;
     this.instances = instances;
+
+    if (weakRefsAvailable && typeof FinalizationRegistry !== 'undefined') {
+      this.signalFinalizer = new FinalizationRegistry((id) => {
+        if (!this.signals.get(id)?.deref()) this.signals.delete(id);
+      });
+    }
   }
 
   registerModel(name: string, Ctor: ModelConstructor) {
@@ -80,13 +87,38 @@ export class Reflection {
     if (!id) {
       id = this.nextSignalId++;
       this.signalIds.set(sig, id);
-      this.signals.set(id, sig);
     }
 
+    this.rememberSignal(id, sig);
     return id;
   }
 
-  private serializeValue(value: any, clientId?: ClientId): any {
+  private rememberSignal(id: SignalId, sig: Signal<any>) {
+    this.signals.set(id, createCacheRef(sig));
+    this.signalFinalizer?.register(sig, id);
+  }
+
+  private getSignalById(id: SignalId): Signal<any> | undefined {
+    const ref = this.signals.get(id);
+    if (!ref) return undefined;
+
+    const sig = ref.deref();
+    if (!sig) this.signals.delete(id);
+    return sig;
+  }
+
+  /** @internal */
+  sweepCollectedSignals() {
+    for (const id of this.signals.keys()) {
+      this.getSignalById(id);
+    }
+  }
+
+  private serializeValue(
+    value: any,
+    clientId?: ClientId,
+    serializingModels = new Set<string>(),
+  ): any {
     if (value === this.rpc || value === this || value === this.instances)
       return undefined;
     if (typeof value === 'function') return undefined;
@@ -100,7 +132,10 @@ export class Reflection {
         this.watch(clientId, id);
       }
 
-      return {'@S': id, v: this.serializeValue(signalValue, clientId)};
+      return {
+        '@S': id,
+        v: this.serializeValue(signalValue, clientId, serializingModels),
+      };
     }
 
     if (this.isModel(value)) {
@@ -112,25 +147,20 @@ export class Reflection {
         this.instances.register(instanceId, value);
       }
 
-      if (clientId) {
-        let sent = this.sentModels.get(clientId);
-        if (sent?.has(marker)) {
-          return {'@M': marker};
-        }
-
-        if (!sent) {
-          sent = new Set();
-          this.sentModels.set(clientId, sent);
-        }
-
-        sent.add(marker);
+      if (serializingModels.has(marker)) {
+        return {'@M': marker};
       }
+      serializingModels.add(marker);
 
       const branded: Record<string, any> = {'@M': marker};
       for (const [key, prop] of Object.entries(value)) {
         if (key.startsWith('_')) continue;
 
-        const serializedProp = this.serializeValue(prop, clientId);
+        const serializedProp = this.serializeValue(
+          prop,
+          clientId,
+          serializingModels,
+        );
         if (serializedProp !== undefined) {
           branded[key] = serializedProp;
         }
@@ -141,7 +171,11 @@ export class Reflection {
 
     if (Array.isArray(value)) {
       return value.map((item) => {
-        const serializedItem = this.serializeValue(item, clientId);
+        const serializedItem = this.serializeValue(
+          item,
+          clientId,
+          serializingModels,
+        );
         return serializedItem === undefined ? null : serializedItem;
       });
     }
@@ -151,7 +185,11 @@ export class Reflection {
       for (const [key, prop] of Object.entries(value)) {
         if (key.startsWith('_')) continue;
 
-        const serializedProp = this.serializeValue(prop, clientId);
+        const serializedProp = this.serializeValue(
+          prop,
+          clientId,
+          serializingModels,
+        );
         if (serializedProp !== undefined) {
           serialized[key] = serializedProp;
         }
@@ -179,14 +217,13 @@ export class Reflection {
     const instance = this.instances.get(id);
     if (!instance || this.getModelType(instance) !== typeName) return null;
 
-    if (clientId) {
-      this.sentModels.get(clientId)?.delete(marker);
-    }
-
     return this.serialize(instance, clientId);
   }
 
   watch(clientId: ClientId, signalId: SignalId) {
+    const sig = this.getSignalById(signalId);
+    if (!sig) return;
+
     let subs = this.subscriptions.get(signalId);
     if (!subs) {
       subs = new Set();
@@ -196,19 +233,17 @@ export class Reflection {
     subs.add(clientId);
 
     if (!this.signalUnsubscribers.has(signalId)) {
-      const sig = this.signals.get(signalId);
-      if (sig) {
-        // The server only subscribes to source signals once a client cares.
-        const unsubscribe = sig.subscribe(() => {
-          this.notifySubscribers(signalId);
-        });
-        this.signalUnsubscribers.set(signalId, unsubscribe);
-      }
+      // The server only subscribes to source signals once a client cares.
+      const unsubscribe = sig.subscribe(() => {
+        this.notifySubscribers(signalId);
+      });
+      this.signalUnsubscribers.set(signalId, unsubscribe);
     }
   }
 
   unwatch(clientId: ClientId, signalId: SignalId) {
     this.subscriptions.get(signalId)?.delete(clientId);
+    this.lastSentValues.delete(`${clientId}:${signalId}`);
     this.disposeSignalIfUnwatched(signalId);
   }
 
@@ -222,8 +257,6 @@ export class Reflection {
     for (const key of this.lastSentValues.keys()) {
       if (key.startsWith(prefix)) this.lastSentValues.delete(key);
     }
-
-    this.sentModels.delete(clientId);
   }
 
   private disposeSignalIfUnwatched(signalId: SignalId) {
@@ -236,7 +269,7 @@ export class Reflection {
   }
 
   private notifySubscribers(signalId: SignalId) {
-    const sig = this.signals.get(signalId);
+    const sig = this.getSignalById(signalId);
     const clients = this.subscriptions.get(signalId);
     if (!sig || !clients || clients.size === 0) return;
 

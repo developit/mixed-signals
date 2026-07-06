@@ -16,6 +16,25 @@ describe('Instances', () => {
     expect(inst.getId(obj)).toBe('abc');
   });
 
+  it('stores object instances behind dereferenceable refs', () => {
+    const inst = new Instances();
+    const obj = {foo: 'bar'};
+    inst.register('abc', obj);
+    const cachedRef = (inst as any).registry.get('abc');
+
+    expect(cachedRef).not.toBe(obj);
+    expect(cachedRef.deref()).toBe(obj);
+    expect(inst.get('abc')).toBe(obj);
+  });
+
+  it('sweeps collected object refs on get', () => {
+    const inst = new Instances();
+    (inst as any).registry.set('gone', {deref: () => undefined});
+
+    expect(inst.get('gone')).toBeUndefined();
+    expect((inst as any).registry.has('gone')).toBe(false);
+  });
+
   it('getId returns undefined for non-object values', () => {
     const inst = new Instances();
     expect(inst.getId('string')).toBeUndefined();

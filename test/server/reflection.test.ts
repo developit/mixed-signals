@@ -148,11 +148,11 @@ describe('Reflection', () => {
       // instance registered
       expect(instances.get('42')).toBe(task);
 
-      // deduplicated for same client
+      // separate serializations are full snapshots; only a single serialization
+      // pass deduplicates repeated model references.
       const again = reflection.serialize(task, 'client-1');
       expect(again['@M']).toBe('Task#42');
-      expect(again.count).toBeUndefined();
-      expect(again.name).toBeUndefined();
+      expect(again.name).toHaveProperty('@S');
 
       // full serialization for different client
       const other = reflection.serialize(task, 'client-2');
@@ -204,15 +204,13 @@ describe('Reflection', () => {
       expect(serialized.rename).toBeUndefined();
     });
 
-    it('deduplicates models per client', () => {
+    it('deduplicates repeated model references during one serialization pass', () => {
       reflection.registerModel('Counter', Counter);
       const c = new Counter();
       instances.register('0', c);
-      const first = reflection.serialize(c, 'clientA');
-      expect(first.count).toHaveProperty('@S');
-      const second = reflection.serialize(c, 'clientA');
-      expect(second.count).toBeUndefined();
-      expect(second['@M']).toMatch(/^Counter#/);
+      const serialized = reflection.serialize({first: c, second: c}, 'clientA');
+      expect(serialized.first.count).toHaveProperty('@S');
+      expect(serialized.second).toEqual({'@M': 'Counter#0'});
     });
 
     it('different clients get full serialization independently', () => {
@@ -235,6 +233,24 @@ describe('Reflection', () => {
       const serialized = reflection.serialize(c);
       expect(serialized['@M']).toBe('Counter#auto-99');
       expect(instances.get('auto-99')).toBe(c);
+    });
+
+    it('stores serialized signals behind dereferenceable refs', () => {
+      const {counter, countId} = setupCounter(reflection, instances);
+      const cachedRef = (reflection as any).signals.get(countId);
+
+      expect(cachedRef).not.toBe(counter.count);
+      expect(cachedRef.deref()).toBe(counter.count);
+    });
+
+    it('sweeps collected signal cache entries', () => {
+      const {countId} = setupCounter(reflection, instances);
+      (reflection as any).signals.set(99, {deref: () => undefined});
+
+      reflection.sweepCollectedSignals();
+
+      expect((reflection as any).signals.has(countId)).toBe(true);
+      expect((reflection as any).signals.has(99)).toBe(false);
     });
 
     it('handles null values', () => {
@@ -476,17 +492,18 @@ describe('Reflection', () => {
       expect(relevant.length).toBe(0);
     });
 
-    it('clears sentModels so re-added client gets full data', () => {
-      reflection.registerModel('Counter', Counter);
-      const c = new Counter();
-      instances.register('0', c);
-      const first = reflection.serialize(c, 'clientA');
-      expect(first.count).toHaveProperty('@S');
-      const deduped = reflection.serialize(c, 'clientA');
-      expect(deduped.count).toBeUndefined();
-      reflection.removeClient('clientA');
-      const full = reflection.serialize(c, 'clientA');
-      expect(full.count).toHaveProperty('@S');
+    it('clears last sent values when a client unwatches a signal', () => {
+      const clientId = 'clientA';
+      const {countId} = setupCounter(reflection, instances, clientId);
+      expect(
+        (reflection as any).lastSentValues.has(`${clientId}:${countId}`),
+      ).toBe(true);
+
+      reflection.unwatch(clientId, countId);
+
+      expect(
+        (reflection as any).lastSentValues.has(`${clientId}:${countId}`),
+      ).toBe(false);
     });
   });
 });

@@ -140,7 +140,7 @@ signal while ≥1 client is watching, and pushes diffs via `N:@S:`.
 │        │  serialize()                ┌──────────────────────────────┐      │
 │        └──────────────────────────▶  │ Reflection                   │      │
 │                                      │  signalIds:  WeakMap<Sig,id> │      │
-│           assigns id=7               │  signals:    Map<id,Sig>     │      │
+│           assigns id=7               │  signals:    Map<id,WeakRef> │      │
 │           {"@S":7,"v":0}  ──────┐    │  subs:       Map<id,Set<c>>  │      │
 │                                 │    │  lastSent:   Map<"c:id",val> │      │
 │                                 │    └───────────────▲──────────────┘      │
@@ -294,6 +294,15 @@ client can deterministically send `@U` and replay subscriptions on reconnect.
 Root objects, signal values, reflected model facades held by application code,
 and Preact subscriptions remain ordinary strong references; once those are gone,
 the weak reflection entries can be collected and opportunistically swept.
+
+Server reflection caches are weak where the runtime supports `WeakRef` and
+`FinalizationRegistry`: signal id → source signal and `Instances` id → model
+instance do not by themselves keep otherwise-unheld server objects alive. Active
+subscriptions still hold source signals strongly through their unsubscribe
+callbacks until the last client unwatches or disconnects. `lastSentValues` is
+cleared for a signal when that client unwatches it, and model marker
+serialization dedupes only within a single payload instead of retaining an
+unbounded per-client "seen model" set.
 
 On reconnect, the client keeps existing roots/signals/model facades alive until
 it receives a fresh `@R` root snapshot. That snapshot refreshes signal values,

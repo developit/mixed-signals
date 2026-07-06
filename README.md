@@ -152,6 +152,10 @@ ids. If a root snapshot omits connection metadata, the client treats it as an
 unknown/new process once a root already exists, which keeps legacy servers safe
 by avoiding raw signal-id reuse. Held model facades can also recover when the new
 server process can resolve their `Type#id` markers from its instance registry.
+Server-side signal and instance identity caches use weak references when
+available, so they do not keep otherwise-unheld server objects alive after all
+clients unwatch or disconnect.
+
 For reconnectable transports (`onOpen` present), `client.ready` remains pending
 if the transport disconnects before the first root snapshot and never opens
 again. Callers that need a hard failure should wrap `ready` in their own timeout
