@@ -74,6 +74,20 @@ describe('RPCClient', () => {
       expect(client.root.peek()).toBe(42);
     });
 
+    it('does not clear existing signals when parsing marker-only @S refs', async () => {
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      transport.emit('N:@R:{"currentView":{"@S":1,"v":null}}');
+
+      const pending = client.call('navigate', ['/customers']);
+      transport.emit('N:@S:1,"loaded"');
+      transport.emit('R1:{"@S":1}');
+
+      const currentView = await pending;
+      expect(currentView).toBe(client.root.currentView);
+      expect(currentView.peek()).toBe('loaded');
+    });
+
     it('applies reviver: @M markers become model facades', () => {
       const transport = new FakeTransport();
       const ctx = createContext();
