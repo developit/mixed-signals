@@ -25,7 +25,7 @@ function setup() {
   } satisfies Partial<RPCClient> as unknown as RPCClient;
   const ctx = {rpc};
   const reflection = new ClientReflection(rpc);
-  return {reflection, notify, ctx};
+  return {reflection, notify, rpc, ctx};
 }
 
 afterEach(() => {
@@ -389,6 +389,22 @@ describe('ClientReflection', () => {
       expect((reflection as any).refreshingModelMarkers.has('Task#dead')).toBe(
         false,
       );
+    });
+
+    it('refreshes stale models for watched signals without full-cache sweeping', () => {
+      vi.useFakeTimers();
+      const {reflection, rpc} = setup();
+      reflection.registerModel('Counter', ReflectedCounter);
+      const count = reflection.getOrCreateSignal(1, 0);
+      reflection.createModelFacade({'@M': 'Counter#abc', count});
+      (reflection as any).staleModelMarkers.add('Counter#abc');
+      const sweep = vi.spyOn(reflection, 'sweepCollectedEntries');
+
+      count.subscribe(() => undefined);
+
+      expect(sweep).not.toHaveBeenCalled();
+      expect(rpc.call).toHaveBeenCalledWith('@M', ['Counter#abc']);
+      reflection.reset();
     });
   });
 
