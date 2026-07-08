@@ -74,27 +74,20 @@ describe('ClientReflection', () => {
       const sig1 = reflection.getOrCreateSignal(1, 'a');
       const sig2 = reflection.getOrCreateSignal(2, 'b');
 
-      // Subscribe to both signals
       const stop1 = sig1.subscribe(() => {});
       const stop2 = sig2.subscribe(() => {});
 
-      // Advance past the 1ms batch timer
-      vi.advanceTimersByTime(1);
+      vi.advanceTimersByTime(10);
 
-      // Should have sent a single watch notification with both IDs
       expect(notify).toHaveBeenCalledTimes(1);
       expect(notify).toHaveBeenCalledWith(WATCH_SIGNALS_METHOD, [1, 2]);
 
       notify.mockClear();
 
-      // Unsubscribe both
       stop1();
       stop2();
 
-      // Advance past the 10ms debounce timeout
       vi.advanceTimersByTime(10);
-      // Advance past the 1ms batch timer
-      vi.advanceTimersByTime(1);
 
       expect(notify).toHaveBeenCalledTimes(1);
       expect(notify).toHaveBeenCalledWith(UNWATCH_SIGNALS_METHOD, [1, 2]);
@@ -106,26 +99,18 @@ describe('ClientReflection', () => {
 
       const sig = reflection.getOrCreateSignal(1, 'val');
 
-      // Subscribe (watch)
       const stop = sig.subscribe(() => {});
-      vi.advanceTimersByTime(1);
+      vi.advanceTimersByTime(10);
 
       expect(notify).toHaveBeenCalledWith(WATCH_SIGNALS_METHOD, [1]);
       notify.mockClear();
 
-      // Unsubscribe
       stop();
-
-      // Advance only 5ms (less than the 10ms debounce)
       vi.advanceTimersByTime(5);
 
-      // Re-subscribe before the unwatch debounce fires
       sig.subscribe(() => {});
-
-      // Advance well past all timers
       vi.advanceTimersByTime(20);
 
-      // The unwatch should have been cancelled — no unwatch notification sent
       expect(notify).not.toHaveBeenCalledWith(
         UNWATCH_SIGNALS_METHOD,
         expect.anything(),
@@ -139,7 +124,7 @@ describe('ClientReflection', () => {
       const sig = reflection.getOrCreateSignal(1, 'val');
       sig.subscribe(() => {});
 
-      vi.advanceTimersByTime(1);
+      vi.advanceTimersByTime(10);
 
       expect(notify).toHaveBeenCalledWith(WATCH_SIGNALS_METHOD, [1]);
     });
@@ -156,7 +141,7 @@ describe('ClientReflection', () => {
       sig2.subscribe(() => {});
       sig3.subscribe(() => {});
 
-      vi.advanceTimersByTime(1);
+      vi.advanceTimersByTime(10);
 
       expect(notify).toHaveBeenCalledTimes(1);
       expect(notify).toHaveBeenCalledWith(WATCH_SIGNALS_METHOD, [1, 2, 3]);
@@ -169,20 +154,92 @@ describe('ClientReflection', () => {
       const sig = reflection.getOrCreateSignal(1, 'val');
       const stop = sig.subscribe(() => {});
 
-      // Flush the watch batch
-      vi.advanceTimersByTime(1);
+      vi.advanceTimersByTime(10);
       expect(notify).toHaveBeenCalledWith(WATCH_SIGNALS_METHOD, [1]);
       notify.mockClear();
 
-      // Unsubscribe
       stop();
-
-      // Advance past the 10ms debounce
       vi.advanceTimersByTime(10);
-      // Advance past the 1ms batch flush
-      vi.advanceTimersByTime(1);
 
       expect(notify).toHaveBeenCalledWith(UNWATCH_SIGNALS_METHOD, [1]);
+    });
+
+    it('cancels a pending watch when a signal unmounts before the flush', () => {
+      vi.useFakeTimers();
+      const {reflection, notify} = setup();
+
+      const sig = reflection.getOrCreateSignal(1, 'val');
+      const stop = sig.subscribe(() => {});
+      stop();
+
+      vi.advanceTimersByTime(10);
+
+      expect(notify).not.toHaveBeenCalled();
+    });
+
+    it('keeps watch and unwatch batches mutually exclusive', () => {
+      vi.useFakeTimers();
+      const {reflection, notify} = setup();
+
+      const sig = reflection.getOrCreateSignal(1, 'val');
+      const stop = sig.subscribe(() => {});
+      vi.advanceTimersByTime(10);
+      expect(notify).toHaveBeenCalledWith(WATCH_SIGNALS_METHOD, [1]);
+      notify.mockClear();
+
+      stop();
+      sig.subscribe(() => {});
+
+      vi.advanceTimersByTime(10);
+
+      expect(notify).not.toHaveBeenCalled();
+    });
+
+    it('flushes later transitions in the active global window', () => {
+      vi.useFakeTimers();
+      const {reflection, notify} = setup();
+
+      const canceled = reflection.getOrCreateSignal(1, 'a');
+      const stop = canceled.subscribe(() => {});
+      stop();
+
+      vi.advanceTimersByTime(9);
+
+      const watched = reflection.getOrCreateSignal(2, 'b');
+      watched.subscribe(() => {});
+
+      expect(vi.getTimerCount()).toBe(1);
+
+      vi.advanceTimersByTime(1);
+
+      expect(notify).toHaveBeenCalledWith(WATCH_SIGNALS_METHOD, [2]);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('uses one global watch timer for many signal transitions', () => {
+      vi.useFakeTimers();
+      const first = setup();
+      const second = setup();
+
+      const sig1 = first.reflection.getOrCreateSignal(1, 'a');
+      const sig2 = first.reflection.getOrCreateSignal(2, 'b');
+      const sig3 = second.reflection.getOrCreateSignal(3, 'c');
+
+      const stop1 = sig1.subscribe(() => {});
+      const stop2 = sig2.subscribe(() => {});
+      const stop3 = sig3.subscribe(() => {});
+
+      expect(vi.getTimerCount()).toBe(1);
+
+      vi.advanceTimersByTime(10);
+      stop1();
+      stop2();
+      stop3();
+
+      expect(vi.getTimerCount()).toBe(1);
+
+      vi.advanceTimersByTime(10);
+      expect(vi.getTimerCount()).toBe(0);
     });
   });
 
