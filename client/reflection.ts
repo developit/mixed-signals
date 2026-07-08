@@ -5,21 +5,28 @@ import {
 } from '../shared/protocol.ts';
 import type {RPCClient} from './rpc.ts';
 
+type SignalId = number | string;
+
+const WATCH_FLUSH_DELAY = 10;
+
 /** @internal */
 export interface WireContext {
   rpc: RPCClient;
 }
 
 export class ClientReflection {
-  private signals = new Map<number | string, Signal<any>>();
+  private signals = new Map<SignalId, Signal<any>>();
   private models = new Map<string, any>();
   private modelRegistry = new Map<string, any>();
   private rpc: RPCClient;
   private ctx: WireContext;
-  private watchBatch = new Set<number | string>();
-  private unwatchBatch = new Set<number | string>();
-  private watchFlushTimer: ReturnType<typeof setTimeout> | null = null;
-  private unwatchFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private static queuedWatchFlushes = new Set<ClientReflection>();
+  private static watchFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private static flushingWatches = false;
+
+  private watchedSignals = new Set<SignalId>();
+  private watchBatch = new Map<SignalId, number>();
+  private unwatchBatch = new Map<SignalId, number>();
 
   constructor(rpc: RPCClient, ctx?: any) {
     this.rpc = rpc;
@@ -30,15 +37,16 @@ export class ClientReflection {
   reset() {
     this.signals.clear();
     this.models.clear();
+    this.watchedSignals.clear();
     this.watchBatch.clear();
     this.unwatchBatch.clear();
-    if (this.watchFlushTimer) {
-      clearTimeout(this.watchFlushTimer);
-      this.watchFlushTimer = null;
-    }
-    if (this.unwatchFlushTimer) {
-      clearTimeout(this.unwatchFlushTimer);
-      this.unwatchFlushTimer = null;
+    ClientReflection.queuedWatchFlushes.delete(this);
+    if (
+      ClientReflection.queuedWatchFlushes.size === 0 &&
+      ClientReflection.watchFlushTimer
+    ) {
+      clearTimeout(ClientReflection.watchFlushTimer);
+      ClientReflection.watchFlushTimer = null;
     }
   }
 
@@ -46,58 +54,133 @@ export class ClientReflection {
     this.modelRegistry.set(typeName, ctor);
   }
 
-  private scheduleWatch(id: number | string) {
-    // Batch watch messages so a render burst becomes one frame.
-    this.watchBatch.add(id);
-    if (!this.watchFlushTimer) {
-      this.watchFlushTimer = setTimeout(() => {
-        const ids = Array.from(this.watchBatch);
-        this.watchBatch.clear();
-        this.watchFlushTimer = null;
-        if (ids.length > 0) {
-          this.rpc.notify(WATCH_SIGNALS_METHOD, ids);
-        }
-      }, 1);
+  private static queueGlobalWatchFlush(delay = WATCH_FLUSH_DELAY) {
+    if (ClientReflection.watchFlushTimer || ClientReflection.flushingWatches) {
+      return;
+    }
+
+    ClientReflection.watchFlushTimer = setTimeout(() => {
+      ClientReflection.watchFlushTimer = null;
+      ClientReflection.flushQueuedWatches();
+    }, delay);
+  }
+
+  private static flushQueuedWatches() {
+    const now = Date.now();
+    ClientReflection.flushingWatches = true;
+
+    try {
+      for (const reflection of Array.from(
+        ClientReflection.queuedWatchFlushes,
+      )) {
+        reflection.flushWatches(now);
+      }
+    } finally {
+      ClientReflection.flushingWatches = false;
+    }
+
+    const nextFlush = ClientReflection.nextQueuedWatchFlush(now);
+    if (nextFlush !== undefined) {
+      ClientReflection.queueGlobalWatchFlush(nextFlush);
     }
   }
 
-  private scheduleUnwatch(id: number | string) {
-    // Unwatchs are batched separately so quick remounts can cancel them.
-    this.unwatchBatch.add(id);
-    if (!this.unwatchFlushTimer) {
-      this.unwatchFlushTimer = setTimeout(() => {
-        const ids = Array.from(this.unwatchBatch);
-        this.unwatchBatch.clear();
-        this.unwatchFlushTimer = null;
-        if (ids.length > 0) {
-          this.rpc.notify(UNWATCH_SIGNALS_METHOD, ids);
-        }
-      }, 1);
+  private static nextQueuedWatchFlush(now: number): number | undefined {
+    let nextFlush: number | undefined;
+
+    for (const reflection of ClientReflection.queuedWatchFlushes) {
+      const reflectionNextFlush = reflection.nextWatchFlush(now);
+
+      if (reflectionNextFlush === undefined) {
+        ClientReflection.queuedWatchFlushes.delete(reflection);
+      } else {
+        nextFlush = Math.min(
+          nextFlush ?? reflectionNextFlush,
+          reflectionNextFlush,
+        );
+      }
+    }
+
+    return nextFlush;
+  }
+
+  private queueWatchFlush() {
+    ClientReflection.queuedWatchFlushes.add(this);
+    ClientReflection.queueGlobalWatchFlush();
+  }
+
+  private scheduleWatch(id: SignalId) {
+    this.unwatchBatch.delete(id);
+
+    if (!this.watchedSignals.has(id)) {
+      this.watchBatch.set(id, Date.now() + WATCH_FLUSH_DELAY);
+      this.queueWatchFlush();
     }
   }
 
-  getOrCreateSignal(id: number | string, initialValue: any): Signal<any> {
+  private scheduleUnwatch(id: SignalId) {
+    this.watchBatch.delete(id);
+
+    if (this.watchedSignals.has(id)) {
+      this.unwatchBatch.set(id, Date.now() + WATCH_FLUSH_DELAY);
+      this.queueWatchFlush();
+    }
+  }
+
+  private flushWatches(now: number) {
+    const watchIds = this.takeDue(this.watchBatch, now);
+    const unwatchIds = this.takeDue(this.unwatchBatch, now);
+
+    if (watchIds.length > 0) {
+      for (const id of watchIds) this.watchedSignals.add(id);
+      this.rpc.notify(WATCH_SIGNALS_METHOD, watchIds);
+    }
+
+    if (unwatchIds.length > 0) {
+      for (const id of unwatchIds) this.watchedSignals.delete(id);
+      this.rpc.notify(UNWATCH_SIGNALS_METHOD, unwatchIds);
+    }
+  }
+
+  private takeDue(batch: Map<SignalId, number>, now: number): SignalId[] {
+    const ids: SignalId[] = [];
+
+    for (const [id, flushAt] of batch) {
+      if (flushAt <= now) {
+        batch.delete(id);
+        ids.push(id);
+      }
+    }
+
+    return ids;
+  }
+
+  private nextWatchFlush(now: number): number | undefined {
+    let flushAt: number | undefined;
+
+    for (const time of this.watchBatch.values()) {
+      flushAt = Math.min(flushAt ?? time, time);
+    }
+
+    for (const time of this.unwatchBatch.values()) {
+      flushAt = Math.min(flushAt ?? time, time);
+    }
+
+    return flushAt === undefined ? undefined : Math.max(0, flushAt - now);
+  }
+
+  getOrCreateSignal(id: SignalId, initialValue: any): Signal<any> {
     const existingSignal = this.signals.get(id);
     if (existingSignal) return existingSignal;
 
-    let unwatchTimeout: ReturnType<typeof setTimeout> | null = null;
-
     const createdSignal = signal(initialValue, {
       watched: () => {
-        if (unwatchTimeout) {
-          clearTimeout(unwatchTimeout);
-          unwatchTimeout = null;
-        } else {
-          // Only tell the server once the client actually observes this signal.
-          this.scheduleWatch(id);
-        }
+        // Only tell the server once the client actually observes this signal.
+        this.scheduleWatch(id);
       },
       unwatched: () => {
         // Debounce unwatch so transient unmount/remount cycles stay subscribed.
-        unwatchTimeout = setTimeout(() => {
-          this.scheduleUnwatch(id);
-          unwatchTimeout = null;
-        }, 10);
+        this.scheduleUnwatch(id);
       },
     });
 
@@ -131,7 +214,7 @@ export class ClientReflection {
     return model;
   }
 
-  handleUpdate(id: number | string, value: any, mode?: string) {
+  handleUpdate(id: SignalId, value: any, mode?: string) {
     const sig = this.signals.get(id);
     if (!sig) return;
 
