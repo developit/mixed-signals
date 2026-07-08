@@ -156,8 +156,8 @@ signal while ≥1 client is watching, and pushes diffs via `N:@S:`.
 │                                 ┌──────────────────────────────┐            │
 │   JSON.parse(reviver) ────────▶ │ ClientReflection             │            │
 │    sees "@S" → calls            │  signals: Map<id,WeakRef>    │            │
-│    getOrCreateSignal(7,0)       │  watchBatch / unwatchBatch   │ ── 1ms ──▶ │
-│                                 └────────────┬─────────────────┘    flush   │
+│    getOrCreateSignal(7,0)       │  watchBatch / unwatchBatch   │ ── 10ms ─▶ │
+│                                 └────────────┬─────────────────┘ global flush│
 │                                              │                              │
 │           ┌──────────────────────────────────┘                              │
 │           ▼                                                                 │
@@ -266,16 +266,15 @@ The client also handles `splice` mode; the server doesn't currently emit it.
  component mounts
    effect reads s.value
      └─▶ watched()
-           watchBatch.add(7)  ─── 1ms ──▶  N:@W:7,8,12  ─▶  subs.get(7).add(client)
-                                                            if first watcher:
-                                                              sig.subscribe(notify)
+           watchBatch.add(7)  ─── 10ms global flush ──▶  N:@W:7,8,12  ─▶  subs.get(7).add(client)
+                                                                  if first watcher:
+                                                                    sig.subscribe(notify)
  component unmounts
    effect disposed
      └─▶ unwatched()
-           setTimeout(10ms)                             ← debounce: if a remount
-             └─▶ unwatchBatch.add(7) ─ 1ms ─▶ N:@U:7      happens inside 10ms the
-                                                          unwatch is cancelled and
-                                                          no traffic is sent.
+           unwatchBatch.add(7) ── 10ms global flush ─▶  N:@U:7
+             ▲                                             ▲
+             └─ a remount before the flush cancels it ─────┘
  client disconnects
    cleanup()  ───────────────────────────────────────▶  clients.delete(id)
                                                         reflection.removeClient(id)

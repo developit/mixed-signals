@@ -168,7 +168,7 @@ describe('ClientReflection', () => {
       expect(notify).toHaveBeenCalledWith(WATCH_SIGNALS_METHOD, [1, 2, 3]);
     });
 
-    it('schedules @U after unwatch debounce timeout', () => {
+    it('schedules @U after the global watch flush delay', () => {
       vi.useFakeTimers();
       const {reflection, notify} = setup();
 
@@ -443,7 +443,7 @@ describe('ClientReflection', () => {
 
       const sig = reflection.getOrCreateSignal(1, 'val');
       sig.subscribe(() => {});
-      // Watch is pending (1ms timer not yet fired)
+      // Watch is pending (10ms timer not yet fired)
 
       reflection.reset();
 
