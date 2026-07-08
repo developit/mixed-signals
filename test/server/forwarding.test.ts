@@ -349,7 +349,7 @@ describe('protocol-level forwarding', () => {
 
     // Subscribe to signals
     const stopName = browser.root.project.name.subscribe(() => {});
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     // --- Signal update flows through ---
@@ -371,6 +371,8 @@ describe('protocol-level forwarding', () => {
     expect(browser.root.project.name.value).toBe('Renamed');
 
     stopName();
+    vi.advanceTimersByTime(10);
+    await flush();
   });
 
   it('fans out upstream signal updates until each downstream client unwatches', async () => {
@@ -578,7 +580,7 @@ describe('protocol-level forwarding', () => {
 
     // Subscribe to sessions list
     const stopSessions = browser.root.sessions.sessions.subscribe(() => {});
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     // --- Create a session (method returns a new model) ---
@@ -592,7 +594,7 @@ describe('protocol-level forwarding', () => {
     // Subscribe to the new session's messages and status
     const stopMessages = created.messages.subscribe(() => {});
     const stopStatus = created.status.subscribe(() => {});
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     // --- Submit a message ---
@@ -610,6 +612,8 @@ describe('protocol-level forwarding', () => {
     stopSessions();
     stopMessages();
     stopStatus();
+    vi.advanceTimersByTime(10);
+    await flush();
   });
 
   it('forwards held model refresh requests to upstream', async () => {
@@ -722,7 +726,7 @@ describe('protocol-level forwarding', () => {
 
     // Subscribe to content
     const stopContent = browser.root.stream.content.subscribe(() => {});
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     // Stream text in chunks
@@ -739,6 +743,8 @@ describe('protocol-level forwarding', () => {
     expect(browser.root.stream.content.value).toBe('Hello world!');
 
     stopContent();
+    vi.advanceTimersByTime(10);
+    await flush();
   });
 
   it('mixes local and forwarded models', async () => {
@@ -801,7 +807,7 @@ describe('protocol-level forwarding', () => {
     // Subscribe to both
     const stopLocal = browser.root.local.value.subscribe(() => {});
     const stopRemote = browser.root.remote.value.subscribe(() => {});
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     // Update local model
@@ -816,6 +822,8 @@ describe('protocol-level forwarding', () => {
 
     stopLocal();
     stopRemote();
+    vi.advanceTimersByTime(10);
+    await flush();
   });
 
   it('forwards signal updates when addUpstream() is called after addClient()', async () => {
@@ -864,7 +872,7 @@ describe('protocol-level forwarding', () => {
 
     // Subscribe to signals
     const stopName = browser.root.project.name.subscribe(() => {});
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     // Signal update should be forwarded even though upstream was added after client
@@ -874,5 +882,7 @@ describe('protocol-level forwarding', () => {
     expect(browser.root.project.name.value).toBe('Updated');
 
     stopName();
+    vi.advanceTimersByTime(10);
+    await flush();
   });
 });

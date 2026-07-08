@@ -616,7 +616,7 @@ describe('RPCClient', () => {
 
       const count = client.root.count;
       count.subscribe(() => undefined);
-      vi.advanceTimersByTime(1);
+      vi.advanceTimersByTime(10);
       expect(transport1.sent).toContain('N:@W:1');
 
       const transport2 = new FakeTransport();
@@ -765,7 +765,7 @@ describe('RPCClient', () => {
       });
       const heldCount = held.count;
       heldCount.subscribe(() => undefined);
-      vi.advanceTimersByTime(1);
+      vi.advanceTimersByTime(10);
       expect(transport1.sent).toContain('N:@W:1');
 
       const transport2 = new FakeTransport();
@@ -784,7 +784,7 @@ describe('RPCClient', () => {
       );
       await Promise.resolve();
       await Promise.resolve();
-      vi.advanceTimersByTime(1);
+      vi.advanceTimersByTime(10);
 
       expect(heldCount.peek()).toBe(5);
       expect(transport2.sent).toContain('N:@W:2');
@@ -811,7 +811,7 @@ describe('RPCClient', () => {
       const heldCount = held.count;
       shared.subscribe(() => undefined);
       heldCount.subscribe(() => undefined);
-      vi.advanceTimersByTime(1);
+      vi.advanceTimersByTime(10);
 
       const transport2 = new FakeTransport();
       client.reconnect(transport2);
@@ -853,7 +853,7 @@ describe('RPCClient', () => {
       });
       const heldCount = held.count;
       heldCount.subscribe(() => undefined);
-      vi.advanceTimersByTime(1);
+      vi.advanceTimersByTime(10);
       expect(transport1.sent).toContain('N:@W:1');
 
       const transport2 = new FakeTransport();
@@ -896,7 +896,7 @@ describe('RPCClient', () => {
 
       const count = client.root.count;
       count.subscribe(() => undefined);
-      vi.advanceTimersByTime(1);
+      vi.advanceTimersByTime(10);
 
       const transport2 = new FakeTransport();
       client.reconnect(transport2);
@@ -968,7 +968,7 @@ describe('RPCClient', () => {
 
       count.subscribe(() => undefined);
       expect(transport2.sent[0]).toBe('M1:@M:"Counter#held"');
-      vi.advanceTimersByTime(1);
+      vi.advanceTimersByTime(10);
       expect(transport2.sent).not.toContain('N:@W:1');
 
       transport2.emit(
@@ -1009,7 +1009,7 @@ describe('RPCClient', () => {
 
       held.count.subscribe(() => undefined);
       held.name.subscribe(() => undefined);
-      vi.advanceTimersByTime(1);
+      vi.advanceTimersByTime(10);
 
       expect(transport2.sent.filter((msg) => msg.includes(':@M:'))).toEqual([
         'M1:@M:"Counter#held"',
@@ -1041,7 +1041,7 @@ describe('RPCClient', () => {
       });
       const count = held.count;
       count.subscribe(() => undefined);
-      vi.advanceTimersByTime(1);
+      vi.advanceTimersByTime(10);
       expect(transport1.sent).toContain('N:@W:1');
 
       const transport2 = new FakeTransport();
@@ -1055,7 +1055,7 @@ describe('RPCClient', () => {
       );
       await Promise.resolve();
       await Promise.resolve();
-      vi.advanceTimersByTime(1);
+      vi.advanceTimersByTime(10);
 
       expect(held.count).toBe(count);
       expect(count.peek()).toBe(5);
@@ -1077,7 +1077,7 @@ describe('RPCClient', () => {
 
       const count = client.root.count;
       count.subscribe(() => undefined);
-      vi.advanceTimersByTime(1);
+      vi.advanceTimersByTime(10);
       expect(transport1.sent).toContain('N:@W:1');
 
       const transport2 = new FakeTransport();
@@ -1087,7 +1087,7 @@ describe('RPCClient', () => {
       );
       await client.ready;
       expect(transport2.sent).not.toContain('M1:@M:"Counter#1"');
-      vi.advanceTimersByTime(1);
+      vi.advanceTimersByTime(10);
 
       expect(count.peek()).toBe(5);
       expect(transport2.sent).toContain('N:@W:10');
