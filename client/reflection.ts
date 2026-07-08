@@ -5,8 +5,10 @@ import {
   WATCH_SIGNALS_METHOD,
 } from '../shared/protocol.ts';
 import {
+  createReflectedModelFacade,
   GET_REFLECTED_MODEL_SIGNALS,
   REFRESH_REFLECTED_MODEL,
+  type ReflectedModelConstructor,
   type RefreshableReflectedModel,
 } from './model.ts';
 import type {RPCClient} from './rpc.ts';
@@ -65,7 +67,7 @@ export class ClientReflection {
   private refreshingModelMarkers = new Set<string>();
   private modelRefreshGeneration = 0;
   private collectingRootModels = false;
-  private modelRegistry = new Map<string, any>();
+  private modelRegistry = new Map<string, ReflectedModelConstructor>();
   private rpc: RPCClient;
   private ctx: WireContext;
   private static queuedWatchFlushes = new Set<ClientReflection>();
@@ -153,8 +155,8 @@ export class ClientReflection {
     return ids;
   }
 
-  registerModel(typeName: string, ctor: any) {
-    this.modelRegistry.set(typeName, ctor);
+  registerModel(typeName: string, ctor?: ReflectedModelConstructor) {
+    if (ctor) this.modelRegistry.set(typeName, ctor);
   }
 
   /** @internal */
@@ -632,11 +634,9 @@ export class ClientReflection {
     }
 
     const ModelCtor = this.modelRegistry.get(typeName);
-    if (!ModelCtor) {
-      throw new Error(`Unknown model type: ${typeName}`);
-    }
-
-    const model = new ModelCtor(this.ctx, data);
+    const model = ModelCtor
+      ? new ModelCtor(this.ctx, data)
+      : createReflectedModelFacade(this.ctx, data, {typeName});
     this.rememberModel(raw, model);
     this.rememberModelSignals(raw, model, data, hasModelData);
     if (hasModelData) this.markModelFresh(raw);

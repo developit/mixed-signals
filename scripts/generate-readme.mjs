@@ -51,6 +51,8 @@ function typeToString(t) {
   }
   if (t.type === 'intrinsic') return t.name;
   if (t.type === 'array') return `${typeToString(t.elementType)}[]`;
+  if (t.type === 'typeOperator')
+    return `${t.operator} ${typeToString(t.target)}`;
   if (t.type === 'union') return t.types.map(typeToString).join(' | ');
   if (t.type === 'intersection') return t.types.map(typeToString).join(' & ');
   if (t.type === 'literal') return JSON.stringify(t.value);

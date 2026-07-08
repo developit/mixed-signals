@@ -18,7 +18,7 @@ No manual subscriptions, no event emitters — just signals.
 | **Instances**            | Registry that maps numeric IDs to server-side model instances, enabling instance-method routing.                        |
 | **RPCClient**            | Client-side hub. Sends method calls, awaits responses, and dispatches incoming notifications.                           |
 | **ClientReflection**     | Client-side signal manager. Creates/updates `Signal` objects from server data, batches `@W`/`@U` subscription messages. |
-| **createReflectedModel** | Factory that produces a Preact Model constructor whose signal props and methods mirror a server model.                   |
+| **Proxy facade**         | Client-side reflected model object built from `@M` data. Serialized signal props become computed signals; unknown string props become lazy RPC methods. |
 
 ## Overview
 
@@ -46,8 +46,8 @@ No manual subscriptions, no event emitters — just signals.
 │   │           client Signal objects,                             │
 │   │           batched watch/unwatch                              │
 │   │                                                              │
-│  createReflectedModel → Preact Model constructors                │
-│    signals as computed props, methods as RPC proxies             │
+│  @M reviver → Proxy facades                                      │
+│    discovered signals as computed props, methods as lazy RPC     │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -76,7 +76,7 @@ All messages are compact, newline-free text strings.
 
 - **Direct RPC calls** — `path.method` (e.g. `sessions.createSession`) for methods on the root object
 - **Reflected model methods** — `{wireId}#method` (e.g. `42#delete`) for methods on model instances
-- The server assigns `wireId`s when it serializes models with `@M`, and `createReflectedModel()` uses that identity for later calls.
+- The server assigns `wireId`s when it serializes models with `@M`, and the client proxy uses that identity for later calls.
 
 #### Serialization Markers
 
@@ -85,7 +85,7 @@ During serialization, special objects are embedded in JSON:
 | Marker | Shape                                 | Meaning                                                                                                                                   |
 | ------ | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `@S`   | `{"@S": id, "v": value}`              | A server-side `Signal`. The client creates or reuses a `Signal` with the given ID and initial value.                                      |
-| `@M`   | `{"@M": "TypeName#wireId", ...props}` | A server-side model instance. The client instantiates the registered model constructor for `TypeName` and uses `wireId` for method calls. |
+| `@M`   | `{"@M": "TypeName#wireId", ...props}` | A server-side model instance. The client reuses a cached facade or creates a proxy facade directly from the serialized props. Custom registered constructors are still supported. |
 
 Properties beginning with `_` and all functions are stripped from serialized objects.
 
@@ -113,7 +113,7 @@ mixed-signals/
 └── client/
     ├── rpc.ts          RPC client, request correlation
     ├── reflection.ts   wire → Signal, batched watch/unwatch
-    └── model.ts        Preact-model factory for remote facades
+    └── model.ts        Proxy facade factory and legacy reflected-model constructor
 ```
 
 Two bundles (`./server`, `./client`) with a single peer dep:
@@ -328,36 +328,42 @@ that need a hard failure should wrap it in their own timeout or abort signal.
 
 ---
 
-## `createReflectedModel`
+## Proxy facades
 
-Generates a Preact `createModel` constructor that mirrors a server model.
-
-```
-                      signalProps      methods
-                      ───────────      ───────
-                      ['id','title']   ['rename']
-```
+The client no longer needs a per-type constructor to reflect a model. `@M`
+serialization already carries the server type, wire id, and the complete set of
+serialized signal properties for that instance. `ClientReflection` uses that
+information to build a stable cached Proxy facade.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  createReflectedModel(signalProps, methods)                                 │
+│  createReflectedModelFacade(ctx, data)                                      │
 │                                                                             │
-│  ┌──────────────── per signalProp ─────────────────┐                        │
-│  │                                                 │   The @M reviver       │
-│  │  data[p] is Signal?                             │   already created the  │
-│  │  ── yes ─▶  computed(() => data[p].value)       │   inner signals.       │
-│  └─────────────────────────────────────────────────┘                        │
+│  ┌──────────────── discovered signal props ─────────┐                       │
+│  │                                                  │  The @M reviver       │
+│  │  data[p] is Signal?                              │  already created the │
+│  │  ── yes ─▶ computed(() => data[p].value)         │  inner signals.      │
+│  └──────────────────────────────────────────────────┘                       │
 │                                                                             │
-│  ┌──────────────── per method ─────────────────────┐                        │
-│  │                                                 │                        │
-│  │  ctx.rpc.call(`${wireId}#${m}`, args)            │   instance route       │
-│  └─────────────────────────────────────────────────┘                        │
+│  ┌──────────────── unknown string property ─────────┐                       │
+│  │                                                  │                       │
+│  │  model.rename → cached function                  │                       │
+│  │  function(...args) → rpc.call(`${wireId}#rename`)│  instance route       │
+│  └──────────────────────────────────────────────────┘                       │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-UI binds to `model.title.value`, which tracks the computed wrapping the
-remote signal. Swapping the underlying facade (e.g. after a refetch)
-propagates without the UI knowing.
+UI binds to `model.title.value`, which tracks the computed wrapping the remote
+signal. Method properties are created lazily and cached for stable identity. The
+Proxy deliberately does not synthesize `then`, `catch`, numeric indexes, or
+symbol properties, so facades are not accidentally treated as promises or array-
+like objects.
+
+`createReflectedModel(signalProps, methods)` remains as a compatibility wrapper
+for older clients or custom facades. Its explicit lists are now hints, not a
+requirement: all serialized signals are discovered anyway, and methods not in
+the legacy list still work through the Proxy. If the server does not actually
+have the method, the RPC response rejects with `Method not found: <name>`.
 
 ---
 
