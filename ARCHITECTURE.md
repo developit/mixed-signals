@@ -156,7 +156,7 @@ signal while ≥1 client is watching, and pushes diffs via `N:@S:`.
 │                                 ┌──────────────────────────────┐            │
 │   JSON.parse(reviver) ────────▶ │ ClientReflection             │            │
 │    sees "@S" → calls            │  signals: Map<id,Signal>     │            │
-│    getOrCreateSignal(7,0)       │  watchBatch / unwatchBatch   │ ── 1ms ──▶ │
+│    getOrCreateSignal(7,0)       │  watchBatch / unwatchBatch   │ ── 10ms ─▶ │
 │                                 └────────────┬─────────────────┘    flush   │
 │                                              │                              │
 │           ┌──────────────────────────────────┘                              │
@@ -265,16 +265,19 @@ The client also handles `splice` mode; the server doesn't currently emit it.
  component mounts
    effect reads s.value
      └─▶ watched()
-           watchBatch.add(7)  ─── 1ms ──▶  N:@W:7,8,12  ─▶  subs.get(7).add(client)
+           unwatchBatch.delete(7)
+           watchBatch.add(7) ─── 10ms ──▶  N:@W:7,8,12  ─▶  subs.get(7).add(client)
                                                             if first watcher:
                                                               sig.subscribe(notify)
  component unmounts
    effect disposed
      └─▶ unwatched()
-           setTimeout(10ms)                             ← debounce: if a remount
-             └─▶ unwatchBatch.add(7) ─ 1ms ─▶ N:@U:7      happens inside 10ms the
-                                                          unwatch is cancelled and
-                                                          no traffic is sent.
+           watchBatch.delete(7)
+           unwatchBatch.add(7) ─ 10ms ─▶  N:@U:7          ← if a remount happens
+                                                          inside the 10ms window,
+                                                          watched() above deletes 7
+                                                          from unwatchBatch and no
+                                                          @U is ever sent.
  client disconnects
    cleanup()  ───────────────────────────────────────▶  clients.delete(id)
                                                         reflection.removeClient(id)
@@ -282,8 +285,11 @@ The client also handles `splice` mode; the server doesn't currently emit it.
                                                           - purge lastSentValues
 ```
 
-Batching coalesces the "20 signals arrive in one response, 20 effects
-subscribe on the same tick" case into one `@W` frame.
+A single global 10ms timer does double duty: it coalesces "20 signals
+arrive in one response, 20 effects subscribe on the same tick" into one `@W`
+frame, and it debounces rapid unmount/remount cycles since `scheduleWatch`
+and `scheduleUnwatch` remove the id from the opposite batch before it can be
+flushed. There's no per-signal timer — one shared timer total.
 
 ---
 
