@@ -22,11 +22,10 @@ export class ClientReflection {
   private ctx: WireContext;
   private static queuedWatchFlushes = new Set<ClientReflection>();
   private static watchFlushTimer: ReturnType<typeof setTimeout> | null = null;
-  private static flushingWatches = false;
 
   private watchedSignals = new Set<SignalId>();
-  private watchBatch = new Map<SignalId, number>();
-  private unwatchBatch = new Map<SignalId, number>();
+  private watchBatch = new Set<SignalId>();
+  private unwatchBatch = new Set<SignalId>();
 
   constructor(rpc: RPCClient, ctx?: any) {
     this.rpc = rpc;
@@ -54,54 +53,22 @@ export class ClientReflection {
     this.modelRegistry.set(typeName, ctor);
   }
 
-  private static queueGlobalWatchFlush(delay = WATCH_FLUSH_DELAY) {
-    if (ClientReflection.watchFlushTimer || ClientReflection.flushingWatches) {
-      return;
-    }
+  private static queueGlobalWatchFlush() {
+    if (ClientReflection.watchFlushTimer) return;
 
     ClientReflection.watchFlushTimer = setTimeout(() => {
       ClientReflection.watchFlushTimer = null;
       ClientReflection.flushQueuedWatches();
-    }, delay);
+    }, WATCH_FLUSH_DELAY);
   }
 
   private static flushQueuedWatches() {
-    const now = Date.now();
-    ClientReflection.flushingWatches = true;
+    const reflections = Array.from(ClientReflection.queuedWatchFlushes);
+    ClientReflection.queuedWatchFlushes.clear();
 
-    try {
-      for (const reflection of Array.from(
-        ClientReflection.queuedWatchFlushes,
-      )) {
-        reflection.flushWatches(now);
-      }
-    } finally {
-      ClientReflection.flushingWatches = false;
+    for (const reflection of reflections) {
+      reflection.flushWatches();
     }
-
-    const nextFlush = ClientReflection.nextQueuedWatchFlush(now);
-    if (nextFlush !== undefined) {
-      ClientReflection.queueGlobalWatchFlush(nextFlush);
-    }
-  }
-
-  private static nextQueuedWatchFlush(now: number): number | undefined {
-    let nextFlush: number | undefined;
-
-    for (const reflection of ClientReflection.queuedWatchFlushes) {
-      const reflectionNextFlush = reflection.nextWatchFlush(now);
-
-      if (reflectionNextFlush === undefined) {
-        ClientReflection.queuedWatchFlushes.delete(reflection);
-      } else {
-        nextFlush = Math.min(
-          nextFlush ?? reflectionNextFlush,
-          reflectionNextFlush,
-        );
-      }
-    }
-
-    return nextFlush;
   }
 
   private queueWatchFlush() {
@@ -113,7 +80,7 @@ export class ClientReflection {
     this.unwatchBatch.delete(id);
 
     if (!this.watchedSignals.has(id)) {
-      this.watchBatch.set(id, Date.now() + WATCH_FLUSH_DELAY);
+      this.watchBatch.add(id);
       this.queueWatchFlush();
     }
   }
@@ -122,14 +89,16 @@ export class ClientReflection {
     this.watchBatch.delete(id);
 
     if (this.watchedSignals.has(id)) {
-      this.unwatchBatch.set(id, Date.now() + WATCH_FLUSH_DELAY);
+      this.unwatchBatch.add(id);
       this.queueWatchFlush();
     }
   }
 
-  private flushWatches(now: number) {
-    const watchIds = this.takeDue(this.watchBatch, now);
-    const unwatchIds = this.takeDue(this.unwatchBatch, now);
+  private flushWatches() {
+    const watchIds = Array.from(this.watchBatch);
+    const unwatchIds = Array.from(this.unwatchBatch);
+    this.watchBatch.clear();
+    this.unwatchBatch.clear();
 
     if (watchIds.length > 0) {
       for (const id of watchIds) this.watchedSignals.add(id);
@@ -140,33 +109,6 @@ export class ClientReflection {
       for (const id of unwatchIds) this.watchedSignals.delete(id);
       this.rpc.notify(UNWATCH_SIGNALS_METHOD, unwatchIds);
     }
-  }
-
-  private takeDue(batch: Map<SignalId, number>, now: number): SignalId[] {
-    const ids: SignalId[] = [];
-
-    for (const [id, flushAt] of batch) {
-      if (flushAt <= now) {
-        batch.delete(id);
-        ids.push(id);
-      }
-    }
-
-    return ids;
-  }
-
-  private nextWatchFlush(now: number): number | undefined {
-    let flushAt: number | undefined;
-
-    for (const time of this.watchBatch.values()) {
-      flushAt = Math.min(flushAt ?? time, time);
-    }
-
-    for (const time of this.unwatchBatch.values()) {
-      flushAt = Math.min(flushAt ?? time, time);
-    }
-
-    return flushAt === undefined ? undefined : Math.max(0, flushAt - now);
   }
 
   getOrCreateSignal(id: SignalId, initialValue: any): Signal<any> {

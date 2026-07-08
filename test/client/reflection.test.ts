@@ -195,7 +195,7 @@ describe('ClientReflection', () => {
       expect(notify).not.toHaveBeenCalled();
     });
 
-    it('does not flush a later watch early through a stale timer', () => {
+    it('flushes later transitions in the active global window', () => {
       vi.useFakeTimers();
       const {reflection, notify} = setup();
 
@@ -208,11 +208,12 @@ describe('ClientReflection', () => {
       const watched = reflection.getOrCreateSignal(2, 'b');
       watched.subscribe(() => {});
 
-      vi.advanceTimersByTime(1);
-      expect(notify).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(1);
 
-      vi.advanceTimersByTime(9);
+      vi.advanceTimersByTime(1);
+
       expect(notify).toHaveBeenCalledWith(WATCH_SIGNALS_METHOD, [2]);
+      expect(vi.getTimerCount()).toBe(0);
     });
 
     it('uses one global watch timer for many signal transitions', () => {
