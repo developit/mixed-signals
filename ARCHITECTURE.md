@@ -355,9 +355,10 @@ information to build a stable cached Proxy facade.
 
 UI binds to `model.title.value`, which tracks the computed wrapping the remote
 signal. Method properties are created lazily and cached for stable identity. The
-Proxy deliberately does not synthesize `then`, `catch`, numeric indexes, or
-symbol properties, so facades are not accidentally treated as promises or array-
-like objects.
+Proxy deliberately does not synthesize promise-like properties such as `then`
+or `catch`, and symbol properties pass through normally. String keys, including
+odd method names like `"0"`, are valid method candidates because reflected
+models are plain objects rather than arrays.
 
 `createReflectedModel(signalProps, methods)` remains as a compatibility wrapper
 for older clients or custom facades. Its explicit lists are now hints, not a
