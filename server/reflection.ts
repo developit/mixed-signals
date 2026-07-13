@@ -87,9 +87,9 @@ export class Reflection {
     if (!id) {
       id = this.nextSignalId++;
       this.signalIds.set(sig, id);
+      this.rememberSignal(id, sig);
     }
 
-    this.rememberSignal(id, sig);
     return id;
   }
 
@@ -126,11 +126,6 @@ export class Reflection {
     if (value instanceof Signal) {
       const id = this.getSignalId(value);
       const signalValue = value.peek();
-
-      if (clientId) {
-        this.lastSentValues.set(`${clientId}:${id}`, signalValue);
-        this.watch(clientId, id);
-      }
 
       return {
         '@S': id,
@@ -233,12 +228,37 @@ export class Reflection {
     subs.add(clientId);
 
     if (!this.signalUnsubscribers.has(signalId)) {
-      // The server only subscribes to source signals once a client cares.
+      // Preact subscriptions synchronously invoke their callback. Seed this
+      // client's baseline so that callback does not duplicate the explicit
+      // full catch-up value sent below.
+      this.lastSentValues.set(`${clientId}:${signalId}`, sig.peek());
       const unsubscribe = sig.subscribe(() => {
         this.notifySubscribers(signalId);
       });
       this.signalUnsubscribers.set(signalId, unsubscribe);
     }
+
+    // A signal may have changed after its snapshot was serialized but before
+    // the client started watching it. Always send the current full value. This
+    // also lets an aggregating forwarding connection catch up each downstream
+    // client when it repeats @W for an already-subscribed upstream signal.
+    this.sendCurrentValue(clientId, signalId, sig);
+  }
+
+  private sendCurrentValue(
+    clientId: ClientId,
+    signalId: SignalId,
+    sig: Signal<any>,
+  ) {
+    const currentValue = sig.peek();
+    this.rpc.send(
+      clientId,
+      formatNotificationMessage(SIGNAL_UPDATE_METHOD, [
+        signalId,
+        this.serialize(currentValue, clientId),
+      ]),
+    );
+    this.lastSentValues.set(`${clientId}:${signalId}`, currentValue);
   }
 
   unwatch(clientId: ClientId, signalId: SignalId) {
@@ -276,8 +296,10 @@ export class Reflection {
     const newValue = sig.peek();
 
     for (const clientId of clients) {
-      const lastValue = this.lastSentValues.get(`${clientId}:${signalId}`);
-      if (lastValue === newValue) continue;
+      const lastValueKey = `${clientId}:${signalId}`;
+      const hasLastValue = this.lastSentValues.has(lastValueKey);
+      const lastValue = this.lastSentValues.get(lastValueKey);
+      if (hasLastValue && lastValue === newValue) continue;
 
       const update = this.computeDelta(lastValue, newValue);
       if (!update) continue;
@@ -291,7 +313,7 @@ export class Reflection {
         clientId,
         formatNotificationMessage(SIGNAL_UPDATE_METHOD, params),
       );
-      this.lastSentValues.set(`${clientId}:${signalId}`, newValue);
+      this.lastSentValues.set(lastValueKey, newValue);
     }
   }
 

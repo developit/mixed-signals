@@ -24,6 +24,12 @@ export class Instances {
   }
 
   register(id: string, instance: any) {
+    const existing = this.get(id);
+    if (existing === instance) return;
+    if (typeof existing === 'object' && existing !== null) {
+      this.reverseRegistry.delete(existing);
+    }
+
     if (typeof instance === 'object' && instance !== null) {
       this.registry.set(id, createCacheRef(instance));
       this.reverseRegistry.set(instance, id);

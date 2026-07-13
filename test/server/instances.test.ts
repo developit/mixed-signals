@@ -1,4 +1,4 @@
-import {describe, expect, it} from 'vitest';
+import {describe, expect, it, vi} from 'vitest';
 import {Instances} from '../../server/instances.ts';
 
 describe('Instances', () => {
@@ -87,7 +87,20 @@ describe('Instances', () => {
     inst.register('x', obj1);
     inst.register('x', obj2);
     expect(inst.get('x')).toBe(obj2);
+    expect(inst.getId(obj1)).toBeUndefined();
     expect(inst.getId(obj2)).toBe('x');
+  });
+
+  it('does not register the same live instance with the finalizer twice', () => {
+    const inst = new Instances();
+    const register = vi.fn();
+    (inst as any).finalizer = {register};
+    const obj = {v: 1};
+
+    inst.register('x', obj);
+    inst.register('x', obj);
+
+    expect(register).toHaveBeenCalledTimes(1);
   });
 
   it('does not create reverse lookups for non-object values', () => {

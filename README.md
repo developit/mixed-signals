@@ -153,8 +153,12 @@ unknown/new process once a root already exists, which keeps legacy servers safe
 by avoiding raw signal-id reuse. Held model facades can also recover when the new
 server process can resolve their `Type#id` markers from its instance registry.
 Server-side signal and instance identity caches use weak references when
-available, so they do not keep otherwise-unheld server objects alive after all
-clients unwatch or disconnect.
+available. Serialization only emits snapshots: the server subscribes to a
+source signal after an explicit client `@W`, immediately sends its current value
+to close the snapshot-to-watch race, and releases the subscription and
+per-client delta baseline after `@U` or disconnect. Forwarded updates follow the
+same explicit subscription lifecycle, and closing an upstream rejects its
+pending calls and removes its reflected root.
 
 For reconnectable transports (`onOpen` present), `client.ready` remains pending
 if the transport disconnects before the first root snapshot and never opens

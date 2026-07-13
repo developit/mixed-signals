@@ -3,10 +3,15 @@ import {afterEach, describe, expect, it, vi} from 'vitest';
 import {createReflectedModel} from '../../client/model.ts';
 import type {WireContext} from '../../client/reflection.ts';
 import {RPCClient} from '../../client/rpc.ts';
-import {addPrefix, stripPrefix} from '../../server/forwarding.ts';
+import {
+  addPrefix,
+  ForwardedUpstream,
+  stripPrefix,
+} from '../../server/forwarding.ts';
 import {createModel} from '../../server/model.ts';
 import {RPC} from '../../server/rpc.ts';
 import {
+  formatErrorMessage,
   formatNotificationMessage,
   parseWireMessage,
   parseWireParams,
@@ -298,6 +303,119 @@ describe('addPrefix / stripPrefix', () => {
   });
 });
 
+describe('ForwardedUpstream lifecycle', () => {
+  it('rejects pending calls and releases state when the upstream closes', async () => {
+    let close!: (error?: unknown) => void;
+    const transport: Transport = {
+      send: vi.fn(),
+      onMessage: vi.fn(),
+      onClose(cb) {
+        close = cb;
+      },
+    };
+    const host = {
+      send: vi.fn(),
+      onUpstreamRootChanged: vi.fn(),
+      onUpstreamClosed: vi.fn(),
+    };
+    const upstream = new ForwardedUpstream('1', transport, host);
+    const pending = upstream.request('slow', []);
+
+    close(new Error('upstream lost'));
+
+    await expect(pending).rejects.toThrow('upstream lost');
+    await expect(upstream.ready).rejects.toThrow('upstream lost');
+    expect((upstream as any).pendingCalls.size).toBe(0);
+    expect((upstream as any).signalSubscriptions.size).toBe(0);
+    expect(host.onUpstreamClosed).toHaveBeenCalledWith(upstream);
+  });
+
+  it('does not retain a request when transport.send throws', async () => {
+    const transport: Transport = {
+      send() {
+        throw new Error('send failed');
+      },
+      onMessage: vi.fn(),
+    };
+    const host = {
+      send: vi.fn(),
+      onUpstreamRootChanged: vi.fn(),
+      onUpstreamClosed: vi.fn(),
+    };
+    const upstream = new ForwardedUpstream('1', transport, host);
+
+    await expect(upstream.request('slow', [])).rejects.toThrow('send failed');
+    expect((upstream as any).pendingCalls.size).toBe(0);
+    expect(host.onUpstreamClosed).toHaveBeenCalledWith(upstream);
+  });
+
+  it('rejects malformed forwarded call params without retaining the call', () => {
+    const host = {
+      send: vi.fn(),
+      onUpstreamRootChanged: vi.fn(),
+      onUpstreamClosed: vi.fn(),
+    };
+    const upstream = new ForwardedUpstream(
+      '1',
+      {send: vi.fn(), onMessage: vi.fn()},
+      host,
+    );
+
+    upstream.forwardCall('client-1', 7, '1#slow', '{');
+
+    expect(host.send).toHaveBeenCalledWith(
+      'client-1',
+      expect.stringMatching(/^E7:/),
+    );
+    expect((upstream as any).pendingCalls.size).toBe(0);
+  });
+
+  it('rejects a forwarded call made after disposal', () => {
+    const host = {
+      send: vi.fn(),
+      onUpstreamRootChanged: vi.fn(),
+      onUpstreamClosed: vi.fn(),
+    };
+    const upstream = new ForwardedUpstream(
+      '1',
+      {send: vi.fn(), onMessage: vi.fn()},
+      host,
+    );
+    upstream.dispose();
+    host.send.mockClear();
+
+    upstream.forwardCall('client-1', 7, '1#slow', '');
+
+    expect(host.send).toHaveBeenCalledWith(
+      'client-1',
+      formatErrorMessage(7, {code: -1, message: 'Upstream disposed'}),
+    );
+    expect((upstream as any).pendingCalls.size).toBe(0);
+  });
+
+  it('unwatches aggregated signals when explicitly disposed', () => {
+    const send = vi.fn();
+    const upstream = new ForwardedUpstream(
+      '1',
+      {send, onMessage: vi.fn()},
+      {
+        send: vi.fn(),
+        onUpstreamRootChanged: vi.fn(),
+        onUpstreamClosed: vi.fn(),
+      },
+    );
+    upstream.forwardWatch('client-1', [1, 2]);
+    send.mockClear();
+
+    upstream.dispose();
+
+    expect(send).toHaveBeenCalledWith(
+      formatNotificationMessage(UNWATCH_SIGNALS_METHOD, [1, 2]),
+    );
+    expect((upstream as any).signalSubscriptions.size).toBe(0);
+  });
+});
+
 describe('protocol-level forwarding', () => {
   it('forwards root, signal updates, and method calls through the server', async () => {
     vi.useFakeTimers();
@@ -420,15 +538,27 @@ describe('protocol-level forwarding', () => {
     browserTransport.send(
       formatNotificationMessage(WATCH_SIGNALS_METHOD, [signalId]),
     );
-    second.browserTransport.send(
-      formatNotificationMessage(WATCH_SIGNALS_METHOD, [signalId]),
-    );
     await flush();
 
     project.name.value = 'First update';
     await flush();
     expect(getSignalUpdateValues(firstMessages)).toContain('First update');
+    expect(getSignalUpdateValues(secondMessages)).not.toContain('First update');
+
+    // The second downstream client joins an already-aggregated upstream watch
+    // and must immediately catch up to the current value.
+    second.browserTransport.send(
+      formatNotificationMessage(WATCH_SIGNALS_METHOD, [signalId]),
+    );
+    await flush();
     expect(getSignalUpdateValues(secondMessages)).toContain('First update');
+
+    firstMessages.length = 0;
+    secondMessages.length = 0;
+    project.name.value = 'Second update';
+    await flush();
+    expect(getSignalUpdateValues(firstMessages)).toContain('Second update');
+    expect(getSignalUpdateValues(secondMessages)).toContain('Second update');
 
     firstMessages.length = 0;
     secondMessages.length = 0;
@@ -437,10 +567,10 @@ describe('protocol-level forwarding', () => {
     );
     await flush();
 
-    project.name.value = 'Second update';
+    project.name.value = 'Third update';
     await flush();
-    expect(getSignalUpdateValues(firstMessages)).not.toContain('Second update');
-    expect(getSignalUpdateValues(secondMessages)).toContain('Second update');
+    expect(getSignalUpdateValues(firstMessages)).not.toContain('Third update');
+    expect(getSignalUpdateValues(secondMessages)).toContain('Third update');
 
     firstMessages.length = 0;
     secondMessages.length = 0;
@@ -449,13 +579,15 @@ describe('protocol-level forwarding', () => {
     );
     await flush();
 
-    project.name.value = 'Third update';
+    project.name.value = 'Fourth update';
     await flush();
-    expect(getSignalUpdateValues(firstMessages)).not.toContain('Third update');
-    expect(getSignalUpdateValues(secondMessages)).not.toContain('Third update');
+    expect(getSignalUpdateValues(firstMessages)).not.toContain('Fourth update');
+    expect(getSignalUpdateValues(secondMessages)).not.toContain('Fourth update');
   });
 
   it('does not broadcast method-returned model updates to clients that never saw the model', async () => {
+    vi.useFakeTimers();
+
     const {
       brokerTransport,
       serverUpstreamTransport,
@@ -515,12 +647,20 @@ describe('protocol-level forwarding', () => {
     const secretModel = await createSecret;
     expect(secretModel.status.value).toBe('idle');
 
+    const stopStatus = secretModel.status.subscribe(() => {});
+    vi.advanceTimersByTime(10);
+    await flush();
+
     secondMessages.length = 0;
     secret.status.value = 'running';
     await flush();
 
     expect(secretModel.status.value).toBe('running');
     expect(getSignalUpdateValues(secondMessages)).not.toContain('running');
+
+    stopStatus();
+    vi.advanceTimersByTime(10);
+    await flush();
   });
 
   it('forwards method results containing new model instances', async () => {

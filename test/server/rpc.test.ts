@@ -92,6 +92,24 @@ describe('RPC', () => {
     expect(typeof cleanup).toBe('function');
   });
 
+  it('drops a closed upstream and clears its root from connected clients', async () => {
+    const rpc = new RPC();
+    const upstream = new FakeTransport();
+    const client = new FakeTransport();
+    rpc.addUpstream(upstream);
+    rpc.addClient(client, 'client-1');
+
+    expect(client.sent).toHaveLength(0);
+
+    await upstream.emit('N:@R:{"remote":true}');
+    expect(parseNotification(client.sent[0]).params[0]).toEqual({remote: true});
+
+    client.sent.length = 0;
+    upstream.close(new Error('upstream lost'));
+
+    expect(parseNotification(client.sent[0]).params[0]).toEqual({});
+  });
+
   it('cleanup stops message delivery', () => {
     const rpc = new RPC();
     rpc.registerModel('Counter', Counter);
@@ -496,6 +514,10 @@ describe('RPC', () => {
     await transport.emit(
       formatNotificationMessage(WATCH_SIGNALS_METHOD, [signalId]),
     );
+
+    // Watching immediately catches up any changes since the root snapshot.
+    expect(parseNotification(transport.sent[0]).params).toEqual([signalId, 1]);
+    transport.sent.length = 0;
 
     // Mutate the signal
     count.value = 2;

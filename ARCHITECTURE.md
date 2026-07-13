@@ -284,7 +284,10 @@ The client also handles `splice` mode; the server doesn't currently emit it.
 ```
 
 Batching coalesces the "20 signals arrive in one response, 20 effects
-subscribe on the same tick" case into one `@W` frame.
+subscribe on the same tick" case into one `@W` frame. Serialization does not
+subscribe the server or retain a per-client delta baseline. Each explicit `@W`
+immediately sends the signal's current full value before subsequent deltas, so a
+change between the serialized snapshot and the watch cannot be missed.
 
 Client reflection caches are weak where the runtime supports `WeakRef` and
 `FinalizationRegistry`: signal id → signal, model marker → facade, and model →
@@ -297,12 +300,16 @@ the weak reflection entries can be collected and opportunistically swept.
 
 Server reflection caches are weak where the runtime supports `WeakRef` and
 `FinalizationRegistry`: signal id → source signal and `Instances` id → model
-instance do not by themselves keep otherwise-unheld server objects alive. Active
-subscriptions still hold source signals strongly through their unsubscribe
-callbacks until the last client unwatches or disconnects. `lastSentValues` is
-cleared for a signal when that client unwatches it, and model marker
-serialization dedupes only within a single payload instead of retaining an
-unbounded per-client "seen model" set.
+instance do not by themselves keep otherwise-unheld server objects alive.
+Finalizers are registered once per live identity rather than once per
+serialization. Active subscriptions still hold source signals strongly through
+their unsubscribe callbacks until the last client unwatches or disconnects.
+`lastSentValues` exists only after explicit `@W` and is cleared for a signal when
+that client unwatches it. Model marker serialization dedupes only within a single
+payload instead of retaining an unbounded per-client "seen model" set. Forwarded
+signals route only to explicit downstream subscribers rather than retaining a
+second seen-signal history; an upstream close rejects pending forwarded calls,
+removes its root, and releases its subscription state.
 
 On reconnect, the client keeps existing roots/signals/model facades alive until
 it receives a fresh `@R` root snapshot. That snapshot refreshes signal values,

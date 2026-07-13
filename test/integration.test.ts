@@ -436,6 +436,8 @@ describe('Integration: Server <-> Client', () => {
     await b.flush();
 
     stopA();
+    vi.advanceTimersByTime(10);
+    await a.flush();
     a.cleanup();
 
     root.count.value = 50;
@@ -531,6 +533,8 @@ describe('Integration: Server <-> Client', () => {
     await secondPair.flush();
     expect(count.peek()).toBe(22);
     stop();
+    vi.advanceTimersByTime(10);
+    await secondPair.flush();
   });
 
   it('rpc.call from client still works with method routing', async () => {
@@ -617,6 +621,8 @@ describe('mixed-signals roundtrip', () => {
 
     stopTitle();
     stopProjectName();
+    vi.advanceTimersByTime(10);
+    await flush();
   });
 
   it('round-trips reflected models with nested signal-backed timeline items', async () => {
@@ -692,6 +698,13 @@ describe('mixed-signals roundtrip', () => {
     expect(client.root.session.items.value[1].name.value).toBe('read');
     expect(client.root.session.items.value[1].output.value).toBe('Reading...');
 
+    const stopToolOutput =
+      client.root.session.items.value[1].output.subscribe(() => undefined);
+    const stopToolStatus =
+      client.root.session.items.value[1].status.subscribe(() => undefined);
+    vi.advanceTimersByTime(10);
+    await flush();
+
     toolCall.output.value = 'file contents';
     toolCall.status.value = 'complete';
     await flush();
@@ -715,7 +728,11 @@ describe('mixed-signals roundtrip', () => {
 
     stopContent?.();
     stopMessageStatus();
+    stopToolOutput();
+    stopToolStatus();
     stopItems();
     stopStatus();
+    vi.advanceTimersByTime(10);
+    await flush();
   });
 });

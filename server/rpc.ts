@@ -73,14 +73,9 @@ export class RPC {
     const upstream = new ForwardedUpstream(prefix, transport, this);
     this.upstreams.set(prefix, upstream);
 
-    // Bind any already-connected clients to the new upstream
-    for (const clientId of this.clients.keys()) {
-      upstream.setClient(clientId);
-    }
-
     return () => {
       upstream.dispose();
-      this.upstreams.delete(prefix);
+      this.onUpstreamClosed(upstream);
     };
   }
 
@@ -103,11 +98,6 @@ export class RPC {
     });
 
     let disposed = false;
-
-    // Bind this client to any upstream connections
-    for (const upstream of this.upstreams.values()) {
-      upstream.setClient(id);
-    }
 
     transport.onMessage(async (data) => {
       // Ignore late frames from a transport that has since been replaced by a
@@ -182,6 +172,20 @@ export class RPC {
     }
   }
 
+  /** @internal */
+  onUpstreamClosed(upstream: ForwardedUpstream) {
+    if (this.upstreams.get(upstream.prefix) !== upstream) return;
+
+    this.upstreams.delete(upstream.prefix);
+    if (!this.allUpstreamsReady()) return;
+
+    // Re-broadcast without the closed upstream. If it was the only root,
+    // send an empty root so clients can release the stale reflected graph.
+    for (const clientId of this.clients.keys()) {
+      this.broadcastMergedRoot(clientId, true);
+    }
+  }
+
   private allUpstreamsReady(): boolean {
     for (const upstream of this.upstreams.values()) {
       if (upstream.root === undefined) return false;
@@ -189,18 +193,18 @@ export class RPC {
     return true;
   }
 
-  private broadcastMergedRoot(clientId: string) {
+  private broadcastMergedRoot(clientId: string, sendEmpty = false) {
     const localRoot =
       this.root !== undefined
         ? this.reflection.serialize(this.root, clientId)
         : undefined;
-    this.sendMergedRoot(clientId, localRoot);
+    this.sendMergedRoot(clientId, localRoot, sendEmpty);
   }
 
   /**
    * Merge local root with upstream roots and send to a client.
    */
-  private sendMergedRoot(clientId: string, localRoot: any) {
+  private sendMergedRoot(clientId: string, localRoot: any, sendEmpty = false) {
     let merged = localRoot;
 
     for (const upstream of this.upstreams.values()) {
@@ -212,6 +216,8 @@ export class RPC {
         }
       }
     }
+
+    if (merged === undefined && sendEmpty) merged = {};
 
     if (merged !== undefined) {
       const connectionInfo = this.connectionInfos.get(clientId);

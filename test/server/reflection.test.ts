@@ -1,5 +1,5 @@
 import {signal} from '@preact/signals-core';
-import {beforeEach, describe, expect, it} from 'vitest';
+import {beforeEach, describe, expect, it, vi} from 'vitest';
 import {Instances} from '../../server/instances.ts';
 import {Reflection} from '../../server/reflection.ts';
 import {
@@ -185,6 +185,54 @@ describe('Reflection', () => {
       expect(first.name['@S']).toBe(second.name['@S']);
     });
 
+    it('registers a live signal with the finalizer only once', () => {
+      const register = vi.fn();
+      (reflection as any).signalFinalizer = {register};
+      const value = signal('stable');
+
+      reflection.serialize({value});
+      reflection.serialize({value});
+
+      expect(register).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not subscribe or retain values until the client watches', () => {
+      const clientId = 'client-1';
+      const value = signal('initial');
+      const serialized = reflection.serialize({value}, clientId);
+      const signalId = serialized.value['@S'] as number;
+
+      value.value = 'before-watch';
+
+      expect((reflection as any).subscriptions.has(signalId)).toBe(false);
+      expect((reflection as any).signalUnsubscribers.has(signalId)).toBe(false);
+      expect(
+        (reflection as any).lastSentValues.has(`${clientId}:${signalId}`),
+      ).toBe(false);
+      expect(sender.sent).toHaveLength(0);
+
+      reflection.watch(clientId, signalId);
+
+      expect(parseUpdate(sender.sent[0].message)).toEqual([
+        signalId,
+        'before-watch',
+      ]);
+      expect((reflection as any).signalUnsubscribers.has(signalId)).toBe(true);
+    });
+
+    it('sends an initial update when a newly watched value is undefined', () => {
+      const clientId = 'client-1';
+      const value = signal<string | undefined>('initial');
+      const serialized = reflection.serialize({value}, clientId);
+      const signalId = serialized.value['@S'] as number;
+      value.value = undefined;
+
+      reflection.watch(clientId, signalId);
+
+      expect(sender.sent).toHaveLength(1);
+      expect(parseUpdate(sender.sent[0].message)).toEqual([signalId, null]);
+    });
+
     it('serializes model with @M marker and signal props', () => {
       const {serialized} = setupCounter(reflection, instances);
       expect(serialized['@M']).toMatch(/^Counter#/);
@@ -312,6 +360,20 @@ describe('Reflection', () => {
       const c2msgs = sender.sent.filter((m) => m.clientId === 'c2');
       expect(c1msgs.length).toBeGreaterThan(0);
       expect(c2msgs.length).toBeGreaterThan(0);
+    });
+
+    it('catches up a new watcher without duplicating existing watchers', () => {
+      const {counter, countId} = setupCounter(reflection, instances, 'c1');
+      reflection.serialize(counter, 'c2');
+      reflection.watch('c1', countId);
+      counter.count.value = 5;
+      sender.sent.length = 0;
+
+      reflection.watch('c2', countId);
+
+      expect(sender.sent).toHaveLength(1);
+      expect(sender.sent[0].clientId).toBe('c2');
+      expect(parseUpdate(sender.sent[0].message)).toEqual([countId, 5]);
     });
   });
 
@@ -471,6 +533,7 @@ describe('Reflection', () => {
       const serialized = reflection.serialize(wrapper, 'client-1');
       const signalId = serialized.s['@S'] as number;
       reflection.watch('client-1', signalId);
+      sender.sent.length = 0;
       reflection.removeClient('client-1');
       s.value = 99;
       expect(sender.sent.length).toBe(0);
@@ -485,6 +548,7 @@ describe('Reflection', () => {
       );
       reflection.watch(clientId, countId);
       reflection.watch(clientId, nameId);
+      sender.sent.length = 0;
       reflection.removeClient(clientId);
       counter.count.value = 99;
       counter.name.value = 'gone';
@@ -495,6 +559,11 @@ describe('Reflection', () => {
     it('clears last sent values when a client unwatches a signal', () => {
       const clientId = 'clientA';
       const {countId} = setupCounter(reflection, instances, clientId);
+      expect(
+        (reflection as any).lastSentValues.has(`${clientId}:${countId}`),
+      ).toBe(false);
+
+      reflection.watch(clientId, countId);
       expect(
         (reflection as any).lastSentValues.has(`${clientId}:${countId}`),
       ).toBe(true);

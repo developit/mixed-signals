@@ -103,34 +103,12 @@ function needsRewrite(rawPayload: string): boolean {
   return rawPayload.includes('"@S"') || rawPayload.includes('"@M"');
 }
 
-function collectSignalIds(
-  value: any,
-  ids = new Set<SignalId>(),
-): Set<SignalId> {
-  if (value === null || value === undefined || typeof value !== 'object') {
-    return ids;
-  }
-
-  if (Array.isArray(value)) {
-    for (const item of value) collectSignalIds(item, ids);
-    return ids;
-  }
-
-  const signalId = value['@S'];
-  if (typeof signalId === 'number' || typeof signalId === 'string') {
-    ids.add(signalId);
-  }
-
-  for (const nested of Object.values(value)) {
-    collectSignalIds(nested, ids);
-  }
-  return ids;
-}
-
 interface UpstreamHost {
   send(clientId: string, message: string): void;
   /** Called when the upstream root changes. Host should re-merge and broadcast. */
   onUpstreamRootChanged(): void;
+  /** Called when an upstream transport closes so the host can release it. */
+  onUpstreamClosed(upstream: ForwardedUpstream): void;
 }
 
 /**
@@ -148,6 +126,8 @@ export class ForwardedUpstream {
   /** Resolves when the upstream root has been received. */
   ready: Promise<void>;
   private _resolveReady!: () => void;
+  private _rejectReady!: (error: Error) => void;
+  private readySettled = false;
 
   /** Upstream call ID → downstream forwarding target or local request promise. */
   private pendingCalls = new Map<
@@ -161,27 +141,47 @@ export class ForwardedUpstream {
   >();
   private nextUpstreamCallId = 1;
 
-  private clients = new Set<string>();
-  private rootSignalIds = new Set<SignalId>();
   private signalSubscriptions = new Map<SignalId, Set<string>>();
-  private signalVisibility = new Map<SignalId, Set<string>>();
 
   constructor(prefix: string, transport: Transport, host: UpstreamHost) {
     this.prefix = prefix;
     this.transport = transport;
     this.host = host;
-    this.ready = new Promise((resolve) => {
+    this.ready = new Promise((resolve, reject) => {
       this._resolveReady = resolve;
+      this._rejectReady = reject;
     });
+    // The host reacts to closure through onUpstreamClosed; suppress unhandled
+    // rejections for callers that only inspect root readiness indirectly.
+    this.ready.catch(() => undefined);
 
     transport.onMessage((data) => {
       this.handleUpstreamMessage(data.toString());
     });
+    transport.onClose?.((error) => {
+      this.handleTransportFailure(
+        error instanceof Error ? error : new Error('Upstream disconnected'),
+      );
+    });
   }
 
-  setClient(clientId: string) {
-    this.clients.add(clientId);
-    this.rememberVisibleSignals(clientId, this.rootSignalIds);
+  private handleTransportFailure(error: unknown) {
+    if (this.disposed) return;
+
+    const transportError =
+      error instanceof Error ? error : new Error(String(error));
+    this.dispose(transportError, false);
+    this.host.onUpstreamClosed(this);
+  }
+
+  private sendSignalNotification(method: string, signalIds: SignalId[]) {
+    if (this.disposed || signalIds.length === 0) return;
+
+    try {
+      this.transport.send(formatNotificationMessage(method, signalIds));
+    } catch (error) {
+      this.handleTransportFailure(error);
+    }
   }
 
   private handleUpstreamMessage(msg: string) {
@@ -193,12 +193,11 @@ export class ForwardedUpstream {
     if (parsed.type === 'notification') {
       if (parsed.method === ROOT_NOTIFICATION_METHOD) {
         const [rootValue] = parseWireParams(parsed.payload);
-        this.rootSignalIds = collectSignalIds(rootValue);
-        for (const clientId of this.clients) {
-          this.rememberVisibleSignals(clientId, this.rootSignalIds);
-        }
         this.root = addPrefix(this.prefix, rootValue);
-        this._resolveReady();
+        if (!this.readySettled) {
+          this.readySettled = true;
+          this._resolveReady();
+        }
         this.host.onUpstreamRootChanged();
         return;
       }
@@ -207,10 +206,7 @@ export class ForwardedUpstream {
         // Parse params: [signalId, value, mode?]
         const params = parseWireParams(parsed.payload);
         const [signalId, value, mode] = params;
-        const subscribers = this.signalSubscriptions.get(signalId as SignalId);
-        const visibleClients = this.signalVisibility.get(signalId as SignalId);
-        const recipients =
-          subscribers && subscribers.size > 0 ? subscribers : visibleClients;
+        const recipients = this.signalSubscriptions.get(signalId as SignalId);
         if (!recipients || recipients.size === 0) return;
 
         const prefixedId = `${this.prefix}${SEP}${signalId}`;
@@ -244,10 +240,6 @@ export class ForwardedUpstream {
       const rewritten = needsRewrite(parsed.payload)
         ? addPrefix(this.prefix, result)
         : result;
-
-      if (pending.clientId) {
-        this.rememberVisibleSignals(pending.clientId, collectSignalIds(result));
-      }
 
       if ('resolve' in pending) {
         pending.resolve(rewritten);
@@ -286,12 +278,39 @@ export class ForwardedUpstream {
     method: string,
     rawPayload: string,
   ) {
-    const upstreamCallId = this.nextUpstreamCallId++;
-    this.pendingCalls.set(upstreamCallId, {clientId, callId: downstreamCallId});
+    if (this.disposed) {
+      this.host.send(
+        clientId,
+        formatErrorMessage(downstreamCallId, {
+          code: -1,
+          message: 'Upstream disposed',
+        }),
+      );
+      return;
+    }
 
     // TODO: strip prefix from params when methods accept model/signal references as arguments
-    const params = parseWireParams(rawPayload);
-    this.transport.send(formatCallMessage(upstreamCallId, method, params));
+    let params: unknown[];
+    try {
+      params = parseWireParams(rawPayload);
+    } catch (error: any) {
+      this.host.send(
+        clientId,
+        formatErrorMessage(downstreamCallId, {
+          code: -1,
+          message: error?.message ?? String(error),
+        }),
+      );
+      return;
+    }
+
+    const upstreamCallId = this.nextUpstreamCallId++;
+    this.pendingCalls.set(upstreamCallId, {clientId, callId: downstreamCallId});
+    try {
+      this.transport.send(formatCallMessage(upstreamCallId, method, params));
+    } catch (error) {
+      this.handleTransportFailure(error);
+    }
   }
 
   request(method: string, params: any[], clientId?: string): Promise<any> {
@@ -300,7 +319,11 @@ export class ForwardedUpstream {
     const upstreamCallId = this.nextUpstreamCallId++;
     return new Promise((resolve, reject) => {
       this.pendingCalls.set(upstreamCallId, {clientId, resolve, reject});
-      this.transport.send(formatCallMessage(upstreamCallId, method, params));
+      try {
+        this.transport.send(formatCallMessage(upstreamCallId, method, params));
+      } catch (error) {
+        this.handleTransportFailure(error);
+      }
     });
   }
 
@@ -310,57 +333,27 @@ export class ForwardedUpstream {
     );
   }
 
-  private rememberVisibleSignals(
-    clientId: string,
-    signalIds: Iterable<SignalId>,
-  ) {
-    for (const signalId of signalIds) {
-      let clients = this.signalVisibility.get(signalId);
-      if (!clients) {
-        clients = new Set();
-        this.signalVisibility.set(signalId, clients);
-      }
-      clients.add(clientId);
-    }
-  }
-
-  private forgetVisibleSignals(
-    clientId: string,
-    signalIds: Iterable<SignalId>,
-  ) {
-    for (const signalId of signalIds) {
-      const clients = this.signalVisibility.get(signalId);
-      if (!clients) continue;
-      clients.delete(clientId);
-      if (clients.size === 0) this.signalVisibility.delete(signalId);
-    }
-  }
-
   /**
    * Forward watch requests to the upstream.
    */
   forwardWatch(clientId: string, signalIds: SignalId[]) {
     const toWatch: SignalId[] = [];
 
-    this.rememberVisibleSignals(clientId, signalIds);
-
     for (const signalId of new Set(signalIds)) {
       let subscribers = this.signalSubscriptions.get(signalId);
-      const wasUnwatched = !subscribers || subscribers.size === 0;
       if (!subscribers) {
         subscribers = new Set();
         this.signalSubscriptions.set(signalId, subscribers);
       }
 
+      // The upstream aggregates all downstream clients into one connection.
+      // Re-issuing @W for each new downstream subscriber makes the upstream
+      // send its current value, closing that client's snapshot-to-watch race.
+      if (!subscribers.has(clientId)) toWatch.push(signalId);
       subscribers.add(clientId);
-      if (wasUnwatched) toWatch.push(signalId);
     }
 
-    if (toWatch.length > 0) {
-      this.transport.send(
-        formatNotificationMessage(WATCH_SIGNALS_METHOD, toWatch),
-      );
-    }
+    this.sendSignalNotification(WATCH_SIGNALS_METHOD, toWatch);
   }
 
   /**
@@ -368,8 +361,6 @@ export class ForwardedUpstream {
    */
   forwardUnwatch(clientId: string, signalIds: SignalId[]) {
     const toUnwatch: SignalId[] = [];
-
-    this.forgetVisibleSignals(clientId, signalIds);
 
     for (const signalId of new Set(signalIds)) {
       const subscribers = this.signalSubscriptions.get(signalId);
@@ -381,11 +372,7 @@ export class ForwardedUpstream {
       }
     }
 
-    if (toUnwatch.length > 0) {
-      this.transport.send(
-        formatNotificationMessage(UNWATCH_SIGNALS_METHOD, toUnwatch),
-      );
-    }
+    this.sendSignalNotification(UNWATCH_SIGNALS_METHOD, toUnwatch);
   }
 
   private clearPendingCalls(error: Error) {
@@ -419,13 +406,7 @@ export class ForwardedUpstream {
    * Clear the association with a downstream client (client disconnected).
    */
   removeClient(clientId: string) {
-    this.clients.delete(clientId);
     this.clearPendingCallsForClient(clientId);
-
-    for (const [signalId, clients] of this.signalVisibility) {
-      clients.delete(clientId);
-      if (clients.size === 0) this.signalVisibility.delete(signalId);
-    }
 
     const toUnwatch: SignalId[] = [];
     for (const [signalId, subscribers] of this.signalSubscriptions) {
@@ -437,22 +418,35 @@ export class ForwardedUpstream {
       }
     }
 
-    if (toUnwatch.length > 0) {
-      this.transport.send(
-        formatNotificationMessage(UNWATCH_SIGNALS_METHOD, toUnwatch),
-      );
-    }
+    this.sendSignalNotification(UNWATCH_SIGNALS_METHOD, toUnwatch);
   }
 
   /**
    * Tear down this upstream connection entirely.
    */
-  dispose() {
+  dispose(error = new Error('Upstream disposed'), notifyUpstream = true) {
+    if (this.disposed) return;
+
+    if (notifyUpstream && this.signalSubscriptions.size > 0) {
+      try {
+        this.transport.send(
+          formatNotificationMessage(
+            UNWATCH_SIGNALS_METHOD,
+            Array.from(this.signalSubscriptions.keys()),
+          ),
+        );
+      } catch {
+        // Teardown still releases local state if the transport already closed.
+      }
+    }
+
     this.disposed = true;
-    this.clients.clear();
-    this.rootSignalIds.clear();
+    this.root = undefined;
     this.signalSubscriptions.clear();
-    this.signalVisibility.clear();
-    this.clearPendingCalls(new Error('Upstream disposed'));
+    this.clearPendingCalls(error);
+    if (!this.readySettled) {
+      this.readySettled = true;
+      this._rejectReady(error);
+    }
   }
 }
