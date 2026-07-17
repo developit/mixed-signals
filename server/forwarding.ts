@@ -5,6 +5,7 @@ import {
   formatResultMessage,
   parseWireMessage,
   parseWireParams,
+  REFRESH_MODELS_METHOD,
   ROOT_NOTIFICATION_METHOD,
   SIGNAL_UPDATE_METHOD,
   type Transport,
@@ -28,7 +29,7 @@ export function addPrefix(prefix: string, value: any): any {
   const out: Record<string, any> = {};
   for (const key of Object.keys(value)) {
     const v = value[key];
-    if (key === '@S' && typeof v === 'number') {
+    if (key === '@S' && (typeof v === 'number' || typeof v === 'string')) {
       out['@S'] = `${prefix}${SEP}${v}`;
     } else if (key === '@M' && typeof v === 'string') {
       const h = v.lastIndexOf('#');
@@ -54,7 +55,7 @@ export function stripPrefix(prefix: string, value: any): any {
   for (const key of Object.keys(value)) {
     const v = value[key];
     if (key === '@S' && typeof v === 'string' && v.startsWith(pfx)) {
-      out['@S'] = Number(v.slice(pfx.length));
+      out['@S'] = stripSignalPrefix(prefix, v);
     } else if (key === '@M' && typeof v === 'string') {
       const h = v.lastIndexOf('#');
       if (h !== -1 && v.slice(h + 1).startsWith(pfx)) {
@@ -77,10 +78,14 @@ export function isUpstreamId(prefix: string, id: SignalId): boolean {
 }
 
 /**
- * Strip the prefix from a prefixed signal ID, returning the original numeric ID.
+ * Strip the prefix from a prefixed signal ID, preserving nested upstream IDs.
  */
-export function stripSignalPrefix(prefix: string, id: string): number {
-  return Number(id.slice(prefix.length + SEP.length));
+export function stripSignalPrefix(prefix: string, id: string): SignalId {
+  const stripped = id.slice(prefix.length + SEP.length);
+  const numeric = Number(stripped);
+  return Number.isInteger(numeric) && String(numeric) === stripped
+    ? numeric
+    : stripped;
 }
 
 /**
@@ -96,6 +101,30 @@ export function stripInstancePrefix(prefix: string, id: string): string {
  */
 function needsRewrite(rawPayload: string): boolean {
   return rawPayload.includes('"@S"') || rawPayload.includes('"@M"');
+}
+
+function collectSignalIds(
+  value: any,
+  ids = new Set<SignalId>(),
+): Set<SignalId> {
+  if (value === null || value === undefined || typeof value !== 'object') {
+    return ids;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) collectSignalIds(item, ids);
+    return ids;
+  }
+
+  const signalId = value['@S'];
+  if (typeof signalId === 'number' || typeof signalId === 'string') {
+    ids.add(signalId);
+  }
+
+  for (const nested of Object.values(value)) {
+    collectSignalIds(nested, ids);
+  }
+  return ids;
 }
 
 interface UpstreamHost {
@@ -120,12 +149,22 @@ export class ForwardedUpstream {
   ready: Promise<void>;
   private _resolveReady!: () => void;
 
-  /** Upstream call ID → { clientId, downstreamCallId } */
-  private pendingCalls = new Map<number, {clientId: string; callId: number}>();
+  /** Upstream call ID → downstream forwarding target or local request promise. */
+  private pendingCalls = new Map<
+    number,
+    | {clientId: string; callId: number}
+    | {
+        clientId?: string;
+        resolve: (value: any) => void;
+        reject: (error: Error) => void;
+      }
+  >();
   private nextUpstreamCallId = 1;
 
-  /** The single downstream client ID using this upstream (1:1 per-browser mapping). */
-  private clientId: string | undefined;
+  private clients = new Set<string>();
+  private rootSignalIds = new Set<SignalId>();
+  private signalSubscriptions = new Map<SignalId, Set<string>>();
+  private signalVisibility = new Map<SignalId, Set<string>>();
 
   constructor(prefix: string, transport: Transport, host: UpstreamHost) {
     this.prefix = prefix;
@@ -141,7 +180,8 @@ export class ForwardedUpstream {
   }
 
   setClient(clientId: string) {
-    this.clientId = clientId;
+    this.clients.add(clientId);
+    this.rememberVisibleSignals(clientId, this.rootSignalIds);
   }
 
   private handleUpstreamMessage(msg: string) {
@@ -153,6 +193,10 @@ export class ForwardedUpstream {
     if (parsed.type === 'notification') {
       if (parsed.method === ROOT_NOTIFICATION_METHOD) {
         const [rootValue] = parseWireParams(parsed.payload);
+        this.rootSignalIds = collectSignalIds(rootValue);
+        for (const clientId of this.clients) {
+          this.rememberVisibleSignals(clientId, this.rootSignalIds);
+        }
         this.root = addPrefix(this.prefix, rootValue);
         this._resolveReady();
         this.host.onUpstreamRootChanged();
@@ -160,11 +204,15 @@ export class ForwardedUpstream {
       }
 
       if (parsed.method === SIGNAL_UPDATE_METHOD) {
-        if (!this.clientId) return;
-
         // Parse params: [signalId, value, mode?]
         const params = parseWireParams(parsed.payload);
         const [signalId, value, mode] = params;
+        const subscribers = this.signalSubscriptions.get(signalId as SignalId);
+        const visibleClients = this.signalVisibility.get(signalId as SignalId);
+        const recipients =
+          subscribers && subscribers.size > 0 ? subscribers : visibleClients;
+        if (!recipients || recipients.size === 0) return;
+
         const prefixedId = `${this.prefix}${SEP}${signalId}`;
 
         // Only rewrite value if it contains @S/@M markers
@@ -175,11 +223,14 @@ export class ForwardedUpstream {
         const outParams = mode
           ? [prefixedId, rewrittenValue, mode]
           : [prefixedId, rewrittenValue];
-
-        this.host.send(
-          this.clientId,
-          formatNotificationMessage(SIGNAL_UPDATE_METHOD, outParams),
+        const message = formatNotificationMessage(
+          SIGNAL_UPDATE_METHOD,
+          outParams,
         );
+
+        for (const clientId of recipients) {
+          this.host.send(clientId, message);
+        }
         return;
       }
     }
@@ -194,10 +245,18 @@ export class ForwardedUpstream {
         ? addPrefix(this.prefix, result)
         : result;
 
-      this.host.send(
-        pending.clientId,
-        formatResultMessage(pending.callId, rewritten),
-      );
+      if (pending.clientId) {
+        this.rememberVisibleSignals(pending.clientId, collectSignalIds(result));
+      }
+
+      if ('resolve' in pending) {
+        pending.resolve(rewritten);
+      } else {
+        this.host.send(
+          pending.clientId,
+          formatResultMessage(pending.callId, rewritten),
+        );
+      }
       return;
     }
 
@@ -206,10 +265,15 @@ export class ForwardedUpstream {
       if (!pending) return;
       this.pendingCalls.delete(parsed.id);
 
-      this.host.send(
-        pending.clientId,
-        formatErrorMessage(pending.callId, JSON.parse(parsed.payload)),
-      );
+      const error = JSON.parse(parsed.payload);
+      if ('reject' in pending) {
+        pending.reject(new Error(error?.message ?? String(error)));
+      } else {
+        this.host.send(
+          pending.clientId,
+          formatErrorMessage(pending.callId, error),
+        );
+      }
     }
   }
 
@@ -230,31 +294,153 @@ export class ForwardedUpstream {
     this.transport.send(formatCallMessage(upstreamCallId, method, params));
   }
 
+  request(method: string, params: any[], clientId?: string): Promise<any> {
+    if (this.disposed) return Promise.reject(new Error('Upstream disposed'));
+
+    const upstreamCallId = this.nextUpstreamCallId++;
+    return new Promise((resolve, reject) => {
+      this.pendingCalls.set(upstreamCallId, {clientId, resolve, reject});
+      this.transport.send(formatCallMessage(upstreamCallId, method, params));
+    });
+  }
+
+  refreshModels(markers: string[], clientId?: string): Promise<any[]> {
+    return this.request(REFRESH_MODELS_METHOD, markers, clientId).then(
+      (result) => (Array.isArray(result) ? result : []),
+    );
+  }
+
+  private rememberVisibleSignals(
+    clientId: string,
+    signalIds: Iterable<SignalId>,
+  ) {
+    for (const signalId of signalIds) {
+      let clients = this.signalVisibility.get(signalId);
+      if (!clients) {
+        clients = new Set();
+        this.signalVisibility.set(signalId, clients);
+      }
+      clients.add(clientId);
+    }
+  }
+
+  private forgetVisibleSignals(
+    clientId: string,
+    signalIds: Iterable<SignalId>,
+  ) {
+    for (const signalId of signalIds) {
+      const clients = this.signalVisibility.get(signalId);
+      if (!clients) continue;
+      clients.delete(clientId);
+      if (clients.size === 0) this.signalVisibility.delete(signalId);
+    }
+  }
+
   /**
    * Forward watch requests to the upstream.
    */
-  forwardWatch(signalIds: number[]) {
-    this.transport.send(
-      formatNotificationMessage(WATCH_SIGNALS_METHOD, signalIds),
-    );
+  forwardWatch(clientId: string, signalIds: SignalId[]) {
+    const toWatch: SignalId[] = [];
+
+    this.rememberVisibleSignals(clientId, signalIds);
+
+    for (const signalId of new Set(signalIds)) {
+      let subscribers = this.signalSubscriptions.get(signalId);
+      const wasUnwatched = !subscribers || subscribers.size === 0;
+      if (!subscribers) {
+        subscribers = new Set();
+        this.signalSubscriptions.set(signalId, subscribers);
+      }
+
+      subscribers.add(clientId);
+      if (wasUnwatched) toWatch.push(signalId);
+    }
+
+    if (toWatch.length > 0) {
+      this.transport.send(
+        formatNotificationMessage(WATCH_SIGNALS_METHOD, toWatch),
+      );
+    }
   }
 
   /**
    * Forward unwatch requests to the upstream.
    */
-  forwardUnwatch(signalIds: number[]) {
-    this.transport.send(
-      formatNotificationMessage(UNWATCH_SIGNALS_METHOD, signalIds),
-    );
+  forwardUnwatch(clientId: string, signalIds: SignalId[]) {
+    const toUnwatch: SignalId[] = [];
+
+    this.forgetVisibleSignals(clientId, signalIds);
+
+    for (const signalId of new Set(signalIds)) {
+      const subscribers = this.signalSubscriptions.get(signalId);
+      if (!subscribers || !subscribers.delete(clientId)) continue;
+
+      if (subscribers.size === 0) {
+        this.signalSubscriptions.delete(signalId);
+        toUnwatch.push(signalId);
+      }
+    }
+
+    if (toUnwatch.length > 0) {
+      this.transport.send(
+        formatNotificationMessage(UNWATCH_SIGNALS_METHOD, toUnwatch),
+      );
+    }
+  }
+
+  private clearPendingCalls(error: Error) {
+    for (const pending of this.pendingCalls.values()) {
+      if ('reject' in pending) {
+        pending.reject(error);
+      } else {
+        this.host.send(
+          pending.clientId,
+          formatErrorMessage(pending.callId, {
+            code: -1,
+            message: error.message,
+          }),
+        );
+      }
+    }
+    this.pendingCalls.clear();
+  }
+
+  private clearPendingCallsForClient(clientId: string) {
+    const error = new Error('Downstream client disconnected');
+    for (const [callId, pending] of this.pendingCalls) {
+      if (pending.clientId !== clientId) continue;
+
+      this.pendingCalls.delete(callId);
+      if ('reject' in pending) pending.reject(error);
+    }
   }
 
   /**
    * Clear the association with a downstream client (client disconnected).
    */
   removeClient(clientId: string) {
-    if (this.clientId === clientId) {
-      this.clientId = undefined;
-      this.pendingCalls.clear();
+    this.clients.delete(clientId);
+    this.clearPendingCallsForClient(clientId);
+
+    for (const [signalId, clients] of this.signalVisibility) {
+      clients.delete(clientId);
+      if (clients.size === 0) this.signalVisibility.delete(signalId);
+    }
+
+    const toUnwatch: SignalId[] = [];
+    for (const [signalId, subscribers] of this.signalSubscriptions) {
+      if (!subscribers.delete(clientId)) continue;
+
+      if (subscribers.size === 0) {
+        this.signalSubscriptions.delete(signalId);
+        toUnwatch.push(signalId);
+      }
+    }
+
+    if (toUnwatch.length > 0) {
+      this.transport.send(
+        formatNotificationMessage(UNWATCH_SIGNALS_METHOD, toUnwatch),
+      );
     }
   }
 
@@ -263,7 +449,10 @@ export class ForwardedUpstream {
    */
   dispose() {
     this.disposed = true;
-    this.clientId = undefined;
-    this.pendingCalls.clear();
+    this.clients.clear();
+    this.rootSignalIds.clear();
+    this.signalSubscriptions.clear();
+    this.signalVisibility.clear();
+    this.clearPendingCalls(new Error('Upstream disposed'));
   }
 }

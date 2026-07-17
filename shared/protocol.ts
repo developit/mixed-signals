@@ -1,13 +1,25 @@
 export interface Transport {
   send(data: string): void;
   onMessage(cb: (data: {toString(): string}) => void): void;
+  onClose?(cb: (error?: unknown) => void): void;
+  onOpen?(cb: () => void): void;
   ready?: Promise<void>;
+}
+
+export interface ConnectionInfo {
+  /** Opaque id that can be supplied on a future server addClient() call. */
+  connectionId: string;
+  /** Opaque id for the server process that accepted this connection. */
+  processId: string;
+  /** True when this connection replaced active state retained for connectionId. */
+  resumed: boolean;
 }
 
 export const ROOT_NOTIFICATION_METHOD = '@R';
 export const SIGNAL_UPDATE_METHOD = '@S';
 export const WATCH_SIGNALS_METHOD = '@W';
 export const UNWATCH_SIGNALS_METHOD = '@U';
+export const REFRESH_MODELS_METHOD = '@M';
 
 type ParsedCallMessage = {
   type: 'call';

@@ -244,7 +244,7 @@ describe('Integration: Server <-> Client', () => {
     await rpcClient.ready;
 
     rpcClient.root.count.subscribe(() => undefined);
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     root.count.value = 42;
@@ -266,7 +266,7 @@ describe('Integration: Server <-> Client', () => {
     await rpcClient.ready;
 
     rpcClient.root.items.subscribe(() => undefined);
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     root.items.value = ['a', 'b', 'c'];
@@ -288,7 +288,7 @@ describe('Integration: Server <-> Client', () => {
     await rpcClient.ready;
 
     rpcClient.root.name.subscribe(() => undefined);
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     root.name.value = 'hello world';
@@ -310,7 +310,7 @@ describe('Integration: Server <-> Client', () => {
     await rpcClient.ready;
 
     rpcClient.root.meta.subscribe(() => undefined);
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     root.meta.value = {version: 1, status: 'updated'};
@@ -332,7 +332,7 @@ describe('Integration: Server <-> Client', () => {
     await rpcClient.ready;
 
     rpcClient.root.name.subscribe(() => undefined);
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     root.name.value = 'xyz';
@@ -402,7 +402,7 @@ describe('Integration: Server <-> Client', () => {
 
     a.rpcClient.root.count.subscribe(() => undefined);
     b.rpcClient.root.count.subscribe(() => undefined);
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await a.flush();
     await b.flush();
 
@@ -431,7 +431,7 @@ describe('Integration: Server <-> Client', () => {
 
     const stopA = a.rpcClient.root.count.subscribe(() => undefined);
     b.rpcClient.root.count.subscribe(() => undefined);
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await a.flush();
     await b.flush();
 
@@ -456,7 +456,7 @@ describe('Integration: Server <-> Client', () => {
     await rpcClient.ready;
 
     rpcClient.root.count.subscribe(() => undefined);
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     root.count.value = 10;
@@ -470,6 +470,67 @@ describe('Integration: Server <-> Client', () => {
     await flush();
 
     expect(rpcClient.root.count.peek()).toBe(10);
+  });
+
+  it('refreshes held models and replays watches when reconnecting to a new RPC process', async () => {
+    vi.useFakeTimers();
+    const rpc1 = new RPC();
+    rpc1.registerModel('Counter', Counter);
+    const root1 = new Counter();
+    root1.count.value = 1;
+    rpc1.expose(root1);
+
+    const firstPair = createLinkedTransportPair();
+    const ctx = {rpc: null as any};
+    const client = new RPCClient(firstPair.clientTransport, ctx);
+    ctx.rpc = client;
+    client.registerModel('Counter', ReflectedCounter);
+    const cleanup1 = rpc1.addClient(firstPair.serverTransport, 'stable-client');
+
+    await firstPair.flush();
+    await client.ready;
+
+    const model = client.root;
+    const count = model.count;
+    const stop = count.subscribe(() => undefined);
+    vi.advanceTimersByTime(10);
+    await firstPair.flush();
+
+    root1.count.value = 2;
+    await firstPair.flush();
+    expect(count.peek()).toBe(2);
+
+    cleanup1();
+
+    const rpc2 = new RPC();
+    rpc2.registerModel('Counter', Counter);
+    const root2 = new Counter();
+    root2.count.value = 20;
+    rpc2.expose(root2);
+    const secondPair = createLinkedTransportPair();
+
+    client.reconnect(secondPair.clientTransport);
+    rpc2.addClient(secondPair.serverTransport, client.connectionId);
+    await secondPair.flush();
+    await client.ready;
+
+    expect(client.connectionInfo?.resumed).toBe(false);
+    expect(client.root).toBe(model);
+    expect(client.root.count).toBe(count);
+    expect(count.peek()).toBe(20);
+
+    root2.count.value = 21;
+    await secondPair.flush();
+    expect(count.peek()).toBe(21);
+
+    const increment = model.increment();
+    await secondPair.flush();
+    await increment;
+    expect(root2.count.peek()).toBe(22);
+
+    await secondPair.flush();
+    expect(count.peek()).toBe(22);
+    stop();
   });
 
   it('rpc.call from client still works with method routing', async () => {
@@ -534,7 +595,7 @@ describe('mixed-signals roundtrip', () => {
     const stopTitle = client.root.title.subscribe(() => undefined);
     const stopProjectName = client.root.project.name.subscribe(() => undefined);
 
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     title.value = 'World';
@@ -608,7 +669,7 @@ describe('mixed-signals roundtrip', () => {
     );
     const stopMessageStatus =
       client.root.session.items.value[0].status.subscribe(() => undefined);
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     firstServerItem.content.value = 'Hello world';

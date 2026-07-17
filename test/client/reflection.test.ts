@@ -25,7 +25,7 @@ function setup() {
   } satisfies Partial<RPCClient> as unknown as RPCClient;
   const ctx = {rpc};
   const reflection = new ClientReflection(rpc);
-  return {reflection, notify, ctx};
+  return {reflection, notify, rpc, ctx};
 }
 
 afterEach(() => {
@@ -56,6 +56,27 @@ describe('ClientReflection', () => {
       expect(sig1).not.toBe(sig2);
       expect(sig1.peek()).toBe('a');
       expect(sig2.peek()).toBe('b');
+    });
+
+    it('stores signal cache entries behind dereferenceable refs', () => {
+      const {reflection} = setup();
+      const sig = reflection.getOrCreateSignal(1, 'a');
+      const cachedRef = (reflection as any).signals.get(1);
+
+      expect(cachedRef).not.toBe(sig);
+      expect(cachedRef.deref()).toBe(sig);
+    });
+
+    it('sweeps collected signal cache entries', () => {
+      const {reflection} = setup();
+      const sig = reflection.getOrCreateSignal(1, 'live');
+      (reflection as any).signals.set(2, {deref: () => undefined});
+
+      reflection.sweepCollectedEntries();
+
+      expect((reflection as any).signals.get(1).deref()).toBe(sig);
+      expect((reflection as any).signals.has(2)).toBe(false);
+      expect(reflection.getOrCreateSignal(2, 'new').peek()).toBe('new');
     });
   });
 
@@ -147,7 +168,7 @@ describe('ClientReflection', () => {
       expect(notify).toHaveBeenCalledWith(WATCH_SIGNALS_METHOD, [1, 2, 3]);
     });
 
-    it('schedules @U after unwatch debounce timeout', () => {
+    it('schedules @U after the global watch flush delay', () => {
       vi.useFakeTimers();
       const {reflection, notify} = setup();
 
@@ -328,6 +349,63 @@ describe('ClientReflection', () => {
       const b = reflection.createModelFacade({'@M': 'Counter#2'});
       expect(a).not.toBe(b);
     });
+
+    it('stores model facades and their signals behind dereferenceable refs', () => {
+      const {reflection} = setup();
+      reflection.registerModel('Task', TaskModel);
+
+      const title = reflection.getOrCreateSignal(1, 'Ship');
+      const facade = reflection.createModelFacade({
+        '@M': 'Task#1',
+        title,
+      });
+
+      const modelRef = (reflection as any).models.get('Task#1');
+      const [signalRef] = (reflection as any).modelSignals.get('Task#1');
+
+      expect(modelRef).not.toBe(facade);
+      expect(modelRef.deref()).toBe(facade);
+      expect(signalRef).not.toBe(title);
+      expect(signalRef.deref()).toBe(title);
+    });
+
+    it('sweeps collected model facades and signal indexes', () => {
+      const {reflection} = setup();
+      (reflection as any).models.set('Task#dead', {deref: () => undefined});
+      (reflection as any).modelSignals.set(
+        'Task#dead',
+        new Set([{deref: () => undefined}]),
+      );
+      (reflection as any).staleModelMarkers.add('Task#dead');
+      (reflection as any).refreshingModelMarkers.add('Task#dead');
+
+      reflection.sweepCollectedEntries();
+
+      expect((reflection as any).models.has('Task#dead')).toBe(false);
+      expect((reflection as any).modelSignals.has('Task#dead')).toBe(false);
+      expect((reflection as any).staleModelMarkers.has('Task#dead')).toBe(
+        false,
+      );
+      expect((reflection as any).refreshingModelMarkers.has('Task#dead')).toBe(
+        false,
+      );
+    });
+
+    it('refreshes stale models for watched signals without full-cache sweeping', () => {
+      vi.useFakeTimers();
+      const {reflection, rpc} = setup();
+      reflection.registerModel('Counter', ReflectedCounter);
+      const count = reflection.getOrCreateSignal(1, 0);
+      reflection.createModelFacade({'@M': 'Counter#abc', count});
+      (reflection as any).staleModelMarkers.add('Counter#abc');
+      const sweep = vi.spyOn(reflection, 'sweepCollectedEntries');
+
+      count.subscribe(() => undefined);
+
+      expect(sweep).not.toHaveBeenCalled();
+      expect(rpc.call).toHaveBeenCalledWith('@M', ['Counter#abc']);
+      reflection.reset();
+    });
   });
 
   describe('reset', () => {
@@ -365,7 +443,7 @@ describe('ClientReflection', () => {
 
       const sig = reflection.getOrCreateSignal(1, 'val');
       sig.subscribe(() => {});
-      // Watch is pending (1ms timer not yet fired)
+      // Watch is pending (10ms timer not yet fired)
 
       reflection.reset();
 
