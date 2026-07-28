@@ -63,7 +63,15 @@ export class Reflection {
 
     if ('id' in instance) {
       const id = instance.id;
-      return String(id instanceof Signal ? id.peek() : id);
+      const resolved = String(id instanceof Signal ? id.peek() : id);
+      // Wire ids are embedded in call frames ("M1:<id>#method:...") and model
+      // markers ("Type#<id>"), so these delimiters would corrupt parsing.
+      if (resolved.includes('#') || resolved.includes(':')) {
+        throw new Error(
+          `Model id "${resolved}" must not contain "#" or ":" (reserved by the wire format)`,
+        );
+      }
+      return resolved;
     }
 
     let id = this.autoIds.get(instance);

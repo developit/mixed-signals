@@ -8,4 +8,5 @@ Fix re-watch staleness, harden method dispatch, and expose nested model facades.
 - `RPC` method dispatch rejects underscore-prefixed path segments, `constructor`/`prototype`/`__proto__`, and methods inherited from `Object.prototype`, so wire calls can only reach the intentionally exposed graph.
 - Proxy facades now define nested reflected models as real properties (e.g. `task.vcs` is the nested model's facade) instead of dropping them and returning a method proxy.
 - Call rejections now preserve application error properties: own enumerable props on a thrown error (e.g. a machine-readable `code`) ride the error frame and are restored onto the client-side rejection.
+- `getInstanceId` rejects model ids containing `#` or `:` — both are wire-format delimiters, and such ids previously corrupted call frames silently.
 - Added a `prepare` script so git-pinned installs build automatically.

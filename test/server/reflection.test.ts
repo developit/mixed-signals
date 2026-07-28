@@ -99,6 +99,15 @@ describe('Reflection', () => {
       expect(reflection.getInstanceId(obj)).toBe('sig-id');
     });
 
+    it('rejects ids containing wire-format delimiters', () => {
+      expect(() => reflection.getInstanceId({id: 'task-1:vcs'})).toThrow(
+        'must not contain "#" or ":"',
+      );
+      expect(() => reflection.getInstanceId({id: 'task#1'})).toThrow(
+        'must not contain "#" or ":"',
+      );
+    });
+
     it('auto-generates id for models without id', () => {
       const obj = {name: 'no-id'};
       const id = reflection.getInstanceId(obj);
