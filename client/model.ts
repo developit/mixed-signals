@@ -205,7 +205,12 @@ export function createReflectedModelFacade<T = any>(
       ? options.signalProps.map((prop) => [prop, nextData[prop]] as const)
       : Object.entries(nextData);
     for (const [prop, value] of entries) {
-      if (value instanceof Signal) setSignal(prop, value);
+      if (value instanceof Signal) {
+        setSignal(prop, value);
+      } else if (value?.[REFRESH_REFLECTED_MODEL]) {
+        // Nested reflected models are exposed directly as facade properties.
+        defineValue(target, prop, value);
+      }
     }
   };
 

@@ -31,6 +31,18 @@ function dlv(obj: any, path: string): any {
   return path.split('.').reduce((acc, key) => acc?.[key], obj);
 }
 
+const UNSAFE_SEGMENTS = new Set(['constructor', 'prototype', '__proto__']);
+
+// Underscore-prefixed properties are private by wire convention, and
+// constructor/prototype segments would let a path escape the exposed graph.
+function isUnsafeSegment(segment: string): boolean {
+  return (
+    segment.length === 0 ||
+    segment.startsWith('_') ||
+    UNSAFE_SEGMENTS.has(segment)
+  );
+}
+
 export class RPC {
   private reflection: Reflection;
   private clients = new Map<string, Transport>();
@@ -480,11 +492,20 @@ export class RPC {
     }
 
     const segments = method.split('.');
+    if (segments.some(isUnsafeSegment)) {
+      throw new Error(`Method not found: ${method}`);
+    }
+
     const methodName = segments.pop()!;
     const receiver =
       segments.length > 0 ? dlv(instance, segments.join('.')) : instance;
     const target = receiver?.[methodName];
-    if (typeof target !== 'function') {
+    // Reject non-functions and methods inherited from Object.prototype
+    // (toString, hasOwnProperty, ...) — only the exposed graph is callable.
+    if (
+      typeof target !== 'function' ||
+      target === (Object.prototype as any)[methodName]
+    ) {
       throw new Error(`Method not found: ${method}`);
     }
 

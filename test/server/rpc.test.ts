@@ -416,6 +416,67 @@ describe('RPC', () => {
     expect(response).toMatch('Method not found');
   });
 
+  it('rejects private and prototype-escaping method paths', async () => {
+    const rpc = new RPC({
+      _secret: () => 'leaked',
+      nested: {greet: () => 'hi', _hidden: () => 'leaked'},
+    });
+    const transport = new FakeTransport();
+    rpc.addClient(transport);
+
+    const unsafeMethods = [
+      '_secret',
+      'nested._hidden',
+      'constructor',
+      '__proto__.constructor',
+      'nested.constructor.constructor',
+      'toString',
+      'hasOwnProperty',
+      'nested.toString',
+    ];
+
+    for (const [index, method] of unsafeMethods.entries()) {
+      transport.sent.length = 0;
+      await transport.emit(formatCallMessage(index + 1, method, []));
+      const response = parseWireMessage(transport.sent[0] ?? '');
+      expect(response?.type, method).toBe('error');
+      if (response?.type === 'error') {
+        expect(parseWireValue<any>(response.payload).message).toBe(
+          `Method not found: ${method}`,
+        );
+      }
+    }
+  });
+
+  it('rejects prototype-escaping paths on instance routes', async () => {
+    const rpc = new RPC({});
+    const transport = new FakeTransport();
+    rpc.addClient(transport);
+    transport.sent.length = 0;
+
+    await transport.emit(formatCallMessage(1, '0#constructor', []));
+    const response = parseWireMessage(transport.sent[0] ?? '');
+    expect(response?.type).toBe('error');
+  });
+
+  it('allows methods that shadow Object.prototype on the exposed graph', async () => {
+    const rpc = new RPC({toString: () => 'custom'});
+    const transport = new FakeTransport();
+    rpc.addClient(transport);
+    transport.sent.length = 0;
+
+    await transport.emit(formatCallMessage(1, 'toString', []));
+    await new Promise((r) => setTimeout(r, 10));
+
+    const response = parseWireMessage(
+      transport.sent.find((m) => m.startsWith('R1:')) ?? '',
+    );
+    expect(response?.type).toBe('result');
+    if (response?.type === 'result') {
+      expect(parseWireValue<string>(response.payload)).toBe('custom');
+    }
+  });
+
   it('dot notation for nested property access', async () => {
     const rpc = new RPC({
       nested: {

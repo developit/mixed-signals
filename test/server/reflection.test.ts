@@ -297,6 +297,56 @@ describe('Reflection', () => {
       expect(c1msgs.length).toBeGreaterThan(0);
       expect(c2msgs.length).toBeGreaterThan(0);
     });
+
+    it('sends a catch-up update on re-watch when the subscription stayed alive', () => {
+      const {counter, countId} = setupCounter(reflection, instances, 'c1');
+      reflection.serialize(counter, 'c2');
+      reflection.watch('c1', countId);
+      reflection.watch('c2', countId);
+      reflection.unwatch('c1', countId);
+      counter.count.value = 5;
+      sender.sent.length = 0;
+
+      reflection.watch('c1', countId);
+
+      const relevant = sender.sent.filter((m) => m.clientId === 'c1');
+      expect(relevant.length).toBe(1);
+      const [id, value] = parseUpdate(relevant[0].message);
+      expect(id).toBe(countId);
+      expect(value).toBe(5);
+    });
+
+    it('compresses the re-watch catch-up against the client last-sent value', () => {
+      const {counter, nameId} = setupCounter(reflection, instances, 'c1');
+      reflection.serialize(counter, 'c2');
+      reflection.watch('c1', nameId);
+      reflection.watch('c2', nameId);
+      reflection.unwatch('c1', nameId);
+      counter.name.value = 'default-updated';
+      sender.sent.length = 0;
+
+      reflection.watch('c1', nameId);
+
+      const relevant = sender.sent.filter((m) => m.clientId === 'c1');
+      expect(relevant.length).toBe(1);
+      const [id, value, mode] = parseUpdate(relevant[0].message);
+      expect(id).toBe(nameId);
+      expect(value).toBe('-updated');
+      expect(mode).toBe('append');
+    });
+
+    it('sends nothing on re-watch when the value has not changed', () => {
+      const {counter, countId} = setupCounter(reflection, instances, 'c1');
+      reflection.serialize(counter, 'c2');
+      reflection.watch('c1', countId);
+      reflection.watch('c2', countId);
+      reflection.unwatch('c1', countId);
+      sender.sent.length = 0;
+
+      reflection.watch('c1', countId);
+
+      expect(sender.sent.filter((m) => m.clientId === 'c1').length).toBe(0);
+    });
   });
 
   describe('delta compression', () => {

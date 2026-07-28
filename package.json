@@ -29,6 +29,7 @@
     "format": "biome format --write .",
     "check": "biome check --write .",
     "docs:api": "node scripts/generate-readme.mjs",
+    "prepare": "tsdown",
     "prepublishOnly": "tsdown && node scripts/generate-readme.mjs",
     "changeset": "changeset",
     "version": "changeset version && pnpm install --lockfile-only",
