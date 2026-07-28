@@ -467,10 +467,13 @@ export class RPC {
       }
     } catch (error: any) {
       if (id !== undefined) {
+        // Application code often attaches metadata to thrown errors (e.g. a
+        // machine-readable `code`). Own enumerable props ride along so the
+        // client can rebuild an equivalent error.
         this.sendError(
           clientId,
           id,
-          {code: -1, message: error.message},
+          {code: -1, message: error.message, ...error},
           transport,
         );
       }

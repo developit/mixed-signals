@@ -261,6 +261,36 @@ describe('Integration: Server <-> Client', () => {
     await expect(promise).rejects.toThrow('server error');
   });
 
+  it('preserves application error properties across call rejections', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC({
+      fail() {
+        throw Object.assign(new Error('dirty worktree'), {
+          code: 'WORKTREE_NOT_CLEAN',
+          branch: 'feature-1',
+        });
+      },
+    });
+
+    const {serverTransport, clientTransport, flush} =
+      createLinkedTransportPair();
+    const ctx = {rpc: null as any};
+    const rpcClient = new RPCClient(clientTransport, ctx);
+    ctx.rpc = rpcClient;
+    rpc.addClient(serverTransport, 'c1');
+
+    await flush();
+    await rpcClient.ready;
+
+    const promise = rpcClient.call('fail');
+    await flush();
+    await expect(promise).rejects.toMatchObject({
+      message: 'dirty worktree',
+      code: 'WORKTREE_NOT_CLEAN',
+      branch: 'feature-1',
+    });
+  });
+
   it('client receives update after watch + server mutation', async () => {
     vi.useFakeTimers();
     const rpc = new RPC();
