@@ -15,11 +15,11 @@ type AnyFunction = (...args: any[]) => any;
 // treated as objects.
 type Primitive = string | number | boolean | bigint | symbol | null | undefined;
 
-type ReflectedMethod<T extends AnyFunction> = (
+export type ReflectedMethod<T extends AnyFunction> = (
   ...args: Parameters<T>
 ) => Promise<Reflected<Awaited<ReturnType<T>>>>;
 
-type ReflectedObject<T extends object> = {
+export type ReflectedObject<T extends object> = {
   readonly [Key in keyof T]: Reflected<T[Key]>;
 };
 
