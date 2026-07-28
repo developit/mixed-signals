@@ -13,6 +13,7 @@ import {
   SIGNAL_UPDATE_METHOD,
   type Transport,
 } from '../shared/protocol.ts';
+import type {DefaultReflectedRoot, Reflected} from './model.ts';
 import {ClientReflection} from './reflection.ts';
 
 // Walk a dotted path like "browser.logs" against an object so peer-issued
@@ -31,7 +32,7 @@ function isConnectionInfo(value: unknown): value is ConnectionInfo {
   );
 }
 
-export class RPCClient {
+export class RPCClient<TRoot = DefaultReflectedRoot> {
   private transport: Transport;
   private transportGeneration = 0;
   private nextId = 1;
@@ -53,7 +54,7 @@ export class RPCClient {
   private reconnectable = false;
   private readyResolved = false;
   private replaySubscriptionsOnRoot = false;
-  root: any = undefined;
+  root: Reflected<TRoot> = undefined as Reflected<TRoot>;
   /** Opaque server-assigned id that can be sent back on a future reconnect. */
   connectionId: string | undefined;
   /** Metadata from the server process that sent the latest root snapshot. */
@@ -214,7 +215,11 @@ export class RPCClient {
     }
   }
 
-  registerModel(typeName: string, ctor: any) {
+  /**
+   * Optionally register a custom facade constructor for a server model type.
+   * Unregistered model types are reflected with proxy facades automatically.
+   */
+  registerModel(typeName: string, ctor?: new (ctx: any, data: any) => any) {
     this.reflection.registerModel(typeName, ctor);
   }
 

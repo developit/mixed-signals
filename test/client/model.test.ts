@@ -51,6 +51,31 @@ describe('createReflectedModel', () => {
     expect(instance.count.peek()).toBe(99);
   });
 
+  it('discovers signal properties and methods without a shape declaration', async () => {
+    const Model = createReflectedModel<{
+      id: Signal<string>;
+      count: Signal<number>;
+      increment(): Promise<void>;
+    }>();
+
+    const call = vi.fn(async () => undefined);
+    const ctx = {
+      rpc: {call} satisfies Partial<RPCClient>,
+    } as unknown as WireContext;
+    const count = signal(1);
+    const instance = new Model(ctx, {'@wireId': 'w9', count});
+
+    expect(instance.count.peek()).toBe(1);
+    count.value = 2;
+    expect(instance.count.peek()).toBe(2);
+
+    expect((instance as any).then).toBeUndefined();
+    expect(instance.increment).toBe(instance.increment);
+
+    await instance.increment();
+    expect(call).toHaveBeenCalledWith('w9#increment', []);
+  });
+
   it('creates method proxies that call rpc.call with wireId#method', async () => {
     const Model = createReflectedModel<{
       id: Signal<string>;

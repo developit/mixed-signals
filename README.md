@@ -15,7 +15,7 @@ The only dependency is `@preact/signals-core` (>=1.8.0).
 **mixed-signals** reflects server-side Preact Models and Signals (anything created via `@preact/signals-core`) to connected clients in real-time. Signals on the server are serialized with identity markers, and the client reconstructs them as local signals that stay in sync via a lightweight wire protocol.
 
 - **Server** models use `createModel()` from `mixed-signals/server` _(a thin wrapper around `@preact/signals-core`'s `createModel`)_
-- **Client** models use `createReflectedModel()` from `mixed-signals/client` to create local proxies that mirror server state
+- **Client** models are proxy facades created automatically from the server-sent model definition; no client-side model registry is required
 - An **RPC** layer handles method calls (client → server) and signal updates (server → client)
 - Delta compression for arrays (append), objects (merge), and strings (append) minimizes bandwidth
 
@@ -74,23 +74,20 @@ wss.on("connection", (ws, request) => {
 
 ```tsx
 import { useSignal } from "@preact/signals";
-import { RPCClient, createReflectedModel } from "mixed-signals/client";
-import type { Todo, Todos } from "./server.ts";
+import { RPCClient } from "mixed-signals/client";
+import type { Todos } from "./server.ts";
 
-const TodoModel = createReflectedModel<Todo>(["text", "done"], ["toggle"]);
-const TodosModel = createReflectedModel<Todos>(["all"], ["add"]);
+type Root = { todos: Todos };
 
 const ws = new WebSocket("/rpc");
-const rpc = new RPCClient({
+const rpc = new RPCClient<Root>({
   send: ws.send.bind(ws),
   onMessage: ws.addEventListener.bind(ws, "message"),
   onClose: (cb) => ws.addEventListener("close", () => cb(), { once: true }),
   ready: new Promise((r) => ws.addEventListener("open", r, { once: true })),
-}, {});
-rpc.registerModel("Todo", TodoModel);
-rpc.registerModel("Todos", TodosModel);
+});
 
-function Demo({ ctx }) {
+function Demo({ ctx }: { ctx: RPCClient<Root>["root"] }) {
   const text = useSignal('');
 
   function add(e) {
@@ -101,7 +98,7 @@ function Demo({ ctx }) {
 
   return <>
     <ul>
-      <For each={todos.all}>
+      <For each={ctx.todos.all}>
         {todo => (
           <li>
             <input type="checkbox" checked={todo.done} />
@@ -120,6 +117,22 @@ rpc.ready.then(() => {
   render(<Demo ctx={rpc.root} />, document.body);
 });
 ```
+
+If you do not want to pass the root type at each construction site, augment the client module once:
+
+```ts
+import type { Todos } from "./server.ts";
+
+declare module "mixed-signals/client" {
+  interface ReflectedRoot {
+    todos: Todos;
+  }
+}
+
+const rpc = new RPCClient(transport); // rpc.root is typed from ReflectedRoot
+```
+
+`createReflectedModel()` is still exported for older clients that prefer declared reflected facades, and `registerModel()` remains the custom-facade escape hatch. Ordinary reflected models need neither. Unknown model types are safe: the client builds a proxy from the received signal properties, and a missing method call rejects with the server's `Method not found` error.
 
 ## Reconnects
 
@@ -196,13 +209,32 @@ forwarded — no per-model declaration needed.
 
 - Kind: **Function**
 - Signatures:
-  - `(signalProps: string[], methods: string[]) => ModelConstructor<T, tuple>`
+  - `(signalProps?: readonly string[], methods: readonly string[]) => ModelConstructor<T, tuple>`
+
+#### `Reflected`
+
+- Kind: **Type alias**
+- Client-side shape for a server value after mixed-signals reflection.
+Signals become read-only client signals and methods become async RPC calls.
+- Type: `conditional`
+
+#### `ReflectedModel`
+
+- Kind: **Type alias**
+- Client-side facade shape for a reflected server model instance.
+- Type: `ReflectedObject<T> & { id: ReadonlySignal<string> }`
+
+#### `ReflectedRoot`
+
+- Kind: **Interface**
+- Declaration-merging hook for projects that want a typed `RPCClient.root`
+without passing a generic at every construction site.
 
 #### `RPCClient`
 
 - Kind: **Class**
 - Constructor:
-  - `new RPCClient(transport: Transport, ctx?: any) => RPCClient`
+  - `new RPCClient(transport: Transport, ctx?: any) => RPCClient<TRoot>`
 - Methods:
   - `call(method: string, params?: any) => Promise<any>`
   - `expose(root: any) => void` — Publish an object as the dispatch target for peer-issued method
@@ -218,12 +250,13 @@ root.
   - `reconnect(transport: Transport) => void` — Replace the transport for a reconnection. Cached roots, signals and model
 facades are kept alive so the next `@R` snapshot can refresh/rebind them,
 then currently watched signals are replayed on the new connection.
-  - `registerModel(typeName: string, ctor: any) => void`
+  - `registerModel(typeName: string, ctor?: (ctx: any, data: any) => any) => void` — Optionally register a custom facade constructor for a server model type.
+Unregistered model types are reflected with proxy facades automatically.
 - Properties:
   - `connectionId: string | undefined` — Opaque server-assigned id that can be sent back on a future reconnect.
   - `connectionInfo: ConnectionInfo | undefined` — Metadata from the server process that sent the latest root snapshot.
   - `ready: Promise<void>`
-  - `root: any`
+  - `root: Reflected<TRoot>`
 
 ### Shared
 

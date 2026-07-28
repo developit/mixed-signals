@@ -140,6 +140,35 @@ describe('Integration: Server <-> Client', () => {
     expect(rpcClient.root.id.peek()).toBe('0');
   });
 
+  it('reflects unregistered root models as proxy facades', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    root.count.value = 4;
+    rpc.expose({counter: root});
+
+    const {serverTransport, clientTransport, flush} =
+      createLinkedTransportPair();
+    const rpcClient = new RPCClient(clientTransport);
+    rpc.addClient(serverTransport, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    expect(rpcClient.root.counter.id.peek()).toBe('1');
+    expect(rpcClient.root.counter.count.peek()).toBe(4);
+    expect(typeof rpcClient.root.counter.increment).toBe('function');
+
+    const increment = rpcClient.root.counter.increment();
+    await flush();
+    await increment;
+    expect(root.count.peek()).toBe(5);
+
+    const missing = rpcClient.root.counter.notActuallyAMethod();
+    await flush();
+    await expect(missing).rejects.toThrow('Method not found');
+  });
+
   it('client root has correct signal values', async () => {
     vi.useFakeTimers();
     const rpc = new RPC();
