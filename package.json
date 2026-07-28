@@ -31,7 +31,7 @@
     "docs:api": "node scripts/generate-readme.mjs",
     "prepublishOnly": "tsdown && node scripts/generate-readme.mjs",
     "changeset": "changeset",
-    "version-packages": "changeset version",
+    "version": "changeset version && pnpm install --lockfile-only",
     "release": "changeset publish"
   },
   "publishConfig": {
