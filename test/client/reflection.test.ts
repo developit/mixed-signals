@@ -22,6 +22,7 @@ function setup() {
   const rpc = {
     notify,
     call: vi.fn(async () => undefined),
+    syncSignalIdentity: vi.fn((_previous, next) => next),
   } satisfies Partial<RPCClient> as unknown as RPCClient;
   const ctx = {rpc};
   const reflection = new ClientReflection(rpc);
@@ -282,10 +283,10 @@ describe('ClientReflection', () => {
         'Model missing @M field',
       );
 
-      // Unknown type throws
-      expect(() => reflection.createModelFacade({'@M': 'Unknown#1'})).toThrow(
-        'Unknown model type',
-      );
+      // Unknown types are reflected automatically.
+      expect(() =>
+        reflection.createModelFacade({'@M': 'Unknown#1'}),
+      ).not.toThrow();
     });
 
     it('reuses cached facades for repeated model markers', () => {
@@ -325,11 +326,55 @@ describe('ClientReflection', () => {
       );
     });
 
-    it('throws on unknown model type', () => {
+    it('creates proxy facades for unregistered model types', async () => {
+      const {reflection, rpc} = setup();
+      const title = reflection.getOrCreateSignal(99, 'Ship');
+
+      const facade = reflection.createModelFacade({
+        '@M': 'Nonexistent#1',
+        id: 'server-id',
+        plain: 'ignored',
+        title,
+      });
+
+      expect(facade.id.peek()).toBe('1');
+      expect(facade.title.peek()).toBe('Ship');
+      expect(Object.hasOwn(facade, 'plain')).toBe(false);
+
+      title.value = 'Shipped';
+      expect(facade.title.peek()).toBe('Shipped');
+
+      expect(facade.then).toBeUndefined();
+      expect(Object.prototype.toString.call(facade)).toBe(
+        '[object Nonexistent]',
+      );
+      expect(facade.rename).toBe(facade.rename);
+
+      await facade.rename('next');
+      expect(rpc.call).toHaveBeenCalledWith('1#rename', ['next']);
+
+      await facade['0']('zero');
+      expect(rpc.call).toHaveBeenCalledWith('1#0', ['zero']);
+    });
+
+    it('refreshes unregistered proxy facades in place', () => {
       const {reflection} = setup();
-      expect(() =>
-        reflection.createModelFacade({'@M': 'Nonexistent#1'}),
-      ).toThrow('Unknown model type');
+      const firstTitle = reflection.getOrCreateSignal(1, 'First');
+      const facade = reflection.createModelFacade({
+        '@M': 'Unknown#1',
+        title: firstTitle,
+      });
+      const title = facade.title;
+
+      const nextTitle = reflection.getOrCreateSignal(2, 'Second');
+      const refreshed = reflection.createModelFacade({
+        '@M': 'Unknown#1',
+        title: nextTitle,
+      });
+
+      expect(refreshed).toBe(facade);
+      expect(refreshed.title).toBe(title);
+      expect(refreshed.title.peek()).toBe('Second');
     });
 
     it('caches facade - same @M returns same object', () => {
