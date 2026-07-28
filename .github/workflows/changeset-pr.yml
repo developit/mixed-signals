@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   changeset:
+    if: ${{ !startsWith(github.head_ref, 'changeset-release/') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
