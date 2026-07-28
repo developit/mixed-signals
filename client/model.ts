@@ -10,6 +10,11 @@ import type {WireContext} from './reflection.ts';
 
 type AnyFunction = (...args: any[]) => any;
 
+// Guard before the object branch so branded primitives like `string & {}`
+// (the autocomplete-friendly union trick) map to themselves instead of being
+// treated as objects.
+type Primitive = string | number | boolean | bigint | symbol | null | undefined;
+
 type ReflectedMethod<T extends AnyFunction> = (
   ...args: Parameters<T>
 ) => Promise<Reflected<Awaited<ReturnType<T>>>>;
@@ -22,11 +27,13 @@ type ReflectedSignalValue<T> = T extends AnyFunction
   ? ReflectedMethod<T>
   : T extends ReadonlySignal<infer Value>
     ? ReadonlySignal<ReflectedSignalValue<Value>>
-    : T extends readonly (infer Item)[]
-      ? ReflectedSignalValue<Item>[]
-      : T extends object
-        ? ReflectedObject<T>
-        : T;
+    : T extends Primitive
+      ? T
+      : T extends readonly (infer Item)[]
+        ? ReflectedSignalValue<Item>[]
+        : T extends object
+          ? ReflectedObject<T>
+          : T;
 
 /**
  * Client-side shape for a server value after mixed-signals reflection.
@@ -37,11 +44,13 @@ export type Reflected<T> =
     ? ReadonlySignal<ReflectedSignalValue<Value>>
     : T extends AnyFunction
       ? ReflectedMethod<T>
-      : T extends readonly (infer Item)[]
-        ? Reflected<Item>[]
-        : T extends object
-          ? ReflectedObject<T>
-          : T;
+      : T extends Primitive
+        ? T
+        : T extends readonly (infer Item)[]
+          ? Reflected<Item>[]
+          : T extends object
+            ? ReflectedObject<T>
+            : T;
 
 /** Client-side facade shape for a reflected server model instance. */
 export type ReflectedModel<T extends object = Record<string, unknown>> =
