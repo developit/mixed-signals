@@ -1,10 +1,21 @@
-import {type Signal, signal} from '@preact/signals-core';
-import {describe, expect, it, vi} from 'vitest';
-import {createReflectedModel} from '../../client/model.ts';
+import {type Model, type Signal, signal} from '@preact/signals-core';
+import {describe, expect, expectTypeOf, it, vi} from 'vitest';
+import {createReflectedModel, type Reflected} from '../../client/model.ts';
 import type {WireContext} from '../../client/reflection.ts';
 import type {RPCClient} from '../../client/rpc.ts';
 
 describe('createReflectedModel', () => {
+  it('omits local model symbols from reflected object types', () => {
+    interface Counter {
+      count: Signal<number>;
+      increment(amount: number): number;
+    }
+
+    expectTypeOf<Reflected<Model<Counter>>>().toEqualTypeOf<
+      Reflected<Counter>
+    >();
+  });
+
   it('exposes id signal with wireId value', () => {
     const Model = createReflectedModel<{id: Signal<string>}>([], []);
     const ctx = {
