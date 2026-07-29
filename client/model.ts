@@ -20,7 +20,9 @@ export type ReflectedMethod<T extends AnyFunction> = (
 ) => Promise<Reflected<Awaited<ReturnType<T>>>>;
 
 export type ReflectedObject<T extends object> = {
-  readonly [Key in keyof T]: Reflected<T[Key]>;
+  readonly [Key in keyof T as Key extends symbol ? never : Key]: Reflected<
+    T[Key]
+  >;
 };
 
 type ReflectedSignalValue<T> = T extends AnyFunction
