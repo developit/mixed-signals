@@ -63,7 +63,15 @@ export class Reflection {
 
     if ('id' in instance) {
       const id = instance.id;
-      return String(id instanceof Signal ? id.peek() : id);
+      const resolved = String(id instanceof Signal ? id.peek() : id);
+      // Wire ids are embedded in call frames ("M1:<id>#method:...") and model
+      // markers ("Type#<id>"), so these delimiters would corrupt parsing.
+      if (resolved.includes('#') || resolved.includes(':')) {
+        throw new Error(
+          `Model id "${resolved}" must not contain "#" or ":" (reserved by the wire format)`,
+        );
+      }
+      return resolved;
     }
 
     let id = this.autoIds.get(instance);
@@ -199,10 +207,19 @@ export class Reflection {
       const sig = this.signals.get(signalId);
       if (sig) {
         // The server only subscribes to source signals once a client cares.
+        // Subscribing notifies immediately, which doubles as catch-up for
+        // this first watcher.
         const unsubscribe = sig.subscribe(() => {
           this.notifySubscribers(signalId);
         });
         this.signalUnsubscribers.set(signalId, unsubscribe);
+      }
+    } else {
+      // A live subscription only forwards future changes. A client joining it
+      // may have missed updates while unwatched, so send a catch-up delta.
+      const sig = this.signals.get(signalId);
+      if (sig) {
+        this.sendUpdateIfChanged(clientId, signalId, sig.peek());
       }
     }
   }
@@ -243,23 +260,31 @@ export class Reflection {
     const newValue = sig.peek();
 
     for (const clientId of clients) {
-      const lastValue = this.lastSentValues.get(`${clientId}:${signalId}`);
-      if (lastValue === newValue) continue;
-
-      const update = this.computeDelta(lastValue, newValue);
-      if (!update) continue;
-
-      const serializedValue = this.serialize(update.value, clientId);
-      const params = update.mode
-        ? [signalId, serializedValue, update.mode]
-        : [signalId, serializedValue];
-
-      this.rpc.send(
-        clientId,
-        formatNotificationMessage(SIGNAL_UPDATE_METHOD, params),
-      );
-      this.lastSentValues.set(`${clientId}:${signalId}`, newValue);
+      this.sendUpdateIfChanged(clientId, signalId, newValue);
     }
+  }
+
+  private sendUpdateIfChanged(
+    clientId: ClientId,
+    signalId: SignalId,
+    newValue: any,
+  ) {
+    const lastValue = this.lastSentValues.get(`${clientId}:${signalId}`);
+    if (lastValue === newValue) return;
+
+    const update = this.computeDelta(lastValue, newValue);
+    if (!update) return;
+
+    const serializedValue = this.serialize(update.value, clientId);
+    const params = update.mode
+      ? [signalId, serializedValue, update.mode]
+      : [signalId, serializedValue];
+
+    this.rpc.send(
+      clientId,
+      formatNotificationMessage(SIGNAL_UPDATE_METHOD, params),
+    );
+    this.lastSentValues.set(`${clientId}:${signalId}`, newValue);
   }
 
   /**

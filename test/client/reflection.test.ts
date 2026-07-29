@@ -305,6 +305,23 @@ describe('ClientReflection', () => {
       expect(facade1).toBe(facade2);
     });
 
+    it('exposes nested model facades as properties on proxy facades', () => {
+      const {reflection} = setup();
+      const branch = reflection.getOrCreateSignal(5, 'main');
+      const vcs = reflection.createModelFacade({'@M': 'Vcs#t1:vcs', branch});
+      const status = reflection.getOrCreateSignal(6, 'running');
+
+      const task = reflection.createModelFacade({'@M': 'Task#t1', status, vcs});
+
+      expect(task.vcs).toBe(vcs);
+      expect(task.vcs.branch.peek()).toBe('main');
+
+      // A refresh replaces the nested facade rather than shadowing it.
+      const nextVcs = reflection.createModelFacade({'@M': 'Vcs#t2:vcs'});
+      reflection.createModelFacade({'@M': 'Task#t1', status, vcs: nextVcs});
+      expect(task.vcs).toBe(nextVcs);
+    });
+
     it('creates facade from serialized data with @M marker', () => {
       const {reflection} = setup();
       reflection.registerModel('Counter', ReflectedCounter);

@@ -10,11 +10,16 @@ import type {WireContext} from './reflection.ts';
 
 type AnyFunction = (...args: any[]) => any;
 
-type ReflectedMethod<T extends AnyFunction> = (
+// Guard before the object branch so branded primitives like `string & {}`
+// (the autocomplete-friendly union trick) map to themselves instead of being
+// treated as objects.
+type Primitive = string | number | boolean | bigint | symbol | null | undefined;
+
+export type ReflectedMethod<T extends AnyFunction> = (
   ...args: Parameters<T>
 ) => Promise<Reflected<Awaited<ReturnType<T>>>>;
 
-type ReflectedObject<T extends object> = {
+export type ReflectedObject<T extends object> = {
   readonly [Key in keyof T as Key extends symbol ? never : Key]: Reflected<
     T[Key]
   >;
@@ -24,11 +29,13 @@ type ReflectedSignalValue<T> = T extends AnyFunction
   ? ReflectedMethod<T>
   : T extends ReadonlySignal<infer Value>
     ? ReadonlySignal<ReflectedSignalValue<Value>>
-    : T extends readonly (infer Item)[]
-      ? ReflectedSignalValue<Item>[]
-      : T extends object
-        ? ReflectedObject<T>
-        : T;
+    : T extends Primitive
+      ? T
+      : T extends readonly (infer Item)[]
+        ? ReflectedSignalValue<Item>[]
+        : T extends object
+          ? ReflectedObject<T>
+          : T;
 
 /**
  * Client-side shape for a server value after mixed-signals reflection.
@@ -39,11 +46,13 @@ export type Reflected<T> =
     ? ReadonlySignal<ReflectedSignalValue<Value>>
     : T extends AnyFunction
       ? ReflectedMethod<T>
-      : T extends readonly (infer Item)[]
-        ? Reflected<Item>[]
-        : T extends object
-          ? ReflectedObject<T>
-          : T;
+      : T extends Primitive
+        ? T
+        : T extends readonly (infer Item)[]
+          ? Reflected<Item>[]
+          : T extends object
+            ? ReflectedObject<T>
+            : T;
 
 /** Client-side facade shape for a reflected server model instance. */
 export type ReflectedModel<T extends object = Record<string, unknown>> =
@@ -207,7 +216,12 @@ export function createReflectedModelFacade<T = any>(
       ? options.signalProps.map((prop) => [prop, nextData[prop]] as const)
       : Object.entries(nextData);
     for (const [prop, value] of entries) {
-      if (value instanceof Signal) setSignal(prop, value);
+      if (value instanceof Signal) {
+        setSignal(prop, value);
+      } else if (value?.[REFRESH_REFLECTED_MODEL]) {
+        // Nested reflected models are exposed directly as facade properties.
+        defineValue(target, prop, value);
+      }
     }
   };
 

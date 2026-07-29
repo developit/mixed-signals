@@ -163,7 +163,12 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
           return;
         }
 
-        pending.reject(new Error((parsed as {message?: string}).message));
+        // Restore any application metadata the server attached to the error.
+        const {message: errorMessage, ...errorProps} = (parsed ?? {}) as {
+          message?: string;
+          [key: string]: unknown;
+        };
+        pending.reject(Object.assign(new Error(errorMessage), errorProps));
         return;
       }
 
