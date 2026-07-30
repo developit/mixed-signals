@@ -440,7 +440,7 @@ export class ClientReflection {
     // stable for ergonomics, but unbranded nested objects/arrays are replaced.
     if (isPlainObject(previousRoot) && isPlainObject(nextRoot)) {
       for (const key of Object.keys(previousRoot)) {
-        if (!(key in nextRoot)) {
+        if (!Object.hasOwn(nextRoot, key)) {
           delete previousRoot[key];
         }
       }

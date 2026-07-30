@@ -378,6 +378,53 @@ describe('Integration: Server <-> Client', () => {
     expect(rpcClient.root.meta.peek()).toEqual({version: 1, status: 'updated'});
   });
 
+  it('object delta preserves key removal alongside another change end-to-end', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    root.meta.value = {a: 1, b: 2};
+    rpc.expose(root);
+
+    const {rpcClient, flush} = connect(rpc, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    rpcClient.root.meta.subscribe(() => undefined);
+    vi.advanceTimersByTime(10);
+    await flush();
+
+    // `a` is removed at the same time as `b` changes.
+    root.meta.value = {b: 3};
+    await flush();
+
+    expect(rpcClient.root.meta.peek()).toEqual({b: 3});
+  });
+
+  it('object delta preserves key removal when a nested value is rebuilt end-to-end', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    root.meta.value = {a: 1, b: {n: 1}};
+    rpc.expose(root);
+
+    const {rpcClient, flush} = connect(rpc, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    rpcClient.root.meta.subscribe(() => undefined);
+    vi.advanceTimersByTime(10);
+    await flush();
+
+    // `a` is removed while `b` is replaced by a fresh but deep-equal object,
+    // as happens for any consumer that rebuilds state from JSON.
+    root.meta.value = {b: {n: 1}};
+    await flush();
+
+    expect(rpcClient.root.meta.peek()).toEqual({b: {n: 1}});
+  });
+
   it('full replacement when delta does not apply', async () => {
     vi.useFakeTimers();
     const rpc = new RPC();

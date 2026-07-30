@@ -601,4 +601,24 @@ describe('ClientReflection', () => {
       expect(sig.peek()).toBe('replaced');
     });
   });
+
+  describe('reconcileRoot', () => {
+    it('deletes keys absent from the next root and keeps the root identity', () => {
+      const {reflection} = setup();
+      const previousRoot = {a: 1, b: 2};
+      const result = reflection.reconcileRoot(previousRoot, {a: 1});
+      expect(result).toBe(previousRoot);
+      expect(result).toEqual({a: 1});
+      expect(Object.hasOwn(result, 'b')).toBe(false);
+    });
+
+    it('deletes removed keys that shadow Object.prototype properties', () => {
+      const {reflection} = setup();
+      const previousRoot = {version: 1, toString: 'user-data'};
+      const result = reflection.reconcileRoot(previousRoot, {version: 2});
+      expect(result).toBe(previousRoot);
+      expect(result).toEqual({version: 2});
+      expect(Object.hasOwn(result, 'toString')).toBe(false);
+    });
+  });
 });
