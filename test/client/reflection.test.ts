@@ -109,8 +109,10 @@ describe('ClientReflection', () => {
       stop1();
       stop2();
 
-      vi.advanceTimersByTime(10);
+      vi.advanceTimersByTime(999);
+      expect(notify).not.toHaveBeenCalled();
 
+      vi.advanceTimersByTime(1);
       expect(notify).toHaveBeenCalledTimes(1);
       expect(notify).toHaveBeenCalledWith(UNWATCH_SIGNALS_METHOD, [1, 2]);
     });
@@ -128,15 +130,34 @@ describe('ClientReflection', () => {
       notify.mockClear();
 
       stop();
-      vi.advanceTimersByTime(5);
+      vi.advanceTimersByTime(999);
 
       sig.subscribe(() => {});
-      vi.advanceTimersByTime(20);
+      vi.advanceTimersByTime(1000);
 
-      expect(notify).not.toHaveBeenCalledWith(
-        UNWATCH_SIGNALS_METHOD,
-        expect.anything(),
-      );
+      expect(notify).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('suppresses wire traffic across repeated short unwatch cycles', () => {
+      vi.useFakeTimers();
+      const {reflection, notify} = setup();
+      const sig = reflection.getOrCreateSignal(1, 'val');
+      let stop = sig.subscribe(() => {});
+
+      vi.advanceTimersByTime(10);
+      expect(notify).toHaveBeenCalledWith(WATCH_SIGNALS_METHOD, [1]);
+      notify.mockClear();
+
+      for (let cycle = 0; cycle < 3; cycle++) {
+        stop();
+        vi.advanceTimersByTime(250);
+        stop = sig.subscribe(() => {});
+      }
+
+      vi.advanceTimersByTime(1000);
+      expect(notify).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
     });
 
     it('schedules @W notification when signal is watched', () => {
@@ -169,7 +190,7 @@ describe('ClientReflection', () => {
       expect(notify).toHaveBeenCalledWith(WATCH_SIGNALS_METHOD, [1, 2, 3]);
     });
 
-    it('schedules @U after the global watch flush delay', () => {
+    it('schedules @U after the longer global unwatch window', () => {
       vi.useFakeTimers();
       const {reflection, notify} = setup();
 
@@ -181,8 +202,40 @@ describe('ClientReflection', () => {
       notify.mockClear();
 
       stop();
+      vi.advanceTimersByTime(999);
+      expect(notify).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(1);
+      expect(notify).toHaveBeenCalledWith(UNWATCH_SIGNALS_METHOD, [1]);
+    });
+
+    it('flushes watches promptly while an unwatch is pending', () => {
+      vi.useFakeTimers();
+      const {reflection, notify} = setup();
+
+      const first = reflection.getOrCreateSignal(1, 'a');
+      const second = reflection.getOrCreateSignal(2, 'b');
+      const stopFirst = first.subscribe(() => {});
+
+      vi.advanceTimersByTime(10);
+      notify.mockClear();
+
+      stopFirst();
+      vi.advanceTimersByTime(500);
+      second.subscribe(() => {});
+      expect(vi.getTimerCount()).toBe(2);
+
       vi.advanceTimersByTime(10);
 
+      expect(vi.getTimerCount()).toBe(1);
+      expect(notify).toHaveBeenCalledTimes(1);
+      expect(notify).toHaveBeenCalledWith(WATCH_SIGNALS_METHOD, [2]);
+      expect(notify).not.toHaveBeenCalledWith(
+        UNWATCH_SIGNALS_METHOD,
+        expect.anything(),
+      );
+
+      vi.advanceTimersByTime(490);
       expect(notify).toHaveBeenCalledWith(UNWATCH_SIGNALS_METHOD, [1]);
     });
 
@@ -212,9 +265,10 @@ describe('ClientReflection', () => {
       stop();
       sig.subscribe(() => {});
 
-      vi.advanceTimersByTime(10);
+      vi.advanceTimersByTime(1000);
 
       expect(notify).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
     });
 
     it('flushes later transitions in the active global window', () => {
@@ -238,7 +292,7 @@ describe('ClientReflection', () => {
       expect(vi.getTimerCount()).toBe(0);
     });
 
-    it('uses one global watch timer for many signal transitions', () => {
+    it('uses one global timer per direction for many signal transitions', () => {
       vi.useFakeTimers();
       const first = setup();
       const second = setup();
@@ -260,7 +314,10 @@ describe('ClientReflection', () => {
 
       expect(vi.getTimerCount()).toBe(1);
 
-      vi.advanceTimersByTime(10);
+      vi.advanceTimersByTime(1000);
+
+      expect(first.notify).toHaveBeenCalledWith(UNWATCH_SIGNALS_METHOD, [1, 2]);
+      expect(second.notify).toHaveBeenCalledWith(UNWATCH_SIGNALS_METHOD, [3]);
       expect(vi.getTimerCount()).toBe(0);
     });
   });
@@ -499,19 +556,29 @@ describe('ClientReflection', () => {
       expect(facade).toBeInstanceOf(TaskModel);
     });
 
-    it('cancels pending watch/unwatch timers', () => {
+    it('cancels pending watch and unwatch timers', () => {
       vi.useFakeTimers();
-      const {reflection, notify} = setup();
+      const first = setup();
+      const pendingWatch = first.reflection.getOrCreateSignal(1, 'watch');
+      pendingWatch.subscribe(() => {});
 
-      const sig = reflection.getOrCreateSignal(1, 'val');
-      sig.subscribe(() => {});
-      // Watch is pending (10ms timer not yet fired)
-
-      reflection.reset();
-
+      first.reflection.reset();
       vi.advanceTimersByTime(10);
-      // The pending watch timer should have been cancelled
-      expect(notify).not.toHaveBeenCalled();
+
+      expect(first.notify).not.toHaveBeenCalled();
+
+      const second = setup();
+      const pendingUnwatch = second.reflection.getOrCreateSignal(2, 'unwatch');
+      const stop = pendingUnwatch.subscribe(() => {});
+      vi.advanceTimersByTime(10);
+      second.notify.mockClear();
+      stop();
+
+      second.reflection.reset();
+      vi.advanceTimersByTime(1000);
+
+      expect(second.notify).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
     });
   });
 
