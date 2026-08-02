@@ -3,6 +3,11 @@ export interface Transport {
   onMessage(cb: (data: {toString(): string}) => void): void;
   onClose?(cb: (error?: unknown) => void): void;
   onOpen?(cb: () => void): void;
+  /**
+   * Close the underlying connection. The client calls this when it gives up
+   * on a stale transport, so the dead connection doesn't linger.
+   */
+  close?(): void;
   ready?: Promise<void>;
 }
 

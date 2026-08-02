@@ -218,11 +218,21 @@ forwarded — no per-model declaration needed.
 Signals become read-only client signals and methods become async RPC calls.
 - Type: `conditional`
 
+#### `ReflectedMethod`
+
+- Kind: **Type alias**
+- Type: `(args: Parameters<T>) => Promise<Reflected<Awaited<ReturnType<T>>>>`
+
 #### `ReflectedModel`
 
 - Kind: **Type alias**
 - Client-side facade shape for a reflected server model instance.
 - Type: `ReflectedObject<T> & { id: ReadonlySignal<string> }`
+
+#### `ReflectedObject`
+
+- Kind: **Type alias**
+- Type: `mapped`
 
 #### `ReflectedRoot`
 
@@ -234,7 +244,7 @@ without passing a generic at every construction site.
 
 - Kind: **Class**
 - Constructor:
-  - `new RPCClient(transport: Transport, ctx?: any) => RPCClient<TRoot>`
+  - `new RPCClient(transport: Transport, ctx?: any, options?: RPCClientOptions) => RPCClient<TRoot>`
 - Methods:
   - `call(method: string, params?: any) => Promise<any>`
   - `expose(root: any) => void` — Publish an object as the dispatch target for peer-issued method
@@ -258,6 +268,27 @@ Unregistered model types are reflected with proxy facades automatically.
   - `ready: Promise<void>`
   - `root: Reflected<TRoot>`
 
+#### `RPCClientOptions`
+
+- Kind: **Interface**
+- Properties:
+  - `staleTimeout: number | false` — How long a call may wait with zero inbound traffic before the transport
+is presumed dead. When the deadline passes, pending calls reject, the
+normal disconnect lifecycle runs, and `transport.close()` is called if
+the transport provides it.
+
+This exists because a connection can go half-open: the network path is
+gone (laptop slept, NAT entry expired, server died without a FIN) but no
+close event fires, sometimes for minutes. Browsers don't expose
+WebSocket ping/pong to JavaScript, so without a deadline a call issued
+on such a socket waits forever.
+
+Any inbound frame resets the clock, so a slow response on a connection
+that is otherwise delivering traffic is not treated as staleness.
+Defaults to 30 seconds. Set to `false` for transports that can't go
+half-open, like a MessagePort to a worker, where blocking past the
+deadline is legitimate.
+
 ### Shared
 
 #### `ConnectionInfo`
@@ -272,6 +303,8 @@ Unregistered model types are reflected with proxy facades automatically.
 
 - Kind: **Interface**
 - Methods:
+  - `close() => void` — Close the underlying connection. The client calls this when it gives up
+on a stale transport, so the dead connection doesn't linger.
   - `onClose(cb: (error?: unknown) => void) => void`
   - `onMessage(cb: (data: { toString: unknown }) => void) => void`
   - `onOpen(cb: () => void) => void`
