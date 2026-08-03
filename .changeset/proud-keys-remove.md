@@ -10,7 +10,8 @@ sent to the client — and the client's additive `{...current, ...value}` merge
 kept the stale key until the next full replacement. The object branch now
 scans the previous value's keys first and falls back to a full replacement
 whenever any key leaves the wire — removed outright, or set to a value
-serialization drops (`undefined` or a function) — since a merge delta cannot
+serialization drops (`undefined`, a function, or a symbol) — since a merge
+delta cannot
 express deletion. Keys whose values were never serialized don't force a
 replacement when they disappear. Pure additions and value changes still
 produce `merge` deltas, and identical rebuilt objects still produce no

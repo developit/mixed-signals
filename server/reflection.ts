@@ -19,9 +19,14 @@ type ModelConstructor =
     ) => any)
   | ((...args: any[]) => any);
 
-// Values serializeValue drops entirely, so their keys never appear on the wire.
+// Values whose keys never appear on the wire: serializeValue drops undefined
+// and functions, and the JSON round trip in serialize() drops symbols.
 function isWireDropped(value: any): boolean {
-  return value === undefined || typeof value === 'function';
+  return (
+    value === undefined ||
+    typeof value === 'function' ||
+    typeof value === 'symbol'
+  );
 }
 
 export class Reflection {

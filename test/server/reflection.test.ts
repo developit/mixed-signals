@@ -601,6 +601,40 @@ describe('Reflection', () => {
       expect(mode).toBeUndefined();
     });
 
+    it('sends full replacement when a value becomes a symbol', () => {
+      const clientId = 'c1';
+      const {counter, metaId} = setupCounter(reflection, instances, clientId);
+      reflection.watch(clientId, metaId);
+      counter.meta.value = {version: 1, tag: 'ok'};
+      sender.sent.length = 0;
+      counter.meta.value = {version: 1, tag: Symbol('gone')};
+      const relevant = sender.sent.filter((m) => m.clientId === clientId);
+      expect(relevant.length).toBeGreaterThan(0);
+      const [id, value, mode] = parseUpdate(
+        relevant[relevant.length - 1].message,
+      );
+      expect(id).toBe(metaId);
+      expect(value).toEqual({version: 1});
+      expect(mode).toBeUndefined();
+    });
+
+    it('sends merge when a symbol-valued key the wire never saw is removed', () => {
+      const clientId = 'c1';
+      const {counter, metaId} = setupCounter(reflection, instances, clientId);
+      reflection.watch(clientId, metaId);
+      counter.meta.value = {version: 1, tag: Symbol('hidden')};
+      sender.sent.length = 0;
+      counter.meta.value = {version: 2};
+      const relevant = sender.sent.filter((m) => m.clientId === clientId);
+      expect(relevant.length).toBeGreaterThan(0);
+      const [id, value, mode] = parseUpdate(
+        relevant[relevant.length - 1].message,
+      );
+      expect(id).toBe(metaId);
+      expect(value).toEqual({version: 2});
+      expect(mode).toBe('merge');
+    });
+
     it('sends merge when a key the wire never saw is removed', () => {
       const clientId = 'c1';
       const {counter, metaId} = setupCounter(reflection, instances, clientId);
