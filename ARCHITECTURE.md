@@ -156,7 +156,8 @@ signal while ≥1 client is watching, and pushes diffs via `N:@S:`.
 │                                 ┌──────────────────────────────┐            │
 │   JSON.parse(reviver) ────────▶ │ ClientReflection             │            │
 │    sees "@S" → calls            │  signals: Map<id,WeakRef>    │            │
-│    getOrCreateSignal(7,0)       │  watchBatch / unwatchBatch   │ ── 10ms ─▶ │
+│    getOrCreateSignal(7,0)       │  watchBatch ────────── 10ms ─┼──────────▶ │
+│                                 │  unwatchBatch ─ up to 1000ms ┼──────────▶ │
 │                                 └────────────┬─────────────────┘ global flush│
 │                                              │                              │
 │           ┌──────────────────────────────────┘                              │
@@ -266,15 +267,17 @@ The client also handles `splice` mode; the server doesn't currently emit it.
  component mounts
    effect reads s.value
      └─▶ watched()
+           unwatchBatch.delete(7)
            watchBatch.add(7)  ─── 10ms global flush ──▶  N:@W:7,8,12  ─▶  subs.get(7).add(client)
                                                                   if first watcher:
                                                                     sig.subscribe(notify)
  component unmounts
    effect disposed
      └─▶ unwatched()
-           unwatchBatch.add(7) ── 10ms global flush ─▶  N:@U:7
-             ▲                                             ▲
-             └─ a remount before the flush cancels it ─────┘
+           watchBatch.delete(7)
+           unwatchBatch.add(7) ── up to 1000ms global flush ──▶  N:@U:7
+             ▲                                                       ▲
+             └─ a remount before the flush cancels it ───────────────┘
  client disconnects
    cleanup()  ───────────────────────────────────────▶  clients.delete(id)
                                                         reflection.removeClient(id)
@@ -283,8 +286,16 @@ The client also handles `splice` mode; the server doesn't currently emit it.
                                                           - dispose source signal subscriptions
 ```
 
-Batching coalesces the "20 signals arrive in one response, 20 effects
-subscribe on the same tick" case into one `@W` frame.
+Two direction-specific global queues keep subscription latency and cleanup
+latency independent. The 10ms watch window coalesces the "20 signals arrive in
+one response, 20 effects subscribe on the same tick" case into one `@W` frame
+without leaving a gap where initial or accumulated deltas can be missed. The
+unwatch queue can wait up to 1000ms before sending `@U`, allowing a rewatch to
+remove the signal from the pending queue so transient unmount/remount cycles
+produce no extra wire traffic. These are global batching windows shared across
+all `ClientReflection` instances, so an unwatch joining an existing window may
+flush sooner than 1000ms. At most one watch timer and one unwatch timer are
+active process-wide; there are no per-signal timers.
 
 Client reflection caches are weak where the runtime supports `WeakRef` and
 `FinalizationRegistry`: signal id → signal, model marker → facade, and model →
