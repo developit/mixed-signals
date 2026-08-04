@@ -1096,4 +1096,123 @@ describe('RPCClient', () => {
       expect(count.peek()).toBe(6);
     });
   });
+
+  describe('stale transport detection', () => {
+    it('rejects pending calls and closes the transport after total inbound silence', async () => {
+      vi.useFakeTimers();
+      const transport = new FakeTransport();
+      const close = vi.spyOn(transport, 'close');
+      const client = new RPCClient(transport, createContext(), {
+        staleTimeout: 1000,
+      });
+      transport.emit('N:@R:{"value":"root-data"}');
+
+      const result = client.call('slow', []);
+      const rejected = vi.fn();
+      result.catch(rejected);
+
+      vi.advanceTimersByTime(999);
+      await Promise.resolve();
+      expect(rejected).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(1);
+      await expect(result).rejects.toThrow('Transport stale');
+      expect(close).toHaveBeenCalledTimes(1);
+      await expect(client.call('after', [])).rejects.toThrow('Transport stale');
+    });
+
+    it('defers staleness whenever any inbound frame arrives', async () => {
+      vi.useFakeTimers();
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext(), {
+        staleTimeout: 1000,
+      });
+      transport.emit('N:@R:{"value":"root-data"}');
+
+      const result = client.call('slow', []);
+      const rejected = vi.fn();
+      result.catch(rejected);
+
+      vi.advanceTimersByTime(600);
+      transport.emit('R999:1');
+      vi.advanceTimersByTime(999);
+      await Promise.resolve();
+      expect(rejected).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(1);
+      await expect(result).rejects.toThrow('Transport stale');
+    });
+
+    it('disarms while no calls are pending and re-arms per call', async () => {
+      vi.useFakeTimers();
+      const transport = new FakeTransport();
+      const close = vi.spyOn(transport, 'close');
+      const client = new RPCClient(transport, createContext(), {
+        staleTimeout: 1000,
+      });
+
+      const first = client.call('test', []);
+      transport.emit('R1:42');
+      expect(await first).toBe(42);
+
+      vi.advanceTimersByTime(10_000);
+      expect(close).not.toHaveBeenCalled();
+
+      const second = client.call('again', []);
+      transport.emit('R2:7');
+      expect(await second).toBe(7);
+    });
+
+    it('is disabled with staleTimeout: false', async () => {
+      vi.useFakeTimers();
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext(), {
+        staleTimeout: false,
+      });
+
+      const result = client.call('slow', []);
+      const rejected = vi.fn();
+      result.catch(rejected);
+
+      vi.advanceTimersByTime(600_000);
+      await Promise.resolve();
+      expect(rejected).not.toHaveBeenCalled();
+
+      transport.emit('R1:1');
+      expect(await result).toBe(1);
+    });
+
+    it('defaults to 30 seconds', async () => {
+      vi.useFakeTimers();
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      transport.emit('N:@R:{"value":"root-data"}');
+
+      const result = client.call('slow', []);
+      vi.advanceTimersByTime(30_000);
+
+      await expect(result).rejects.toThrow('Transport stale');
+    });
+
+    it('is superseded by a reconnect to a replacement transport', async () => {
+      vi.useFakeTimers();
+      const first = new FakeTransport();
+      const close = vi.spyOn(first, 'close');
+      const client = new RPCClient(first, createContext(), {
+        staleTimeout: 1000,
+      });
+
+      const stalled = client.call('slow', []);
+      const second = new FakeTransport();
+      client.reconnect(second);
+      await expect(stalled).rejects.toThrow('Transport reconnected');
+
+      vi.advanceTimersByTime(10_000);
+      expect(close).not.toHaveBeenCalled();
+
+      const result = client.call('fresh', []);
+      second.emit('R2:5');
+      expect(await result).toBe(5);
+    });
+  });
 });

@@ -7,4 +7,4 @@ export {
   type ReflectedObject,
   type ReflectedRoot,
 } from './model.ts';
-export {RPCClient} from './rpc.ts';
+export {RPCClient, type RPCClientOptions} from './rpc.ts';

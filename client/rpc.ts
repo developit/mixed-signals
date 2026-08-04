@@ -32,14 +32,41 @@ function isConnectionInfo(value: unknown): value is ConnectionInfo {
   );
 }
 
+export interface RPCClientOptions {
+  /**
+   * How long a call may wait with zero inbound traffic before the transport
+   * is presumed dead. When the deadline passes, pending calls reject, the
+   * normal disconnect lifecycle runs, and `transport.close()` is called if
+   * the transport provides it.
+   *
+   * This exists because a connection can go half-open: the network path is
+   * gone (laptop slept, NAT entry expired, server died without a FIN) but no
+   * close event fires, sometimes for minutes. Browsers don't expose
+   * WebSocket ping/pong to JavaScript, so without a deadline a call issued
+   * on such a socket waits forever.
+   *
+   * Any inbound frame resets the clock, so a slow response on a connection
+   * that is otherwise delivering traffic is not treated as staleness.
+   * Defaults to 30 seconds. Set to `false` for transports that can't go
+   * half-open, like a MessagePort to a worker, where blocking past the
+   * deadline is legitimate.
+   */
+  staleTimeout?: number | false;
+}
+
+const DEFAULT_STALE_TIMEOUT = 30_000;
+
 export class RPCClient<TRoot = DefaultReflectedRoot> {
   private transport: Transport;
   private transportGeneration = 0;
   private nextId = 1;
   private pending = new Map<
     number,
-    {resolve: (v: any) => void; reject: (e: any) => void}
+    {resolve: (v: any) => void; reject: (e: any) => void; sentAt: number}
   >();
+  private staleTimeout: number | false;
+  private staleTimer: ReturnType<typeof setTimeout> | undefined;
+  private lastInboundAt = 0;
   private notificationListeners = new Set<
     (method: string, params: any[]) => void
   >();
@@ -63,10 +90,11 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
   private _resolveReady!: () => void;
   private _rejectReady!: (reason?: unknown) => void;
 
-  constructor(transport: Transport, ctx?: any) {
+  constructor(transport: Transport, ctx?: any, options?: RPCClientOptions) {
     this.transport = transport;
     this.transportReady = transport.ready;
     this.reconnectable = !!transport.onOpen;
+    this.staleTimeout = options?.staleTimeout ?? DEFAULT_STALE_TIMEOUT;
     this.resetDisconnectPromise();
     this.ready = this.createReadyPromise();
     this.reflection = new ClientReflection(this, ctx);
@@ -84,6 +112,7 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
       reject(error);
     }
     this.pending.clear();
+    this.clearStaleTimer();
 
     this._rejectDisconnect(error);
 
@@ -117,6 +146,7 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
   }
 
   private wireTransport(transport: Transport, generation: number) {
+    this.lastInboundAt = Date.now();
     transport.ready?.then(
       () => this.handleOpen(generation),
       (error) => this.handleDisconnect(generation, error),
@@ -131,6 +161,8 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
       ) {
         return;
       }
+
+      this.lastInboundAt = Date.now();
 
       const message = parseWireMessage(data.toString());
       if (!message) return;
@@ -157,6 +189,9 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
         if (!pending) return;
 
         this.pending.delete(message.id);
+        if (this.pending.size === 0) {
+          this.clearStaleTimer();
+        }
 
         if (message.type === 'result') {
           pending.resolve(parsed);
@@ -393,8 +428,54 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
     }
 
     const id = this.nextId++;
-    this.pending.set(id, {resolve, reject});
+    this.pending.set(id, {resolve, reject, sentAt: Date.now()});
     transport.send(formatCallMessage(id, method, params || []));
+    this.watchForStaleTransport(generation);
+  }
+
+  private clearStaleTimer() {
+    if (this.staleTimer === undefined) return;
+    clearTimeout(this.staleTimer);
+    this.staleTimer = undefined;
+  }
+
+  // A transport is stale when the oldest pending call and the newest inbound
+  // frame are both older than staleTimeout. Sleep until the earliest time that
+  // could be true, then re-check: if traffic moved the deadline, sleep the
+  // difference; otherwise treat it as a disconnect. Calls and inbound frames
+  // only ever push the deadline later, so an armed timer never needs
+  // rescheduling, and no timer exists while nothing is pending.
+  private watchForStaleTransport(generation: number) {
+    if (this.staleTimeout === false || this.staleTimer !== undefined) return;
+    if (generation !== this.transportGeneration || this.closed) return;
+    const oldest = this.pending.values().next().value;
+    if (!oldest) return;
+
+    const deadline =
+      Math.max(this.lastInboundAt, oldest.sentAt) + this.staleTimeout;
+    const remaining = deadline - Date.now();
+    if (remaining > 0) {
+      this.staleTimer = setTimeout(() => {
+        this.staleTimer = undefined;
+        this.watchForStaleTransport(generation);
+      }, remaining);
+      // Don't hold a Node process open just to watch for staleness.
+      (this.staleTimer as {unref?(): void}).unref?.();
+      return;
+    }
+
+    const transport = this.transport;
+    this.handleDisconnect(
+      generation,
+      new Error(
+        `Transport stale: no inbound traffic for ${this.staleTimeout}ms with a call pending`,
+      ),
+    );
+    try {
+      transport.close?.();
+    } catch {
+      // Ignore close failures; the transport is already being discarded.
+    }
   }
 
   private handleOpen(generation: number) {
@@ -412,6 +493,7 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
   private handleDisconnect(generation: number, error?: unknown) {
     if (generation !== this.transportGeneration || this.closed) return;
 
+    this.clearStaleTimer();
     this.closed = true;
     this.disconnectError =
       error instanceof Error ? error : new Error('Transport disconnected');
