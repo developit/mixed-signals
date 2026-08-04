@@ -19,6 +19,16 @@ type ModelConstructor =
     ) => any)
   | ((...args: any[]) => any);
 
+// Values whose keys never appear on the wire: serializeValue drops undefined
+// and functions, and the JSON round trip in serialize() drops symbols.
+function isWireDropped(value: any): boolean {
+  return (
+    value === undefined ||
+    typeof value === 'function' ||
+    typeof value === 'symbol'
+  );
+}
+
 export class Reflection {
   private signalIds = new WeakMap<Signal<any>, SignalId>();
   private signals = new Map<SignalId, Signal<any>>();
@@ -318,26 +328,31 @@ export class Reflection {
       newValue &&
       typeof oldValue === 'object' &&
       typeof newValue === 'object' &&
-      !Array.isArray(oldValue)
+      !Array.isArray(oldValue) &&
+      !Array.isArray(newValue)
     ) {
+      // Merge deltas can only add or overwrite keys, so a key that leaves
+      // the wire — removed outright, or set to a value serialization drops —
+      // requires a full replacement.
+      for (const key of Object.keys(oldValue)) {
+        if (isWireDropped(oldValue[key])) continue;
+        if (!Object.hasOwn(newValue, key) || isWireDropped(newValue[key])) {
+          return {value: newValue};
+        }
+      }
+
       const changes: any = {};
       let hasChanges = false;
 
-      for (const key in newValue) {
+      for (const key of Object.keys(newValue)) {
         if (newValue[key] !== oldValue[key]) {
           changes[key] = newValue[key];
           hasChanges = true;
         }
       }
 
-      // No changed keys and no removed keys — no update needed.
-      if (!hasChanges) {
-        const oldKeys = Object.keys(oldValue);
-        const newKeys = Object.keys(newValue);
-        if (oldKeys.length === newKeys.length) return null;
-      }
-
-      if (hasChanges) return {value: changes, mode: 'merge'};
+      // Removals were ruled out above, so no changed keys means no update.
+      return hasChanges ? {value: changes, mode: 'merge'} : null;
     }
 
     if (
