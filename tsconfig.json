@@ -9,5 +9,11 @@
     "noEmit": true,
     "lib": ["ES2022", "DOM"]
   },
-  "include": ["shared/**/*", "server/**/*", "client/**/*", "test/**/*"]
+  "include": [
+    "shared/**/*",
+    "server/**/*",
+    "client/**/*",
+    "test/**/*",
+    "demos/**/*"
+  ]
 }
