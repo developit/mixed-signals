@@ -1,9 +1,11 @@
 import {
+  type ConnectionInfo,
   formatErrorMessage,
   formatNotificationMessage,
   formatResultMessage,
   parseWireMessage,
   parseWireParams,
+  REFRESH_MODELS_METHOD,
   ROOT_NOTIFICATION_METHOD,
   type Transport,
   UNWATCH_SIGNALS_METHOD,
@@ -29,9 +31,23 @@ function dlv(obj: any, path: string): any {
   return path.split('.').reduce((acc, key) => acc?.[key], obj);
 }
 
+const UNSAFE_SEGMENTS = new Set(['constructor', 'prototype', '__proto__']);
+
+// Underscore-prefixed properties are private by wire convention, and
+// constructor/prototype segments would let a path escape the exposed graph.
+function isUnsafeSegment(segment: string): boolean {
+  return (
+    segment.length === 0 ||
+    segment.startsWith('_') ||
+    UNSAFE_SEGMENTS.has(segment)
+  );
+}
+
 export class RPC {
   private reflection: Reflection;
   private clients = new Map<string, Transport>();
+  private connectionInfos = new Map<string, ConnectionInfo>();
+  private processId = crypto.randomUUID();
   private root: any;
 
   /** @internal */
@@ -69,6 +85,11 @@ export class RPC {
     const upstream = new ForwardedUpstream(prefix, transport, this);
     this.upstreams.set(prefix, upstream);
 
+    // Bind any already-connected clients to the new upstream
+    for (const clientId of this.clients.keys()) {
+      upstream.setClient(clientId);
+    }
+
     return () => {
       upstream.dispose();
       this.upstreams.delete(prefix);
@@ -77,7 +98,23 @@ export class RPC {
 
   addClient(transport: Transport, clientId?: string): () => void {
     const id = clientId ?? crypto.randomUUID();
+    const resumed = this.clients.has(id);
+
+    if (resumed) {
+      this.reflection.removeClient(id);
+      for (const upstream of this.upstreams.values()) {
+        upstream.removeClient(id);
+      }
+    }
+
     this.clients.set(id, transport);
+    this.connectionInfos.set(id, {
+      connectionId: id,
+      processId: this.processId,
+      resumed,
+    });
+
+    let disposed = false;
 
     // Bind this client to any upstream connections
     for (const upstream of this.upstreams.values()) {
@@ -85,11 +122,15 @@ export class RPC {
     }
 
     transport.onMessage(async (data) => {
+      // Ignore late frames from a transport that has since been replaced by a
+      // reconnect using the same opaque connection id.
+      if (this.clients.get(id) !== transport) return;
+
       try {
         const raw = data.toString();
 
         // Try forwarding first — if the message targets an upstream, handle it there.
-        if (this.tryForwardClientMessage(id, raw)) return;
+        if (this.tryForwardClientMessage(id, transport, raw)) return;
 
         const message = parseWireMessage(raw);
         if (!message || message.type === 'result' || message.type === 'error')
@@ -97,7 +138,13 @@ export class RPC {
 
         const params = parseWireParams(message.payload);
         const messageId = message.type === 'call' ? message.id : undefined;
-        await this.handleMessage(id, messageId, message.method, params);
+        await this.handleMessage(
+          id,
+          transport,
+          messageId,
+          message.method,
+          params,
+        );
       } catch (err: any) {
         console.error('Failed to handle message:', err);
       }
@@ -110,13 +157,28 @@ export class RPC {
       this.broadcastMergedRoot(id);
     }
 
-    return () => {
+    const cleanup = () => {
+      if (disposed) return;
+      disposed = true;
+
+      // If this client id has already reconnected, the old transport's close
+      // must not delete the replacement connection or its freshly replayed
+      // subscriptions.
+      if (this.clients.get(id) !== transport) return;
+
       this.clients.delete(id);
+      this.connectionInfos.delete(id);
       this.reflection.removeClient(id);
       for (const upstream of this.upstreams.values()) {
         upstream.removeClient(id);
       }
     };
+
+    transport.onClose?.(() => {
+      cleanup();
+    });
+
+    return cleanup;
   }
 
   /**
@@ -164,9 +226,13 @@ export class RPC {
     }
 
     if (merged !== undefined) {
+      const connectionInfo = this.connectionInfos.get(clientId);
       this.send(
         clientId,
-        formatNotificationMessage(ROOT_NOTIFICATION_METHOD, [merged]),
+        formatNotificationMessage(
+          ROOT_NOTIFICATION_METHOD,
+          connectionInfo ? [merged, connectionInfo] : [merged],
+        ),
       );
     }
   }
@@ -175,9 +241,22 @@ export class RPC {
    * Intercept a client message and forward it to an upstream if it targets
    * forwarded models/signals. Returns true if the message was forwarded.
    */
-  private tryForwardClientMessage(clientId: string, raw: string): boolean {
+  private tryForwardClientMessage(
+    clientId: string,
+    transport: Transport,
+    raw: string,
+  ): boolean {
     const parsed = parseWireMessage(raw);
     if (!parsed) return false;
+
+    if (parsed.type === 'call' && parsed.method === REFRESH_MODELS_METHOD) {
+      return this.tryForwardModelRefresh(
+        clientId,
+        transport,
+        parsed.id,
+        parsed.payload,
+      );
+    }
 
     // @W and @U: split signal IDs between local and upstream
     if (
@@ -189,7 +268,10 @@ export class RPC {
       const localIds: number[] = [];
 
       // Group upstream IDs by prefix
-      const upstreamBatches = new Map<ForwardedUpstream, number[]>();
+      const upstreamBatches = new Map<
+        ForwardedUpstream,
+        Array<number | string>
+      >();
       for (const id of ids) {
         const upstream = this.findUpstreamForSignal(id);
         if (upstream) {
@@ -210,9 +292,9 @@ export class RPC {
       // Forward to each upstream
       for (const [upstream, signalIds] of upstreamBatches) {
         if (parsed.method === WATCH_SIGNALS_METHOD) {
-          upstream.forwardWatch(signalIds);
+          upstream.forwardWatch(clientId, signalIds);
         } else {
-          upstream.forwardUnwatch(signalIds);
+          upstream.forwardUnwatch(clientId, signalIds);
         }
       }
 
@@ -251,6 +333,74 @@ export class RPC {
     return false;
   }
 
+  private tryForwardModelRefresh(
+    clientId: string,
+    transport: Transport,
+    callId: number,
+    payload: string,
+  ): boolean {
+    const markers = parseWireParams<unknown[]>(payload);
+    const results = new Array(markers.length).fill(null);
+    const upstreamBatches = new Map<
+      ForwardedUpstream,
+      {indexes: number[]; markers: string[]}
+    >();
+
+    for (let index = 0; index < markers.length; index++) {
+      const marker = markers[index];
+      if (typeof marker !== 'string') continue;
+
+      const hashIdx = marker.lastIndexOf('#');
+      if (hashIdx === -1) {
+        results[index] = this.reflection.serializeModelMarker(marker, clientId);
+        continue;
+      }
+
+      const typeName = marker.slice(0, hashIdx);
+      const wireId = marker.slice(hashIdx + 1);
+      const upstream = this.findUpstreamForInstance(wireId);
+      if (!upstream) {
+        results[index] = this.reflection.serializeModelMarker(marker, clientId);
+        continue;
+      }
+
+      let batch = upstreamBatches.get(upstream);
+      if (!batch) {
+        batch = {indexes: [], markers: []};
+        upstreamBatches.set(upstream, batch);
+      }
+      batch.indexes.push(index);
+      batch.markers.push(
+        `${typeName}#${stripInstancePrefix(upstream.prefix, wireId)}`,
+      );
+    }
+
+    if (upstreamBatches.size === 0) return false;
+
+    Promise.all(
+      Array.from(upstreamBatches, async ([upstream, batch]) => {
+        const refreshed = await upstream.refreshModels(batch.markers, clientId);
+        for (let index = 0; index < batch.indexes.length; index++) {
+          results[batch.indexes[index]] = refreshed[index] ?? null;
+        }
+      }),
+    ).then(
+      () => this.sendResult(clientId, callId, results, transport),
+      (error: any) =>
+        this.sendError(
+          clientId,
+          callId,
+          {
+            code: -1,
+            message: error?.message ?? String(error),
+          },
+          transport,
+        ),
+    );
+
+    return true;
+  }
+
   private findUpstreamForSignal(
     id: number | string,
   ): ForwardedUpstream | undefined {
@@ -270,6 +420,7 @@ export class RPC {
 
   private async handleMessage(
     clientId: string,
+    transport: Transport,
     id: number | undefined,
     method: string,
     params: any[],
@@ -290,16 +441,41 @@ export class RPC {
       return;
     }
 
+    if (method === REFRESH_MODELS_METHOD) {
+      if (id !== undefined) {
+        this.sendResult(
+          clientId,
+          id,
+          params.map((marker) =>
+            typeof marker === 'string'
+              ? this.reflection.serializeModelMarker(marker, clientId)
+              : null,
+          ),
+          transport,
+        );
+      }
+
+      return;
+    }
+
     try {
       const result = await this.callMethod(method, params);
-      const serialized = this.reflection.serialize(result, clientId);
 
-      if (id !== undefined) {
-        this.sendResult(clientId, id, serialized);
+      if (id !== undefined && this.clients.get(clientId) === transport) {
+        const serialized = this.reflection.serialize(result, clientId);
+        this.sendResult(clientId, id, serialized, transport);
       }
     } catch (error: any) {
       if (id !== undefined) {
-        this.sendError(clientId, id, {code: -1, message: error.message});
+        // Application code often attaches metadata to thrown errors (e.g. a
+        // machine-readable `code`). Own enumerable props ride along so the
+        // client can rebuild an equivalent error.
+        this.sendError(
+          clientId,
+          id,
+          {code: -1, message: error.message, ...error},
+          transport,
+        );
       }
     }
   }
@@ -319,11 +495,20 @@ export class RPC {
     }
 
     const segments = method.split('.');
+    if (segments.some(isUnsafeSegment)) {
+      throw new Error(`Method not found: ${method}`);
+    }
+
     const methodName = segments.pop()!;
     const receiver =
       segments.length > 0 ? dlv(instance, segments.join('.')) : instance;
     const target = receiver?.[methodName];
-    if (typeof target !== 'function') {
+    // Reject non-functions and methods inherited from Object.prototype
+    // (toString, hasOwnProperty, ...) — only the exposed graph is callable.
+    if (
+      typeof target !== 'function' ||
+      target === (Object.prototype as any)[methodName]
+    ) {
       throw new Error(`Method not found: ${method}`);
     }
 
@@ -350,11 +535,23 @@ export class RPC {
     transport.send(message);
   }
 
-  private sendResult(clientId: string, id: number, result: any) {
+  private sendResult(
+    clientId: string,
+    id: number,
+    result: any,
+    transport?: Transport,
+  ) {
+    if (transport && this.clients.get(clientId) !== transport) return;
     this.send(clientId, formatResultMessage(id, result));
   }
 
-  private sendError(clientId: string, id: number, error: any) {
+  private sendError(
+    clientId: string,
+    id: number,
+    error: any,
+    transport?: Transport,
+  ) {
+    if (transport && this.clients.get(clientId) !== transport) return;
     this.send(clientId, formatErrorMessage(id, error));
   }
 }

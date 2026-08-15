@@ -99,6 +99,15 @@ describe('Reflection', () => {
       expect(reflection.getInstanceId(obj)).toBe('sig-id');
     });
 
+    it('rejects ids containing wire-format delimiters', () => {
+      expect(() => reflection.getInstanceId({id: 'task-1:vcs'})).toThrow(
+        'must not contain "#" or ":"',
+      );
+      expect(() => reflection.getInstanceId({id: 'task#1'})).toThrow(
+        'must not contain "#" or ":"',
+      );
+    });
+
     it('auto-generates id for models without id', () => {
       const obj = {name: 'no-id'};
       const id = reflection.getInstanceId(obj);
@@ -297,6 +306,56 @@ describe('Reflection', () => {
       expect(c1msgs.length).toBeGreaterThan(0);
       expect(c2msgs.length).toBeGreaterThan(0);
     });
+
+    it('sends a catch-up update on re-watch when the subscription stayed alive', () => {
+      const {counter, countId} = setupCounter(reflection, instances, 'c1');
+      reflection.serialize(counter, 'c2');
+      reflection.watch('c1', countId);
+      reflection.watch('c2', countId);
+      reflection.unwatch('c1', countId);
+      counter.count.value = 5;
+      sender.sent.length = 0;
+
+      reflection.watch('c1', countId);
+
+      const relevant = sender.sent.filter((m) => m.clientId === 'c1');
+      expect(relevant.length).toBe(1);
+      const [id, value] = parseUpdate(relevant[0].message);
+      expect(id).toBe(countId);
+      expect(value).toBe(5);
+    });
+
+    it('compresses the re-watch catch-up against the client last-sent value', () => {
+      const {counter, nameId} = setupCounter(reflection, instances, 'c1');
+      reflection.serialize(counter, 'c2');
+      reflection.watch('c1', nameId);
+      reflection.watch('c2', nameId);
+      reflection.unwatch('c1', nameId);
+      counter.name.value = 'default-updated';
+      sender.sent.length = 0;
+
+      reflection.watch('c1', nameId);
+
+      const relevant = sender.sent.filter((m) => m.clientId === 'c1');
+      expect(relevant.length).toBe(1);
+      const [id, value, mode] = parseUpdate(relevant[0].message);
+      expect(id).toBe(nameId);
+      expect(value).toBe('-updated');
+      expect(mode).toBe('append');
+    });
+
+    it('sends nothing on re-watch when the value has not changed', () => {
+      const {counter, countId} = setupCounter(reflection, instances, 'c1');
+      reflection.serialize(counter, 'c2');
+      reflection.watch('c1', countId);
+      reflection.watch('c2', countId);
+      reflection.unwatch('c1', countId);
+      sender.sent.length = 0;
+
+      reflection.watch('c1', countId);
+
+      expect(sender.sent.filter((m) => m.clientId === 'c1').length).toBe(0);
+    });
   });
 
   describe('delta compression', () => {
@@ -431,6 +490,181 @@ describe('Reflection', () => {
       const last = relevant[relevant.length - 1].message;
       expect(last).not.toContain('"append"');
       expect(last).not.toContain('"merge"');
+    });
+
+    it('sends merge delta when a key is added', () => {
+      const clientId = 'c1';
+      const {counter, metaId} = setupCounter(reflection, instances, clientId);
+      reflection.watch(clientId, metaId);
+      counter.meta.value = {version: 1, extra: 2};
+      const relevant = sender.sent.filter((m) => m.clientId === clientId);
+      expect(relevant.length).toBeGreaterThan(0);
+      const [id, value, mode] = parseUpdate(
+        relevant[relevant.length - 1].message,
+      );
+      expect(id).toBe(metaId);
+      expect(value).toEqual({extra: 2});
+      expect(mode).toBe('merge');
+    });
+
+    it('sends no update for a rebuilt object with identical entries', () => {
+      const clientId = 'c1';
+      const {counter, metaId} = setupCounter(reflection, instances, clientId);
+      reflection.watch(clientId, metaId);
+      counter.meta.value = {version: 1};
+      const relevant = sender.sent.filter((m) => m.clientId === clientId);
+      expect(relevant.length).toBe(0);
+    });
+
+    it('sends full replacement when a key is removed with no other changes', () => {
+      const clientId = 'c1';
+      const {counter, metaId} = setupCounter(reflection, instances, clientId);
+      reflection.watch(clientId, metaId);
+      counter.meta.value = {version: 1, status: 'ok'};
+      sender.sent.length = 0;
+      counter.meta.value = {version: 1};
+      const relevant = sender.sent.filter((m) => m.clientId === clientId);
+      expect(relevant.length).toBeGreaterThan(0);
+      const [id, value, mode] = parseUpdate(
+        relevant[relevant.length - 1].message,
+      );
+      expect(id).toBe(metaId);
+      expect(value).toEqual({version: 1});
+      expect(mode).toBeUndefined();
+    });
+
+    it('sends full replacement when a key is removed alongside another change', () => {
+      const clientId = 'c1';
+      const {counter, metaId} = setupCounter(reflection, instances, clientId);
+      reflection.watch(clientId, metaId);
+      counter.meta.value = {version: 1, status: 'ok'};
+      sender.sent.length = 0;
+      counter.meta.value = {version: 2};
+      const relevant = sender.sent.filter((m) => m.clientId === clientId);
+      expect(relevant.length).toBeGreaterThan(0);
+      const [id, value, mode] = parseUpdate(
+        relevant[relevant.length - 1].message,
+      );
+      expect(id).toBe(metaId);
+      expect(value).toEqual({version: 2});
+      expect(mode).toBeUndefined();
+    });
+
+    it('detects removal of keys that shadow Object.prototype properties', () => {
+      const clientId = 'c1';
+      const {counter, metaId} = setupCounter(reflection, instances, clientId);
+      reflection.watch(clientId, metaId);
+      counter.meta.value = {version: 1, toString: 'user-data'};
+      sender.sent.length = 0;
+      counter.meta.value = {version: 2};
+      const relevant = sender.sent.filter((m) => m.clientId === clientId);
+      expect(relevant.length).toBeGreaterThan(0);
+      const [id, value, mode] = parseUpdate(
+        relevant[relevant.length - 1].message,
+      );
+      expect(id).toBe(metaId);
+      expect(value).toEqual({version: 2});
+      expect(mode).toBeUndefined();
+    });
+
+    it('sends full replacement when a key is set to undefined', () => {
+      const clientId = 'c1';
+      const {counter, metaId} = setupCounter(reflection, instances, clientId);
+      reflection.watch(clientId, metaId);
+      counter.meta.value = {version: 1, status: 'ok'};
+      sender.sent.length = 0;
+      counter.meta.value = {version: 1, status: undefined};
+      const relevant = sender.sent.filter((m) => m.clientId === clientId);
+      expect(relevant.length).toBeGreaterThan(0);
+      const [id, value, mode] = parseUpdate(
+        relevant[relevant.length - 1].message,
+      );
+      expect(id).toBe(metaId);
+      expect(value).toEqual({version: 1});
+      expect(mode).toBeUndefined();
+    });
+
+    it('sends full replacement when a value becomes a function', () => {
+      const clientId = 'c1';
+      const {counter, metaId} = setupCounter(reflection, instances, clientId);
+      reflection.watch(clientId, metaId);
+      counter.meta.value = {version: 1, run: 'not-yet'};
+      sender.sent.length = 0;
+      counter.meta.value = {version: 1, run: () => {}};
+      const relevant = sender.sent.filter((m) => m.clientId === clientId);
+      expect(relevant.length).toBeGreaterThan(0);
+      const [id, value, mode] = parseUpdate(
+        relevant[relevant.length - 1].message,
+      );
+      expect(id).toBe(metaId);
+      expect(value).toEqual({version: 1});
+      expect(mode).toBeUndefined();
+    });
+
+    it('sends full replacement when a value becomes a symbol', () => {
+      const clientId = 'c1';
+      const {counter, metaId} = setupCounter(reflection, instances, clientId);
+      reflection.watch(clientId, metaId);
+      counter.meta.value = {version: 1, tag: 'ok'};
+      sender.sent.length = 0;
+      counter.meta.value = {version: 1, tag: Symbol('gone')};
+      const relevant = sender.sent.filter((m) => m.clientId === clientId);
+      expect(relevant.length).toBeGreaterThan(0);
+      const [id, value, mode] = parseUpdate(
+        relevant[relevant.length - 1].message,
+      );
+      expect(id).toBe(metaId);
+      expect(value).toEqual({version: 1});
+      expect(mode).toBeUndefined();
+    });
+
+    it('sends merge when a symbol-valued key the wire never saw is removed', () => {
+      const clientId = 'c1';
+      const {counter, metaId} = setupCounter(reflection, instances, clientId);
+      reflection.watch(clientId, metaId);
+      counter.meta.value = {version: 1, tag: Symbol('hidden')};
+      sender.sent.length = 0;
+      counter.meta.value = {version: 2};
+      const relevant = sender.sent.filter((m) => m.clientId === clientId);
+      expect(relevant.length).toBeGreaterThan(0);
+      const [id, value, mode] = parseUpdate(
+        relevant[relevant.length - 1].message,
+      );
+      expect(id).toBe(metaId);
+      expect(value).toEqual({version: 2});
+      expect(mode).toBe('merge');
+    });
+
+    it('sends merge when a key the wire never saw is removed', () => {
+      const clientId = 'c1';
+      const {counter, metaId} = setupCounter(reflection, instances, clientId);
+      reflection.watch(clientId, metaId);
+      counter.meta.value = {version: 1, run: () => {}};
+      sender.sent.length = 0;
+      counter.meta.value = {version: 2};
+      const relevant = sender.sent.filter((m) => m.clientId === clientId);
+      expect(relevant.length).toBeGreaterThan(0);
+      const [id, value, mode] = parseUpdate(
+        relevant[relevant.length - 1].message,
+      );
+      expect(id).toBe(metaId);
+      expect(value).toEqual({version: 2});
+      expect(mode).toBe('merge');
+    });
+
+    it('sends full replacement when an object value becomes an array', () => {
+      const clientId = 'c1';
+      const {counter, metaId} = setupCounter(reflection, instances, clientId);
+      reflection.watch(clientId, metaId);
+      counter.meta.value = [1, 2];
+      const relevant = sender.sent.filter((m) => m.clientId === clientId);
+      expect(relevant.length).toBeGreaterThan(0);
+      const [id, value, mode] = parseUpdate(
+        relevant[relevant.length - 1].message,
+      );
+      expect(id).toBe(metaId);
+      expect(value).toEqual([1, 2]);
+      expect(mode).toBeUndefined();
     });
 
     it('serializes nested model references in method results', () => {

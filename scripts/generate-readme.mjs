@@ -51,6 +51,8 @@ function typeToString(t) {
   }
   if (t.type === 'intrinsic') return t.name;
   if (t.type === 'array') return `${typeToString(t.elementType)}[]`;
+  if (t.type === 'typeOperator')
+    return `${t.operator} ${typeToString(t.target)}`;
   if (t.type === 'union') return t.types.map(typeToString).join(' | ');
   if (t.type === 'intersection') return t.types.map(typeToString).join(' & ');
   if (t.type === 'literal') return JSON.stringify(t.value);
@@ -109,9 +111,7 @@ function renderNode(node) {
     lines.push('- Signatures:');
     for (const sig of node.signatures) {
       const sigDesc = commentText(sig.comment);
-      lines.push(
-        `  - \`${sigToLine(sig)}\`${sigDesc ? ' — ' + sigDesc : ''}`,
-      );
+      lines.push(`  - \`${sigToLine(sig)}\`${sigDesc ? ' — ' + sigDesc : ''}`);
     }
   }
 

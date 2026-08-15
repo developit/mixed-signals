@@ -6,7 +6,15 @@ import {RPCClient} from '../../client/rpc.ts';
 import {addPrefix, stripPrefix} from '../../server/forwarding.ts';
 import {createModel} from '../../server/model.ts';
 import {RPC} from '../../server/rpc.ts';
-import type {Transport} from '../../shared/protocol.ts';
+import {
+  formatNotificationMessage,
+  parseWireMessage,
+  parseWireParams,
+  SIGNAL_UPDATE_METHOD,
+  type Transport,
+  UNWATCH_SIGNALS_METHOD,
+  WATCH_SIGNALS_METHOD,
+} from '../../shared/protocol.ts';
 
 type MessageHandler = (data: {toString(): string}) => void | Promise<void>;
 
@@ -21,6 +29,10 @@ function createLinkedTransports(): {
   serverUpstreamTransport: Transport;
   serverDownstreamTransport: Transport;
   browserTransport: Transport;
+  createDownstreamPair(name: string): {
+    serverTransport: Transport;
+    browserTransport: Transport;
+  };
   flush: () => Promise<void>;
 } {
   const queue: Array<() => Promise<void>> = [];
@@ -33,6 +45,33 @@ function createLinkedTransports(): {
       await handlers[key]?.({toString: () => data});
     });
   };
+
+  const createDownstreamPair = (name: string) => {
+    const serverKey = `serverDownstream:${name}`;
+    const browserKey = `browser:${name}`;
+
+    return {
+      // Server's downstream (to browser)
+      serverTransport: {
+        send(data: string) {
+          enqueue(browserKey, data);
+        },
+        onMessage(cb) {
+          handlers[serverKey] = cb;
+        },
+      } satisfies Transport,
+      // Browser's view
+      browserTransport: {
+        send(data: string) {
+          enqueue(serverKey, data);
+        },
+        onMessage(cb) {
+          handlers[browserKey] = cb;
+        },
+      } satisfies Transport,
+    };
+  };
+  const defaultDownstream = createDownstreamPair('default');
 
   return {
     // Broker's view of the server connection
@@ -53,24 +92,9 @@ function createLinkedTransports(): {
         handlers.serverUpstream = cb;
       },
     },
-    // Server's downstream (to browser)
-    serverDownstreamTransport: {
-      send(data: string) {
-        enqueue('browser', data);
-      },
-      onMessage(cb) {
-        handlers.serverDownstream = cb;
-      },
-    },
-    // Browser's view
-    browserTransport: {
-      send(data: string) {
-        enqueue('serverDownstream', data);
-      },
-      onMessage(cb) {
-        handlers.browser = cb;
-      },
-    },
+    serverDownstreamTransport: defaultDownstream.serverTransport,
+    browserTransport: defaultDownstream.browserTransport,
+    createDownstreamPair,
     async flush() {
       while (queue.length > 0) {
         const pending = queue.splice(0);
@@ -109,6 +133,19 @@ class BrokerSessions {
     );
     this.sessions.value = [...this.sessions.value, session];
     return session;
+  }
+}
+
+class BrokerFactory {
+  id = signal('factory');
+  private _secret: BrokerSession;
+
+  constructor(secret: BrokerSession) {
+    this._secret = secret;
+  }
+
+  createSecret() {
+    return this._secret;
   }
 }
 
@@ -166,6 +203,11 @@ interface SessionsApi {
   createSession(): Promise<any>;
 }
 
+interface FactoryApi {
+  id: Signal<string>;
+  createSecret(): Promise<SessionApi>;
+}
+
 interface SessionApi {
   id: Signal<string>;
   messages: Signal<any[]>;
@@ -184,6 +226,16 @@ interface MessageApi {
 afterEach(() => {
   vi.useRealTimers();
 });
+
+function getSignalUpdateValues(messages: string[]) {
+  return messages.flatMap((message) => {
+    const parsed = parseWireMessage(message);
+    if (parsed?.type !== 'notification') return [];
+    if (parsed.method !== SIGNAL_UPDATE_METHOD) return [];
+    const [, value] = parseWireParams(parsed.payload);
+    return [value];
+  });
+}
 
 describe('addPrefix / stripPrefix', () => {
   it('prefixes @S and @M markers', () => {
@@ -221,6 +273,21 @@ describe('addPrefix / stripPrefix', () => {
     const stripped = stripPrefix('1', prefixed);
 
     expect(stripped).toEqual(original);
+  });
+
+  it('preserves nested upstream signal prefixes for forwarding chains', () => {
+    const original = {
+      status: {'@S': '1_42', v: 'ready'},
+    };
+
+    const prefixed = addPrefix('2', original);
+    expect(prefixed).toEqual({
+      status: {'@S': '2_1_42', v: 'ready'},
+    });
+    expect(stripPrefix('2', prefixed)).toEqual(original);
+    expect(stripPrefix('1', original)).toEqual({
+      status: {'@S': 42, v: 'ready'},
+    });
   });
 
   it('passes through non-prefixed values', () => {
@@ -282,7 +349,7 @@ describe('protocol-level forwarding', () => {
 
     // Subscribe to signals
     const stopName = browser.root.project.name.subscribe(() => {});
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     // --- Signal update flows through ---
@@ -304,6 +371,156 @@ describe('protocol-level forwarding', () => {
     expect(browser.root.project.name.value).toBe('Renamed');
 
     stopName();
+    vi.advanceTimersByTime(10);
+    await flush();
+  });
+
+  it('fans out upstream signal updates until each downstream client unwatches', async () => {
+    const {
+      brokerTransport,
+      serverUpstreamTransport,
+      serverDownstreamTransport,
+      browserTransport,
+      createDownstreamPair,
+      flush,
+    } = createLinkedTransports();
+    const second = createDownstreamPair('second');
+    const firstMessages: string[] = [];
+    const secondMessages: string[] = [];
+    browserTransport.onMessage((data) => {
+      firstMessages.push(data.toString());
+    });
+    second.browserTransport.onMessage((data) => {
+      secondMessages.push(data.toString());
+    });
+
+    const brokerRpc = new RPC();
+    const project = {name: signal('Initial')};
+    brokerRpc.expose({project});
+    brokerRpc.addClient(brokerTransport);
+
+    const serverRpc = new RPC();
+    serverRpc.addUpstream(serverUpstreamTransport);
+    await flush();
+
+    serverRpc.addClient(serverDownstreamTransport, 'browser-1');
+    serverRpc.addClient(second.serverTransport, 'browser-2');
+    await flush();
+
+    const rootMessage = parseWireMessage(firstMessages[0]);
+    expect(rootMessage?.type).toBe('notification');
+    if (rootMessage?.type !== 'notification') {
+      throw new Error('Expected root notification');
+    }
+    const [root] = parseWireParams<any[]>(rootMessage.payload);
+    const signalId = root.project.name['@S'];
+
+    firstMessages.length = 0;
+    secondMessages.length = 0;
+    browserTransport.send(
+      formatNotificationMessage(WATCH_SIGNALS_METHOD, [signalId]),
+    );
+    second.browserTransport.send(
+      formatNotificationMessage(WATCH_SIGNALS_METHOD, [signalId]),
+    );
+    await flush();
+
+    project.name.value = 'First update';
+    await flush();
+    expect(getSignalUpdateValues(firstMessages)).toContain('First update');
+    expect(getSignalUpdateValues(secondMessages)).toContain('First update');
+
+    firstMessages.length = 0;
+    secondMessages.length = 0;
+    browserTransport.send(
+      formatNotificationMessage(UNWATCH_SIGNALS_METHOD, [signalId]),
+    );
+    await flush();
+
+    project.name.value = 'Second update';
+    await flush();
+    expect(getSignalUpdateValues(firstMessages)).not.toContain('Second update');
+    expect(getSignalUpdateValues(secondMessages)).toContain('Second update');
+
+    firstMessages.length = 0;
+    secondMessages.length = 0;
+    second.browserTransport.send(
+      formatNotificationMessage(UNWATCH_SIGNALS_METHOD, [signalId]),
+    );
+    await flush();
+
+    project.name.value = 'Third update';
+    await flush();
+    expect(getSignalUpdateValues(firstMessages)).not.toContain('Third update');
+    expect(getSignalUpdateValues(secondMessages)).not.toContain('Third update');
+  });
+
+  it('does not broadcast method-returned model updates to clients that never saw the model', async () => {
+    const {
+      brokerTransport,
+      serverUpstreamTransport,
+      serverDownstreamTransport,
+      browserTransport,
+      createDownstreamPair,
+      flush,
+    } = createLinkedTransports();
+    const second = createDownstreamPair('second');
+    const secondMessages: string[] = [];
+    second.browserTransport.onMessage((data) => {
+      secondMessages.push(data.toString());
+    });
+
+    const brokerRpc = new RPC();
+    brokerRpc.registerModel('BrokerFactory', BrokerFactory);
+    brokerRpc.registerModel('BrokerSession', BrokerSession);
+    brokerRpc.registerModel('BrokerMessage', BrokerMessage);
+    const secret = new BrokerSession('secret-1');
+    brokerRpc.expose({factory: new BrokerFactory(secret)});
+    brokerRpc.addClient(brokerTransport);
+
+    const serverRpc = new RPC();
+    serverRpc.addUpstream(serverUpstreamTransport);
+    await flush();
+
+    const FactoryModel = createReflectedModel<FactoryApi>(
+      ['id'],
+      ['createSecret'],
+    );
+    const SessionModel = createReflectedModel<SessionApi>(
+      ['id', 'messages', 'status'],
+      ['submit', 'stop'],
+    );
+    const MessageModel = createReflectedModel<MessageApi>(
+      ['id', 'role', 'content', 'status'],
+      [],
+    );
+
+    let browser!: RPCClient;
+    const ctx = {
+      rpc: {call: (m, p) => browser.call(m, p)} satisfies Partial<RPCClient>,
+    } as WireContext;
+    browser = new RPCClient(browserTransport, ctx);
+    browser.registerModel('BrokerFactory', FactoryModel);
+    browser.registerModel('BrokerSession', SessionModel);
+    browser.registerModel('BrokerMessage', MessageModel);
+
+    serverRpc.addClient(serverDownstreamTransport, 'browser-1');
+    serverRpc.addClient(second.serverTransport, 'browser-2');
+    await flush();
+    await browser.ready;
+
+    secondMessages.length = 0;
+    const createSecret = browser.root.factory.createSecret();
+    await flush();
+    const secretModel = await createSecret;
+    expect(secretModel.status.value).toBe('idle');
+
+    secondMessages.length = 0;
+    secret.status.value = 'running';
+    await flush();
+
+    expect(secretModel.status.value).toBe('running');
+    expect(getSignalUpdateValues(secondMessages)).not.toContain('running');
   });
 
   it('forwards method results containing new model instances', async () => {
@@ -363,7 +580,7 @@ describe('protocol-level forwarding', () => {
 
     // Subscribe to sessions list
     const stopSessions = browser.root.sessions.sessions.subscribe(() => {});
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     // --- Create a session (method returns a new model) ---
@@ -377,7 +594,7 @@ describe('protocol-level forwarding', () => {
     // Subscribe to the new session's messages and status
     const stopMessages = created.messages.subscribe(() => {});
     const stopStatus = created.status.subscribe(() => {});
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     // --- Submit a message ---
@@ -395,6 +612,74 @@ describe('protocol-level forwarding', () => {
     stopSessions();
     stopMessages();
     stopStatus();
+    vi.advanceTimersByTime(10);
+    await flush();
+  });
+
+  it('forwards held model refresh requests to upstream', async () => {
+    const {
+      brokerTransport,
+      serverUpstreamTransport,
+      serverDownstreamTransport,
+      browserTransport,
+      flush,
+    } = createLinkedTransports();
+
+    const brokerRpc = new RPC();
+    brokerRpc.registerModel('BrokerSessions', BrokerSessions);
+    brokerRpc.registerModel('BrokerSession', BrokerSession);
+    brokerRpc.registerModel('BrokerMessage', BrokerMessage);
+    const sessions = new BrokerSessions();
+    brokerRpc.expose({sessions});
+    brokerRpc.addClient(brokerTransport);
+
+    const serverRpc = new RPC();
+    serverRpc.addUpstream(serverUpstreamTransport);
+    await flush();
+
+    const SessionsModel = createReflectedModel<SessionsApi>(
+      ['status', 'sessions'],
+      ['createSession'],
+    );
+    const SessionModel = createReflectedModel<SessionApi>(
+      ['messages', 'status'],
+      ['submit', 'stop'],
+    );
+    const MessageModel = createReflectedModel<MessageApi>(
+      ['id', 'role', 'content', 'status'],
+      [],
+    );
+
+    let browser!: RPCClient;
+    const ctx = {
+      rpc: {call: (m, p) => browser.call(m, p)} satisfies Partial<RPCClient>,
+    } as WireContext;
+    browser = new RPCClient(browserTransport, ctx);
+    browser.registerModel('BrokerSessions', SessionsModel);
+    browser.registerModel('BrokerSession', SessionModel);
+    browser.registerModel('BrokerMessage', MessageModel);
+
+    serverRpc.addClient(serverDownstreamTransport, 'browser-1');
+    await flush();
+    await browser.ready;
+
+    const createPromise = browser.root.sessions.createSession();
+    await flush();
+    const created = await createPromise;
+    expect(created.status.value).toBe('idle');
+
+    sessions.sessions.value[0].status.value = 'running';
+
+    const refreshPromise = browser.call('@M', [
+      `BrokerSession#${created.id.peek()}`,
+    ]);
+    await flush();
+    await Promise.resolve();
+    await flush();
+    const [refreshed] = await refreshPromise;
+
+    expect(refreshed).toBe(created);
+    expect(created.status.value).toBe('running');
   });
 
   it('handles streaming text via delta append', async () => {
@@ -441,7 +726,7 @@ describe('protocol-level forwarding', () => {
 
     // Subscribe to content
     const stopContent = browser.root.stream.content.subscribe(() => {});
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     // Stream text in chunks
@@ -458,6 +743,8 @@ describe('protocol-level forwarding', () => {
     expect(browser.root.stream.content.value).toBe('Hello world!');
 
     stopContent();
+    vi.advanceTimersByTime(10);
+    await flush();
   });
 
   it('mixes local and forwarded models', async () => {
@@ -520,7 +807,7 @@ describe('protocol-level forwarding', () => {
     // Subscribe to both
     const stopLocal = browser.root.local.value.subscribe(() => {});
     const stopRemote = browser.root.remote.value.subscribe(() => {});
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     // Update local model
@@ -535,5 +822,67 @@ describe('protocol-level forwarding', () => {
 
     stopLocal();
     stopRemote();
+    vi.advanceTimersByTime(10);
+    await flush();
+  });
+
+  it('forwards signal updates when addUpstream() is called after addClient()', async () => {
+    vi.useFakeTimers();
+
+    const {
+      brokerTransport,
+      serverUpstreamTransport,
+      serverDownstreamTransport,
+      browserTransport,
+      flush,
+    } = createLinkedTransports();
+
+    // --- Broker setup ---
+    const brokerRpc = new RPC();
+    brokerRpc.registerModel('BrokerProject', BrokerProject);
+    const project = new BrokerProject('42', 'Initial');
+    brokerRpc.expose({project});
+    brokerRpc.addClient(brokerTransport);
+
+    // --- Server setup: add client FIRST, then upstream ---
+    const serverRpc = new RPC();
+    serverRpc.addClient(serverDownstreamTransport, 'browser-1');
+
+    // --- Browser setup ---
+    const ProjectModel = createReflectedModel<ProjectApi>(
+      ['id', 'name'],
+      ['rename'],
+    );
+    let browser!: RPCClient;
+    const ctx = {
+      rpc: {call: (m, p) => browser.call(m, p)} satisfies Partial<RPCClient>,
+    } as WireContext;
+    browser = new RPCClient(browserTransport, ctx);
+    browser.registerModel('BrokerProject', ProjectModel);
+
+    // Now add upstream AFTER client is already connected
+    serverRpc.addUpstream(serverUpstreamTransport);
+
+    // Flush to deliver @R from broker → server → browser
+    await flush();
+    await browser.ready;
+
+    expect(browser.root.project).toBeDefined();
+    expect(browser.root.project.name.value).toBe('Initial');
+
+    // Subscribe to signals
+    const stopName = browser.root.project.name.subscribe(() => {});
+    vi.advanceTimersByTime(10);
+    await flush();
+
+    // Signal update should be forwarded even though upstream was added after client
+    project.name.value = 'Updated';
+    await flush();
+
+    expect(browser.root.project.name.value).toBe('Updated');
+
+    stopName();
+    vi.advanceTimersByTime(10);
+    await flush();
   });
 });

@@ -1,10 +1,21 @@
-import {type Signal, signal} from '@preact/signals-core';
-import {describe, expect, it, vi} from 'vitest';
-import {createReflectedModel} from '../../client/model.ts';
+import {type Model, type Signal, signal} from '@preact/signals-core';
+import {describe, expect, expectTypeOf, it, vi} from 'vitest';
+import {createReflectedModel, type Reflected} from '../../client/model.ts';
 import type {WireContext} from '../../client/reflection.ts';
 import type {RPCClient} from '../../client/rpc.ts';
 
 describe('createReflectedModel', () => {
+  it('omits local model symbols from reflected object types', () => {
+    interface Counter {
+      count: Signal<number>;
+      increment(amount: number): number;
+    }
+
+    expectTypeOf<Reflected<Model<Counter>>>().toEqualTypeOf<
+      Reflected<Counter>
+    >();
+  });
+
   it('exposes id signal with wireId value', () => {
     const Model = createReflectedModel<{id: Signal<string>}>([], []);
     const ctx = {
@@ -49,6 +60,31 @@ describe('createReflectedModel', () => {
     expect(instance.count.peek()).toBe(0);
     source.value = 99;
     expect(instance.count.peek()).toBe(99);
+  });
+
+  it('discovers signal properties and methods without a shape declaration', async () => {
+    const Model = createReflectedModel<{
+      id: Signal<string>;
+      count: Signal<number>;
+      increment(): Promise<void>;
+    }>();
+
+    const call = vi.fn(async () => undefined);
+    const ctx = {
+      rpc: {call} satisfies Partial<RPCClient>,
+    } as unknown as WireContext;
+    const count = signal(1);
+    const instance = new Model(ctx, {'@wireId': 'w9', count});
+
+    expect(instance.count.peek()).toBe(1);
+    count.value = 2;
+    expect(instance.count.peek()).toBe(2);
+
+    expect((instance as any).then).toBeUndefined();
+    expect(instance.increment).toBe(instance.increment);
+
+    await instance.increment();
+    expect(call).toHaveBeenCalledWith('w9#increment', []);
   });
 
   it('creates method proxies that call rpc.call with wireId#method', async () => {

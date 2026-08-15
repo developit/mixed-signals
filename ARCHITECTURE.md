@@ -12,13 +12,13 @@ No manual subscriptions, no event emitters — just signals.
 
 | Concept                  | Description                                                                                                             |
 | ------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
-| **Transport**            | Any object with `send(data: string)` and `onMessage(cb)`. Typically a WebSocket.                                        |
+| **Transport**            | Any object with `send(data: string)` and `onMessage(cb)`, plus optional `onOpen(cb)`, `onClose(cb)`, and `ready`. Typically a WebSocket. |
 | **RPC**                  | Server-side hub. Wraps a root object, routes incoming method calls, manages connected clients.                          |
 | **Reflection**           | Server-side signal tracker. Serializes signal values, computes deltas, and pushes updates to subscribed clients.        |
 | **Instances**            | Registry that maps numeric IDs to server-side model instances, enabling instance-method routing.                        |
 | **RPCClient**            | Client-side hub. Sends method calls, awaits responses, and dispatches incoming notifications.                           |
 | **ClientReflection**     | Client-side signal manager. Creates/updates `Signal` objects from server data, batches `@W`/`@U` subscription messages. |
-| **createReflectedModel** | Factory that produces a Preact Model constructor whose signal props and methods mirror a server model.                   |
+| **Proxy facade**         | Client-side reflected model object built from `@M` data. Serialized signal props become computed signals; unknown string props become lazy RPC methods. |
 
 ## Overview
 
@@ -46,8 +46,8 @@ No manual subscriptions, no event emitters — just signals.
 │   │           client Signal objects,                             │
 │   │           batched watch/unwatch                              │
 │   │                                                              │
-│  createReflectedModel → Preact Model constructors                │
-│    signals as computed props, methods as RPC proxies             │
+│  @M reviver → Proxy facades                                      │
+│    discovered signals as computed props, methods as lazy RPC     │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -76,7 +76,7 @@ All messages are compact, newline-free text strings.
 
 - **Direct RPC calls** — `path.method` (e.g. `sessions.createSession`) for methods on the root object
 - **Reflected model methods** — `{wireId}#method` (e.g. `42#delete`) for methods on model instances
-- The server assigns `wireId`s when it serializes models with `@M`, and `createReflectedModel()` uses that identity for later calls.
+- The server assigns `wireId`s when it serializes models with `@M`, and the client proxy uses that identity for later calls.
 
 #### Serialization Markers
 
@@ -85,7 +85,7 @@ During serialization, special objects are embedded in JSON:
 | Marker | Shape                                 | Meaning                                                                                                                                   |
 | ------ | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `@S`   | `{"@S": id, "v": value}`              | A server-side `Signal`. The client creates or reuses a `Signal` with the given ID and initial value.                                      |
-| `@M`   | `{"@M": "TypeName#wireId", ...props}` | A server-side model instance. The client instantiates the registered model constructor for `TypeName` and uses `wireId` for method calls. |
+| `@M`   | `{"@M": "TypeName#wireId", ...props}` | A server-side model instance. The client reuses a cached facade or creates a proxy facade directly from the serialized props. Custom registered constructors are still supported. |
 
 Properties beginning with `_` and all functions are stripped from serialized objects.
 
@@ -113,7 +113,7 @@ mixed-signals/
 └── client/
     ├── rpc.ts          RPC client, request correlation
     ├── reflection.ts   wire → Signal, batched watch/unwatch
-    └── model.ts        Preact-model factory for remote facades
+    └── model.ts        Proxy facade factory and legacy reflected-model constructor
 ```
 
 Two bundles (`./server`, `./client`) with a single peer dep:
@@ -155,9 +155,9 @@ signal while ≥1 client is watching, and pushes diffs via `N:@S:`.
 │ CLIENT                                                                      │
 │                                 ┌──────────────────────────────┐            │
 │   JSON.parse(reviver) ────────▶ │ ClientReflection             │            │
-│    sees "@S" → calls            │  signals: Map<id,Signal>     │            │
-│    getOrCreateSignal(7,0)       │  watchBatch / unwatchBatch   │ ── 1ms ──▶ │
-│                                 └────────────┬─────────────────┘    flush   │
+│    sees "@S" → calls            │  signals: Map<id,WeakRef>    │            │
+│    getOrCreateSignal(7,0)       │  watchBatch / unwatchBatch   │ ── 10ms ─▶ │
+│                                 └────────────┬─────────────────┘ global flush│
 │                                              │                              │
 │           ┌──────────────────────────────────┘                              │
 │           ▼                                                                 │
@@ -194,9 +194,10 @@ Reserved methods:
 
 | method | dir | payload           | meaning                       |
 | :----: | :-: | ----------------- | ----------------------------- |
-|  `@W`  | c→s | `id,id,...`       | subscribe to these signal ids |
-|  `@U`  | c→s | `id,id,...`       | unsubscribe                   |
-|  `@S`  | s→c | `id,value[,mode]` | signal `id` changed           |
+|  `@W`  | c→s | `id,id,...`       | subscribe to these signal ids                    |
+|  `@U`  | c→s | `id,id,...`       | unsubscribe                                      |
+|  `@M`  | c→s | `"Type#id",...`  | refresh held model facades by marker            |
+|  `@S`  | s→c | `id,value[,mode]` | signal `id` changed                              |
 
 Routing on server (`callMethod`):
 
@@ -265,58 +266,105 @@ The client also handles `splice` mode; the server doesn't currently emit it.
  component mounts
    effect reads s.value
      └─▶ watched()
-           watchBatch.add(7)  ─── 1ms ──▶  N:@W:7,8,12  ─▶  subs.get(7).add(client)
-                                                            if first watcher:
-                                                              sig.subscribe(notify)
+           watchBatch.add(7)  ─── 10ms global flush ──▶  N:@W:7,8,12  ─▶  subs.get(7).add(client)
+                                                                  if first watcher:
+                                                                    sig.subscribe(notify)
  component unmounts
    effect disposed
      └─▶ unwatched()
-           setTimeout(10ms)                             ← debounce: if a remount
-             └─▶ unwatchBatch.add(7) ─ 1ms ─▶ N:@U:7      happens inside 10ms the
-                                                          unwatch is cancelled and
-                                                          no traffic is sent.
+           unwatchBatch.add(7) ── 10ms global flush ─▶  N:@U:7
+             ▲                                             ▲
+             └─ a remount before the flush cancels it ─────┘
  client disconnects
    cleanup()  ───────────────────────────────────────▶  clients.delete(id)
                                                         reflection.removeClient(id)
                                                           - drop from all subs sets
                                                           - purge lastSentValues
+                                                          - dispose source signal subscriptions
 ```
 
 Batching coalesces the "20 signals arrive in one response, 20 effects
 subscribe on the same tick" case into one `@W` frame.
 
+Client reflection caches are weak where the runtime supports `WeakRef` and
+`FinalizationRegistry`: signal id → signal, model marker → facade, and model →
+signal index entries do not by themselves keep unwatched objects alive. Active
+signals are still held strongly by `activeSignals` while they are watched so the
+client can deterministically send `@U` and replay subscriptions on reconnect.
+Root objects, signal values, reflected model facades held by application code,
+and Preact subscriptions remain ordinary strong references; once those are gone,
+the weak reflection entries can be collected and opportunistically swept.
+
+On reconnect, the client keeps existing roots/signals/model facades alive until
+it receives a fresh `@R` root snapshot. That snapshot refreshes signal values,
+rebases root signals if a different backend process assigned different signal
+ids, refreshes cached model facades with their new underlying signal sources,
+requests fresh snapshots for active held model facades that were not present in
+the reconnect root via `M{id}:@M:...`, replays currently watched signal ids once
+from the root snapshot immediately, and replays them again after held-model
+refreshes bind any additional signal ids. After a process change, inactive held
+facades remain marked stale; if one of their signal props becomes watched later,
+the client lazily refreshes that facade and then replays the newly rebound signal
+ids.
+Only explicit protocol identities are preserved: `@S` signals and `@M` model
+facades. The top-level plain root object can be updated in place for ergonomics,
+but unbranded nested arrays and plain objects are replaced instead of reconciled
+by index or shape. Held facades that are not present in the new root can recover
+when the server process can resolve their `Type#id` marker from its `Instances`
+registry.
+
+The server includes connection metadata as a second `@R` parameter:
+`{connectionId, processId, resumed}`. `connectionId` is opaque and can be fed
+back into `RPC.addClient(transport, connectionId)` on a later WebSocket
+connection. `processId` tells the client which server process produced the
+snapshot, and `resumed` tells whether this connection replaced active retained
+state for that id. Once a client has disconnected and cleanup has run, a later
+connection with the same id is not reported as resumed. If the second `@R`
+parameter is absent, the client treats any snapshot after the initial root as an
+unknown/new process and clears raw signal-id mappings before hydration. For
+reconnectable transports (`onOpen` present), `RPCClient.ready` stays pending if
+the transport disconnects before the first root and never opens again; callers
+that need a hard failure should wrap it in their own timeout or abort signal.
+
 ---
 
-## `createReflectedModel`
+## Proxy facades
 
-Generates a Preact `createModel` constructor that mirrors a server model.
-
-```
-                      signalProps      methods
-                      ───────────      ───────
-                      ['id','title']   ['rename']
-```
+The client no longer needs a per-type constructor to reflect a model. `@M`
+serialization already carries the server type, wire id, and the complete set of
+serialized signal properties for that instance. `ClientReflection` uses that
+information to build a stable cached Proxy facade.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  createReflectedModel(signalProps, methods)                                 │
+│  createReflectedModelFacade(ctx, data)                                      │
 │                                                                             │
-│  ┌──────────────── per signalProp ─────────────────┐                        │
-│  │                                                 │   The @M reviver       │
-│  │  data[p] is Signal?                             │   already created the  │
-│  │  ── yes ─▶  computed(() => data[p].value)       │   inner signals.       │
-│  └─────────────────────────────────────────────────┘                        │
+│  ┌──────────────── discovered signal props ─────────┐                       │
+│  │                                                  │  The @M reviver       │
+│  │  data[p] is Signal?                              │  already created the │
+│  │  ── yes ─▶ computed(() => data[p].value)         │  inner signals.      │
+│  └──────────────────────────────────────────────────┘                       │
 │                                                                             │
-│  ┌──────────────── per method ─────────────────────┐                        │
-│  │                                                 │                        │
-│  │  ctx.rpc.call(`${wireId}#${m}`, args)            │   instance route       │
-│  └─────────────────────────────────────────────────┘                        │
+│  ┌──────────────── unknown string property ─────────┐                       │
+│  │                                                  │                       │
+│  │  model.rename → cached function                  │                       │
+│  │  function(...args) → rpc.call(`${wireId}#rename`)│  instance route       │
+│  └──────────────────────────────────────────────────┘                       │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-UI binds to `model.title.value`, which tracks the computed wrapping the
-remote signal. Swapping the underlying facade (e.g. after a refetch)
-propagates without the UI knowing.
+UI binds to `model.title.value`, which tracks the computed wrapping the remote
+signal. Method properties are created lazily and cached for stable identity. The
+Proxy deliberately does not synthesize promise-like properties such as `then`
+or `catch`, and symbol properties pass through normally. String keys, including
+odd method names like `"0"`, are valid method candidates because reflected
+models are plain objects rather than arrays.
+
+`createReflectedModel(signalProps, methods)` remains as a compatibility wrapper
+for older clients or custom facades. Its explicit lists are now hints, not a
+requirement: all serialized signals are discovered anyway, and methods not in
+the legacy list still work through the Proxy. If the server does not actually
+have the method, the RPC response rejects with `Method not found: <name>`.
 
 ---
 
@@ -362,5 +410,5 @@ propagates without the UI knowing.
   Redundant `sig.value = same` writes never touch the wire.
 - **Lazy fan-out** — a server signal with zero watchers has zero
   `.subscribe()` callbacks attached to it.
-- **Transport-agnostic** — `Transport = { send(str), onMessage(cb), ready? }`.
+- **Transport-agnostic** — `Transport = { send(str), onMessage(cb), onOpen?(cb), onClose?(cb), ready? }`.
   WebSocket, MessagePort, stdin/stdout all fit.

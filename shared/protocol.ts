@@ -1,13 +1,30 @@
 export interface Transport {
   send(data: string): void;
   onMessage(cb: (data: {toString(): string}) => void): void;
+  onClose?(cb: (error?: unknown) => void): void;
+  onOpen?(cb: () => void): void;
+  /**
+   * Close the underlying connection. The client calls this when it gives up
+   * on a stale transport, so the dead connection doesn't linger.
+   */
+  close?(): void;
   ready?: Promise<void>;
+}
+
+export interface ConnectionInfo {
+  /** Opaque id that can be supplied on a future server addClient() call. */
+  connectionId: string;
+  /** Opaque id for the server process that accepted this connection. */
+  processId: string;
+  /** True when this connection replaced active state retained for connectionId. */
+  resumed: boolean;
 }
 
 export const ROOT_NOTIFICATION_METHOD = '@R';
 export const SIGNAL_UPDATE_METHOD = '@S';
 export const WATCH_SIGNALS_METHOD = '@W';
 export const UNWATCH_SIGNALS_METHOD = '@U';
+export const REFRESH_MODELS_METHOD = '@M';
 
 type ParsedCallMessage = {
   type: 'call';
@@ -116,7 +133,7 @@ export function parseWireValue<T = unknown>(
 }
 
 function stringifyWireParams(params: readonly unknown[] = []): string {
-  return params.map((param) => JSON.stringify(param)).join(',');
+  return JSON.stringify(params).slice(1, -1);
 }
 
 export function formatCallMessage(

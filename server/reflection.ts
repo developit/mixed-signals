@@ -19,10 +19,21 @@ type ModelConstructor =
     ) => any)
   | ((...args: any[]) => any);
 
+// Values whose keys never appear on the wire: serializeValue drops undefined
+// and functions, and the JSON round trip in serialize() drops symbols.
+function isWireDropped(value: any): boolean {
+  return (
+    value === undefined ||
+    typeof value === 'function' ||
+    typeof value === 'symbol'
+  );
+}
+
 export class Reflection {
   private signalIds = new WeakMap<Signal<any>, SignalId>();
   private signals = new Map<SignalId, Signal<any>>();
   private subscriptions = new Map<SignalId, Set<ClientId>>();
+  private signalUnsubscribers = new Map<SignalId, () => void>();
   private lastSentValues = new Map<string, any>();
   private sentModels = new Map<ClientId, Set<string>>();
   private nextSignalId = 1;
@@ -62,7 +73,15 @@ export class Reflection {
 
     if ('id' in instance) {
       const id = instance.id;
-      return String(id instanceof Signal ? id.peek() : id);
+      const resolved = String(id instanceof Signal ? id.peek() : id);
+      // Wire ids are embedded in call frames ("M1:<id>#method:...") and model
+      // markers ("Type#<id>"), so these delimiters would corrupt parsing.
+      if (resolved.includes('#') || resolved.includes(':')) {
+        throw new Error(
+          `Model id "${resolved}" must not contain "#" or ":" (reserved by the wire format)`,
+        );
+      }
+      return resolved;
     }
 
     let id = this.autoIds.get(instance);
@@ -169,6 +188,22 @@ export class Reflection {
     return JSON.parse(JSON.stringify(serialized));
   }
 
+  serializeModelMarker(marker: string, clientId?: ClientId): any {
+    const hashIdx = marker.lastIndexOf('#');
+    if (hashIdx === -1) return null;
+
+    const typeName = marker.slice(0, hashIdx);
+    const id = marker.slice(hashIdx + 1);
+    const instance = this.instances.get(id);
+    if (!instance || this.getModelType(instance) !== typeName) return null;
+
+    if (clientId) {
+      this.sentModels.get(clientId)?.delete(marker);
+    }
+
+    return this.serialize(instance, clientId);
+  }
+
   watch(clientId: ClientId, signalId: SignalId) {
     let subs = this.subscriptions.get(signalId);
     if (!subs) {
@@ -176,27 +211,38 @@ export class Reflection {
       this.subscriptions.set(signalId, subs);
     }
 
-    const isFirst = subs.size === 0;
     subs.add(clientId);
 
-    if (isFirst) {
+    if (!this.signalUnsubscribers.has(signalId)) {
       const sig = this.signals.get(signalId);
       if (sig) {
         // The server only subscribes to source signals once a client cares.
-        sig.subscribe(() => {
+        // Subscribing notifies immediately, which doubles as catch-up for
+        // this first watcher.
+        const unsubscribe = sig.subscribe(() => {
           this.notifySubscribers(signalId);
         });
+        this.signalUnsubscribers.set(signalId, unsubscribe);
+      }
+    } else {
+      // A live subscription only forwards future changes. A client joining it
+      // may have missed updates while unwatched, so send a catch-up delta.
+      const sig = this.signals.get(signalId);
+      if (sig) {
+        this.sendUpdateIfChanged(clientId, signalId, sig.peek());
       }
     }
   }
 
   unwatch(clientId: ClientId, signalId: SignalId) {
     this.subscriptions.get(signalId)?.delete(clientId);
+    this.disposeSignalIfUnwatched(signalId);
   }
 
   removeClient(clientId: ClientId) {
-    for (const subs of this.subscriptions.values()) {
+    for (const [signalId, subs] of this.subscriptions) {
       subs.delete(clientId);
+      this.disposeSignalIfUnwatched(signalId);
     }
 
     const prefix = `${clientId}:`;
@@ -207,6 +253,15 @@ export class Reflection {
     this.sentModels.delete(clientId);
   }
 
+  private disposeSignalIfUnwatched(signalId: SignalId) {
+    const subs = this.subscriptions.get(signalId);
+    if (subs && subs.size > 0) return;
+
+    this.subscriptions.delete(signalId);
+    this.signalUnsubscribers.get(signalId)?.();
+    this.signalUnsubscribers.delete(signalId);
+  }
+
   private notifySubscribers(signalId: SignalId) {
     const sig = this.signals.get(signalId);
     const clients = this.subscriptions.get(signalId);
@@ -215,23 +270,31 @@ export class Reflection {
     const newValue = sig.peek();
 
     for (const clientId of clients) {
-      const lastValue = this.lastSentValues.get(`${clientId}:${signalId}`);
-      if (lastValue === newValue) continue;
-
-      const update = this.computeDelta(lastValue, newValue);
-      if (!update) continue;
-
-      const serializedValue = this.serialize(update.value, clientId);
-      const params = update.mode
-        ? [signalId, serializedValue, update.mode]
-        : [signalId, serializedValue];
-
-      this.rpc.send(
-        clientId,
-        formatNotificationMessage(SIGNAL_UPDATE_METHOD, params),
-      );
-      this.lastSentValues.set(`${clientId}:${signalId}`, newValue);
+      this.sendUpdateIfChanged(clientId, signalId, newValue);
     }
+  }
+
+  private sendUpdateIfChanged(
+    clientId: ClientId,
+    signalId: SignalId,
+    newValue: any,
+  ) {
+    const lastValue = this.lastSentValues.get(`${clientId}:${signalId}`);
+    if (lastValue === newValue) return;
+
+    const update = this.computeDelta(lastValue, newValue);
+    if (!update) return;
+
+    const serializedValue = this.serialize(update.value, clientId);
+    const params = update.mode
+      ? [signalId, serializedValue, update.mode]
+      : [signalId, serializedValue];
+
+    this.rpc.send(
+      clientId,
+      formatNotificationMessage(SIGNAL_UPDATE_METHOD, params),
+    );
+    this.lastSentValues.set(`${clientId}:${signalId}`, newValue);
   }
 
   /**
@@ -265,26 +328,31 @@ export class Reflection {
       newValue &&
       typeof oldValue === 'object' &&
       typeof newValue === 'object' &&
-      !Array.isArray(oldValue)
+      !Array.isArray(oldValue) &&
+      !Array.isArray(newValue)
     ) {
+      // Merge deltas can only add or overwrite keys, so a key that leaves
+      // the wire — removed outright, or set to a value serialization drops —
+      // requires a full replacement.
+      for (const key of Object.keys(oldValue)) {
+        if (isWireDropped(oldValue[key])) continue;
+        if (!Object.hasOwn(newValue, key) || isWireDropped(newValue[key])) {
+          return {value: newValue};
+        }
+      }
+
       const changes: any = {};
       let hasChanges = false;
 
-      for (const key in newValue) {
+      for (const key of Object.keys(newValue)) {
         if (newValue[key] !== oldValue[key]) {
           changes[key] = newValue[key];
           hasChanges = true;
         }
       }
 
-      // No changed keys and no removed keys — no update needed.
-      if (!hasChanges) {
-        const oldKeys = Object.keys(oldValue);
-        const newKeys = Object.keys(newValue);
-        if (oldKeys.length === newKeys.length) return null;
-      }
-
-      if (hasChanges) return {value: changes, mode: 'merge'};
+      // Removals were ruled out above, so no changed keys means no update.
+      return hasChanges ? {value: changes, mode: 'merge'} : null;
     }
 
     if (

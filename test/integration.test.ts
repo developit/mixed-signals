@@ -140,6 +140,35 @@ describe('Integration: Server <-> Client', () => {
     expect(rpcClient.root.id.peek()).toBe('0');
   });
 
+  it('reflects unregistered root models as proxy facades', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    root.count.value = 4;
+    rpc.expose({counter: root});
+
+    const {serverTransport, clientTransport, flush} =
+      createLinkedTransportPair();
+    const rpcClient = new RPCClient(clientTransport);
+    rpc.addClient(serverTransport, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    expect(rpcClient.root.counter.id.peek()).toBe('1');
+    expect(rpcClient.root.counter.count.peek()).toBe(4);
+    expect(typeof rpcClient.root.counter.increment).toBe('function');
+
+    const increment = rpcClient.root.counter.increment();
+    await flush();
+    await increment;
+    expect(root.count.peek()).toBe(5);
+
+    const missing = rpcClient.root.counter.notActuallyAMethod();
+    await flush();
+    await expect(missing).rejects.toThrow('Method not found');
+  });
+
   it('client root has correct signal values', async () => {
     vi.useFakeTimers();
     const rpc = new RPC();
@@ -232,6 +261,36 @@ describe('Integration: Server <-> Client', () => {
     await expect(promise).rejects.toThrow('server error');
   });
 
+  it('preserves application error properties across call rejections', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC({
+      fail() {
+        throw Object.assign(new Error('dirty worktree'), {
+          code: 'WORKTREE_NOT_CLEAN',
+          branch: 'feature-1',
+        });
+      },
+    });
+
+    const {serverTransport, clientTransport, flush} =
+      createLinkedTransportPair();
+    const ctx = {rpc: null as any};
+    const rpcClient = new RPCClient(clientTransport, ctx);
+    ctx.rpc = rpcClient;
+    rpc.addClient(serverTransport, 'c1');
+
+    await flush();
+    await rpcClient.ready;
+
+    const promise = rpcClient.call('fail');
+    await flush();
+    await expect(promise).rejects.toMatchObject({
+      message: 'dirty worktree',
+      code: 'WORKTREE_NOT_CLEAN',
+      branch: 'feature-1',
+    });
+  });
+
   it('client receives update after watch + server mutation', async () => {
     vi.useFakeTimers();
     const rpc = new RPC();
@@ -244,7 +303,7 @@ describe('Integration: Server <-> Client', () => {
     await rpcClient.ready;
 
     rpcClient.root.count.subscribe(() => undefined);
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     root.count.value = 42;
@@ -266,7 +325,7 @@ describe('Integration: Server <-> Client', () => {
     await rpcClient.ready;
 
     rpcClient.root.items.subscribe(() => undefined);
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     root.items.value = ['a', 'b', 'c'];
@@ -288,7 +347,7 @@ describe('Integration: Server <-> Client', () => {
     await rpcClient.ready;
 
     rpcClient.root.name.subscribe(() => undefined);
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     root.name.value = 'hello world';
@@ -310,13 +369,60 @@ describe('Integration: Server <-> Client', () => {
     await rpcClient.ready;
 
     rpcClient.root.meta.subscribe(() => undefined);
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     root.meta.value = {version: 1, status: 'updated'};
     await flush();
 
     expect(rpcClient.root.meta.peek()).toEqual({version: 1, status: 'updated'});
+  });
+
+  it('object delta preserves key removal alongside another change end-to-end', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    root.meta.value = {a: 1, b: 2};
+    rpc.expose(root);
+
+    const {rpcClient, flush} = connect(rpc, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    rpcClient.root.meta.subscribe(() => undefined);
+    vi.advanceTimersByTime(10);
+    await flush();
+
+    // `a` is removed at the same time as `b` changes.
+    root.meta.value = {b: 3};
+    await flush();
+
+    expect(rpcClient.root.meta.peek()).toEqual({b: 3});
+  });
+
+  it('object delta preserves key removal when a nested value is rebuilt end-to-end', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    root.meta.value = {a: 1, b: {n: 1}};
+    rpc.expose(root);
+
+    const {rpcClient, flush} = connect(rpc, 'c1');
+    await flush();
+    await rpcClient.ready;
+
+    rpcClient.root.meta.subscribe(() => undefined);
+    vi.advanceTimersByTime(10);
+    await flush();
+
+    // `a` is removed while `b` is replaced by a fresh but deep-equal object,
+    // as happens for any consumer that rebuilds state from JSON.
+    root.meta.value = {b: {n: 1}};
+    await flush();
+
+    expect(rpcClient.root.meta.peek()).toEqual({b: {n: 1}});
   });
 
   it('full replacement when delta does not apply', async () => {
@@ -332,7 +438,7 @@ describe('Integration: Server <-> Client', () => {
     await rpcClient.ready;
 
     rpcClient.root.name.subscribe(() => undefined);
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     root.name.value = 'xyz';
@@ -402,7 +508,7 @@ describe('Integration: Server <-> Client', () => {
 
     a.rpcClient.root.count.subscribe(() => undefined);
     b.rpcClient.root.count.subscribe(() => undefined);
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await a.flush();
     await b.flush();
 
@@ -431,7 +537,7 @@ describe('Integration: Server <-> Client', () => {
 
     const stopA = a.rpcClient.root.count.subscribe(() => undefined);
     b.rpcClient.root.count.subscribe(() => undefined);
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await a.flush();
     await b.flush();
 
@@ -456,7 +562,7 @@ describe('Integration: Server <-> Client', () => {
     await rpcClient.ready;
 
     rpcClient.root.count.subscribe(() => undefined);
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     root.count.value = 10;
@@ -470,6 +576,67 @@ describe('Integration: Server <-> Client', () => {
     await flush();
 
     expect(rpcClient.root.count.peek()).toBe(10);
+  });
+
+  it('refreshes held models and replays watches when reconnecting to a new RPC process', async () => {
+    vi.useFakeTimers();
+    const rpc1 = new RPC();
+    rpc1.registerModel('Counter', Counter);
+    const root1 = new Counter();
+    root1.count.value = 1;
+    rpc1.expose(root1);
+
+    const firstPair = createLinkedTransportPair();
+    const ctx = {rpc: null as any};
+    const client = new RPCClient(firstPair.clientTransport, ctx);
+    ctx.rpc = client;
+    client.registerModel('Counter', ReflectedCounter);
+    const cleanup1 = rpc1.addClient(firstPair.serverTransport, 'stable-client');
+
+    await firstPair.flush();
+    await client.ready;
+
+    const model = client.root;
+    const count = model.count;
+    const stop = count.subscribe(() => undefined);
+    vi.advanceTimersByTime(10);
+    await firstPair.flush();
+
+    root1.count.value = 2;
+    await firstPair.flush();
+    expect(count.peek()).toBe(2);
+
+    cleanup1();
+
+    const rpc2 = new RPC();
+    rpc2.registerModel('Counter', Counter);
+    const root2 = new Counter();
+    root2.count.value = 20;
+    rpc2.expose(root2);
+    const secondPair = createLinkedTransportPair();
+
+    client.reconnect(secondPair.clientTransport);
+    rpc2.addClient(secondPair.serverTransport, client.connectionId);
+    await secondPair.flush();
+    await client.ready;
+
+    expect(client.connectionInfo?.resumed).toBe(false);
+    expect(client.root).toBe(model);
+    expect(client.root.count).toBe(count);
+    expect(count.peek()).toBe(20);
+
+    root2.count.value = 21;
+    await secondPair.flush();
+    expect(count.peek()).toBe(21);
+
+    const increment = model.increment();
+    await secondPair.flush();
+    await increment;
+    expect(root2.count.peek()).toBe(22);
+
+    await secondPair.flush();
+    expect(count.peek()).toBe(22);
+    stop();
   });
 
   it('rpc.call from client still works with method routing', async () => {
@@ -534,7 +701,7 @@ describe('mixed-signals roundtrip', () => {
     const stopTitle = client.root.title.subscribe(() => undefined);
     const stopProjectName = client.root.project.name.subscribe(() => undefined);
 
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     title.value = 'World';
@@ -608,7 +775,7 @@ describe('mixed-signals roundtrip', () => {
     );
     const stopMessageStatus =
       client.root.session.items.value[0].status.subscribe(() => undefined);
-    vi.advanceTimersByTime(1);
+    vi.advanceTimersByTime(10);
     await flush();
 
     firstServerItem.content.value = 'Hello world';

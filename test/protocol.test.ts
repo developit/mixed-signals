@@ -45,6 +45,30 @@ describe('protocol', () => {
     });
   });
 
+  it('encodes undefined params as null (valid JSON roundtrip)', () => {
+    const call = formatCallMessage(1, 'm', [1, undefined, 'x']);
+    expect(call).toBe('M1:m:1,null,"x"');
+    const parsed = parseWireMessage(call);
+    expect(parsed).toEqual({
+      type: 'call',
+      id: 1,
+      method: 'm',
+      payload: '1,null,"x"',
+    });
+    expect(parseWireParams((parsed as {payload: string}).payload)).toEqual([
+      1,
+      null,
+      'x',
+    ]);
+
+    const notification = formatNotificationMessage('@W', [
+      undefined,
+      undefined,
+    ]);
+    expect(notification).toBe('N:@W:null,null');
+    expect(parseWireParams('null,null')).toEqual([null, null]);
+  });
+
   it('parses params and values with empty payloads and revivers', () => {
     const reviver = (_key: string, value: unknown) => {
       if (typeof value === 'number') return value * 2;

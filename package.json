@@ -1,6 +1,6 @@
 {
   "name": "mixed-signals",
-  "version": "0.2.0",
+  "version": "0.4.1",
   "description": "RPC Reflection for Preact Models & Signals: use Models/Signals from a somewhere else (server/worker/etc) as if they were here.",
   "type": "module",
   "exports": {
@@ -29,7 +29,15 @@
     "format": "biome format --write .",
     "check": "biome check --write .",
     "docs:api": "node scripts/generate-readme.mjs",
-    "prepublishOnly": "tsdown && node scripts/generate-readme.mjs"
+    "prepare": "tsdown",
+    "prepublishOnly": "tsdown && node scripts/generate-readme.mjs",
+    "changeset": "changeset",
+    "version": "changeset version && pnpm install --lockfile-only",
+    "release": "changeset publish"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "keywords": [
     "preact",
@@ -51,6 +59,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.2",
+    "@changesets/cli": "^2.29.8",
     "@preact/signals-core": "^1.14.0",
     "tsdown": "^0.20.0",
     "typedoc": "^0.28.13",
