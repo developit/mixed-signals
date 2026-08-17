@@ -1,5 +1,54 @@
 # mixed-signals
 
+## 0.4.2
+
+### Patch Changes
+
+- 6af0bab: Stop re-sending signal values a client already holds.
+
+  Serializing a signal always inlined its value, so anything that reached a client
+  twice was paid for twice. Returning a reflected signal from an RPC method — the
+  natural way to answer "give me the diff" without a second copy of it — sent the
+  whole payload again alongside the update the client had already received. In a
+  real app that was a 474 KB diff crossing the wire twice in adjacent frames.
+
+  `Reflection` now emits a bare `{'@S': id}` ref when it can prove the client
+  already holds that exact value: the last value sent to that client is
+  identical, and the client still has a live subscription to the signal. Watched
+  signals are strongly held on the client, so a subscription rules out the signal
+  having been collected out of its `WeakRef` cache and the ref failing to resolve.
+  The client half already handled `v`-less refs, so no client change was needed.
+
+  Refreshing a model by marker still re-inlines its own signals — a refresh means
+  the client stopped trusting its copy, and a ref back to that copy is worthless.
+
+- 2a6b0f6: Fix object deltas silently dropping key removals.
+
+  `Reflection#computeDelta` only iterated the new value's keys when building a
+  `merge` delta, so a key removed at the same time as any other change was never
+  sent to the client — and the client's additive `{...current, ...value}` merge
+  kept the stale key until the next full replacement. The object branch now
+  scans the previous value's keys first and falls back to a full replacement
+  whenever any key leaves the wire — removed outright, or set to a value
+  serialization drops (`undefined`, a function, or a symbol) — since a merge
+  delta cannot
+  express deletion. Keys whose values were never serialized don't force a
+  replacement when they disappear. Pure additions and value changes still
+  produce `merge` deltas, and identical rebuilt objects still produce no
+  update.
+
+  Also removes the unsound key-count heuristic (one removal plus one addition
+  kept counts equal), standardizes key iteration and membership on own keys
+  (`Object.keys`/`Object.hasOwn`, so removals of keys shadowing
+  `Object.prototype` properties like `toString` are detected), and guards the
+  object branch against array new-values so an object-to-array transition sends
+  a full replacement instead of a bogus merge of array indices. The client's
+  `reconcileRoot` had the same prototype-chain membership check, which let a
+  removed root key shadowing an `Object.prototype` property survive
+  reconciliation on reconnect; it now uses `Object.hasOwn` as well.
+
+- 349a2a6: Detect stale transports on the client. If a call is left waiting while no inbound frames arrive for `staleTimeout` (default 30s), `RPCClient` treats the transport as disconnected: pending calls reject, the disconnect lifecycle runs, and the transport's new optional `close()` is called. This catches half-open connections (a browser WebSocket after laptop sleep, NAT expiry, or an ungraceful server death) that never fire `onClose` and previously left calls pending forever. Tune or disable with `new RPCClient(transport, ctx, {staleTimeout})`.
+
 ## 0.4.1
 
 ### Patch Changes
