@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+  # Manual escape hatch: GitHub occasionally drops a push event, leaving a
+  # merged "Version Packages" commit with nothing to publish it.
+  workflow_dispatch:
 
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
