@@ -34,12 +34,21 @@ class Project {
     this.name.value = next;
     return {ok: true};
   }
+
+  /**
+   * Returns the reflected signal itself rather than its value — the pattern for
+   * bulky payloads, so the reply carries a ref instead of a second copy.
+   */
+  getName() {
+    return {name: this.name};
+  }
 }
 
 interface ProjectApi {
   id: Signal<string>;
   name: Signal<string>;
   rename(next: string): Promise<unknown>;
+  getName(): Promise<{name: Signal<string>}>;
 }
 
 class TranscriptMessageItem {
@@ -723,6 +732,67 @@ describe('mixed-signals roundtrip', () => {
 
     stopTitle();
     stopProjectName();
+  });
+
+  it('returns a watched signal as a ref instead of a second copy', async () => {
+    vi.useFakeTimers();
+
+    const big = 'x'.repeat(50_000);
+    const project = new Project('42', big);
+    const rpc = new RPC({project});
+    const {serverTransport, clientTransport, flush} =
+      createLinkedTransportPair();
+    const frames: string[] = [];
+    const spiedServerTransport = {
+      ...serverTransport,
+      send(data: string) {
+        frames.push(data);
+        serverTransport.send(data);
+      },
+    };
+    const ProjectModel = createReflectedModel<ProjectApi>(
+      ['id', 'name'],
+      ['rename', 'getName'],
+    );
+    let client!: RPCClient;
+
+    rpc.registerModel('Project', Project);
+    const ctx: WireContext = {
+      get rpc() {
+        return client;
+      },
+    };
+    client = new RPCClient(clientTransport, ctx);
+    client.registerModel('Project', ProjectModel);
+
+    rpc.addClient(spiedServerTransport, 'client-1');
+    await flush();
+    await client.ready;
+
+    // Observe the signal so the client watches it — that subscription is what
+    // lets the server prove the client still holds the value and can be sent a
+    // bare `{'@S':id}` ref instead of the payload.
+    const stop = client.root.project.name.subscribe(() => undefined);
+    vi.advanceTimersByTime(10);
+    await flush();
+
+    frames.length = 0;
+    const pending = client.root.project.getName();
+    await flush();
+    const result = await pending;
+
+    // The client resolves the ref to a signal already carrying the value, so
+    // the call costs a couple dozen bytes instead of a second copy.
+    expect(result.name.value).toBe(big);
+    expect(frames.join('')).not.toContain(big);
+    expect(frames.join('').length).toBeLessThan(200);
+
+    // And it is the live signal, not a detached snapshot of one.
+    project.name.value = 'small';
+    await flush();
+    expect(result.name.value).toBe('small');
+
+    stop();
   });
 
   it('round-trips reflected models with nested signal-backed timeline items', async () => {

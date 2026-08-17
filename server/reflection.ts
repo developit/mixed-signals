@@ -114,8 +114,27 @@ export class Reflection {
       const signalValue = value.peek();
 
       if (clientId) {
-        this.lastSentValues.set(`${clientId}:${id}`, signalValue);
+        const key = `${clientId}:${id}`;
+        // Send a bare ref when we can prove the client already holds this exact
+        // value: its reviver resolves a `v`-less `{'@S':id}` against the signal
+        // it has. Re-inlining would ship the payload twice, which for something
+        // like a diff signal returned from an RPC is hundreds of KB of pure
+        // duplicate. Same idea as the model dedup below.
+        //
+        // Both halves of the proof matter. The last-sent value says the bytes
+        // got there; the live subscription says the client still has somewhere
+        // to put them — a watched signal is strongly held client-side, so it
+        // cannot have been collected out of the client's WeakRef cache. Check
+        // it before watch() below adds the subscription. Reconnects are safe on
+        // their own: removeClient() drops these entries when a client goes away
+        // or resumes, so a fresh connection always gets values inlined.
+        const alreadyHeld =
+          this.lastSentValues.has(key) &&
+          this.lastSentValues.get(key) === signalValue &&
+          !!this.subscriptions.get(id)?.has(clientId);
+        this.lastSentValues.set(key, signalValue);
         this.watch(clientId, id);
+        if (alreadyHeld) return {'@S': id};
       }
 
       return {'@S': id, v: this.serializeValue(signalValue, clientId)};
@@ -188,6 +207,21 @@ export class Reflection {
     return JSON.parse(JSON.stringify(serialized));
   }
 
+  /**
+   * Drop what we believe this client holds for a model's own signals, so the
+   * next serialization inlines their values instead of sending bare refs. A
+   * refresh means the client no longer trusts its copy — a ref pointing at that
+   * copy is worthless. Nested models are refreshed under their own markers.
+   */
+  private forgetClientSignalValues(instance: any, clientId: ClientId) {
+    for (const [key, prop] of Object.entries(instance)) {
+      if (key.startsWith('_') || !(prop instanceof Signal)) continue;
+
+      const id = this.signalIds.get(prop);
+      if (id !== undefined) this.lastSentValues.delete(`${clientId}:${id}`);
+    }
+  }
+
   serializeModelMarker(marker: string, clientId?: ClientId): any {
     const hashIdx = marker.lastIndexOf('#');
     if (hashIdx === -1) return null;
@@ -199,6 +233,7 @@ export class Reflection {
 
     if (clientId) {
       this.sentModels.get(clientId)?.delete(marker);
+      this.forgetClientSignalValues(instance, clientId);
     }
 
     return this.serialize(instance, clientId);
