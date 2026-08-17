@@ -85,6 +85,7 @@ During serialization, special objects are embedded in JSON:
 | Marker | Shape                                 | Meaning                                                                                                                                   |
 | ------ | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `@S`   | `{"@S": id, "v": value}`              | A server-side `Signal`. The client creates or reuses a `Signal` with the given ID and initial value.                                      |
+| `@S`   | `{"@S": id}`                          | The same signal, without its value: the client already holds it (identical last-sent value plus a live subscription), so the ref resolves against the signal it has. Returning a reflected signal from a method is therefore cheap — the value travels once, as a signal update. |
 | `@M`   | `{"@M": "TypeName#wireId", ...props}` | A server-side model instance. The client reuses a cached facade or creates a proxy facade directly from the serialized props. Custom registered constructors are still supported. |
 
 Properties beginning with `_` and all functions are stripped from serialized objects.
@@ -130,6 +131,11 @@ signal while ≥1 client is watching, and pushes diffs via `N:@S:`.
 
 **Reactivity is the subscription protocol.** If no component reads
 `user.name.value`, the server never sends updates for it.
+
+**A value travels once per client.** Once a client holds a signal and is
+watching it, later serializations send `{"@S": <id>}` alone. So a method with a
+bulky answer should return the signal that already carries it rather than its
+value — `return {diff: this.diff}`, not `return {diff: this.diff.value}`.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐

@@ -224,6 +224,85 @@ describe('Reflection', () => {
       expect(second['@M']).toMatch(/^Counter#/);
     });
 
+    it('sends a bare ref when a watching client already holds the value', () => {
+      const big = signal('x'.repeat(1000));
+      const first = reflection.serialize({diff: big}, 'clientA');
+      const id = first.diff['@S'] as number;
+      expect(first.diff.v).toBe(big.peek());
+
+      // The first serialization watched the signal on clientA's behalf, so the
+      // client provably still holds it: the repeat carries the id alone.
+      const second = reflection.serialize({diff: big}, 'clientA');
+      expect(second.diff).toEqual({'@S': id});
+    });
+
+    it('re-inlines the value once a watching client is behind', () => {
+      const big = signal('x'.repeat(1000));
+      reflection.serialize({diff: big}, 'clientA');
+      const id = reflection.serialize({diff: big}, 'clientA').diff['@S'];
+
+      // Unwatching stops updates, so a later change leaves the client stale and
+      // the next serialization has to carry the value again.
+      reflection.unwatch('clientA', id);
+      big.value = 'y'.repeat(1000);
+      expect(reflection.serialize({diff: big}, 'clientA').diff).toEqual({
+        '@S': id,
+        v: big.peek(),
+      });
+    });
+
+    it('inlines the value for a client that is not watching the signal', () => {
+      const big = signal('x'.repeat(1000));
+      const id = reflection.serialize({diff: big}, 'clientA').diff['@S'];
+      reflection.unwatch('clientA', id);
+
+      // Same value as last sent, but with no live subscription the client may
+      // have dropped the signal — proof is missing, so pay for the payload.
+      expect(reflection.serialize({diff: big}, 'clientA').diff).toEqual({
+        '@S': id,
+        v: big.peek(),
+      });
+    });
+
+    it('re-inlines for a client that reconnected', () => {
+      const big = signal('x'.repeat(1000));
+      const id = reflection.serialize({diff: big}, 'clientA').diff['@S'];
+      reflection.removeClient('clientA');
+      expect(reflection.serialize({diff: big}, 'clientA').diff).toEqual({
+        '@S': id,
+        v: big.peek(),
+      });
+    });
+
+    it('re-inlines a model own signals when refreshing it by marker', () => {
+      const {counter, serialized} = setupCounter(
+        reflection,
+        instances,
+        'clientA',
+      );
+      expect(serialized.count.v).toBe(counter.count.peek());
+
+      // A refresh means the client stopped trusting its copy of this model, so
+      // a ref pointing back at that copy would be worthless.
+      const refreshed = reflection.serializeModelMarker('Counter#0', 'clientA');
+      expect(refreshed.count.v).toBe(counter.count.peek());
+      expect(refreshed.name.v).toBe(counter.name.peek());
+    });
+
+    it('does not dedupe signal payloads across clients', () => {
+      const big = signal('x'.repeat(1000));
+      reflection.serialize({diff: big}, 'clientA');
+      expect(reflection.serialize({diff: big}, 'clientB').diff.v).toBe(
+        big.peek(),
+      );
+    });
+
+    it('inlines repeat payloads when serializing without a client', () => {
+      const big = signal('x'.repeat(1000));
+      reflection.serialize({diff: big});
+      expect(reflection.serialize({diff: big}).diff.v).toBe(big.peek());
+    });
+
     it('different clients get full serialization independently', () => {
       reflection.registerModel('Counter', Counter);
       const c = new Counter();
