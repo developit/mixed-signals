@@ -7,6 +7,7 @@ import {addPrefix, stripPrefix} from '../../server/forwarding.ts';
 import {createModel} from '../../server/model.ts';
 import {RPC} from '../../server/rpc.ts';
 import {
+  FINAL_SIGNALS_METHOD,
   formatNotificationMessage,
   parseWireMessage,
   parseWireParams,
@@ -453,6 +454,83 @@ describe('protocol-level forwarding', () => {
     await flush();
     expect(getSignalUpdateValues(firstMessages)).not.toContain('Third update');
     expect(getSignalUpdateValues(secondMessages)).not.toContain('Third update');
+  });
+
+  it('relays an upstream final notification and answers later watchers locally', async () => {
+    const {
+      brokerTransport,
+      serverUpstreamTransport,
+      serverDownstreamTransport,
+      browserTransport,
+      createDownstreamPair,
+      flush,
+    } = createLinkedTransports();
+    const second = createDownstreamPair('second');
+    const firstMessages: string[] = [];
+    const secondMessages: string[] = [];
+    const upstreamMessages: string[] = [];
+    browserTransport.onMessage((data) => {
+      firstMessages.push(data.toString());
+    });
+    second.browserTransport.onMessage((data) => {
+      secondMessages.push(data.toString());
+    });
+    const upstreamSend = serverUpstreamTransport.send.bind(
+      serverUpstreamTransport,
+    );
+    serverUpstreamTransport.send = (data: string) => {
+      upstreamMessages.push(data);
+      upstreamSend(data);
+    };
+
+    const brokerRpc = new RPC();
+    const project = {name: signal('Initial')};
+    brokerRpc.expose({project});
+    brokerRpc.addClient(brokerTransport);
+
+    const serverRpc = new RPC();
+    serverRpc.addUpstream(serverUpstreamTransport);
+    await flush();
+
+    serverRpc.addClient(serverDownstreamTransport, 'browser-1');
+    serverRpc.addClient(second.serverTransport, 'browser-2');
+    await flush();
+
+    const rootMessage = parseWireMessage(firstMessages[0]);
+    if (rootMessage?.type !== 'notification') {
+      throw new Error('Expected root notification');
+    }
+    const [root] = parseWireParams<any[]>(rootMessage.payload);
+    const signalId = root.project.name['@S'];
+    const finalFrame = formatNotificationMessage(FINAL_SIGNALS_METHOD, [
+      signalId,
+    ]);
+
+    browserTransport.send(
+      formatNotificationMessage(WATCH_SIGNALS_METHOD, [signalId]),
+    );
+    await flush();
+    firstMessages.length = 0;
+    secondMessages.length = 0;
+    upstreamMessages.length = 0;
+
+    brokerRpc.markFinal(project.name);
+    await flush();
+    expect(firstMessages).toEqual([finalFrame]);
+    expect(secondMessages).toEqual([]);
+
+    // The second browser holds the cached root, which predates the @F.
+    second.browserTransport.send(
+      formatNotificationMessage(WATCH_SIGNALS_METHOD, [signalId]),
+    );
+    await flush();
+    expect(secondMessages).toEqual([finalFrame]);
+    expect(upstreamMessages).toEqual([]);
+
+    firstMessages.length = 0;
+    project.name.value = 'After final';
+    await flush();
+    expect(getSignalUpdateValues(firstMessages)).not.toContain('After final');
   });
 
   it('does not broadcast method-returned model updates to clients that never saw the model', async () => {

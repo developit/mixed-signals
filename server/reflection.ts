@@ -1,5 +1,6 @@
 import {Signal} from '@preact/signals-core';
 import {
+  FINAL_SIGNALS_METHOD,
   formatNotificationMessage,
   SIGNAL_UPDATE_METHOD,
 } from '../shared/protocol.ts';
@@ -35,6 +36,7 @@ export class Reflection {
   private subscriptions = new Map<SignalId, Set<ClientId>>();
   private signalUnsubscribers = new Map<SignalId, () => void>();
   private lastSentValues = new Map<string, any>();
+  private finalSignals = new WeakSet<Signal<any>>();
   private sentModels = new Map<ClientId, Set<string>>();
   private nextSignalId = 1;
   private rpc: RpcSender;
@@ -112,6 +114,12 @@ export class Reflection {
     if (value instanceof Signal) {
       const id = this.getSignalId(value);
       const signalValue = value.peek();
+
+      if (this.finalSignals.has(value)) {
+        // Always inlined: an unwatched signal is only weakly held client-side,
+        // so a bare ref could fail to resolve.
+        return {'@S': id, v: this.serializeValue(signalValue, clientId), f: 1};
+      }
 
       if (clientId) {
         const key = `${clientId}:${id}`;
@@ -239,7 +247,44 @@ export class Reflection {
     return this.serialize(instance, clientId);
   }
 
+  markFinal(signals: Iterable<Signal<any>>) {
+    // Only watchers need an @F; everyone else sees the flag on the next
+    // serialization.
+    const idsByClient = new Map<ClientId, SignalId[]>();
+    for (const sig of signals) {
+      if (this.finalSignals.has(sig)) continue;
+      this.finalSignals.add(sig);
+
+      const id = this.signalIds.get(sig);
+      if (id === undefined) continue;
+      const subs = this.subscriptions.get(id);
+      if (!subs) continue;
+
+      for (const clientId of subs) {
+        let ids = idsByClient.get(clientId);
+        if (!ids) {
+          ids = [];
+          idsByClient.set(clientId, ids);
+        }
+        ids.push(id);
+      }
+      this.subscriptions.delete(id);
+      this.signalUnsubscribers.get(id)?.();
+      this.signalUnsubscribers.delete(id);
+    }
+
+    for (const [clientId, ids] of idsByClient) {
+      this.rpc.send(
+        clientId,
+        formatNotificationMessage(FINAL_SIGNALS_METHOD, ids),
+      );
+    }
+  }
+
   watch(clientId: ClientId, signalId: SignalId) {
+    const sig = this.signals.get(signalId);
+    if (sig && this.finalSignals.has(sig)) return;
+
     let subs = this.subscriptions.get(signalId);
     if (!subs) {
       subs = new Set();
@@ -247,25 +292,20 @@ export class Reflection {
     }
 
     subs.add(clientId);
+    if (!sig) return;
 
     if (!this.signalUnsubscribers.has(signalId)) {
-      const sig = this.signals.get(signalId);
-      if (sig) {
-        // The server only subscribes to source signals once a client cares.
-        // Subscribing notifies immediately, which doubles as catch-up for
-        // this first watcher.
-        const unsubscribe = sig.subscribe(() => {
-          this.notifySubscribers(signalId);
-        });
-        this.signalUnsubscribers.set(signalId, unsubscribe);
-      }
+      // The server only subscribes to source signals once a client cares.
+      // Subscribing notifies immediately, which doubles as catch-up for
+      // this first watcher.
+      const unsubscribe = sig.subscribe(() => {
+        this.notifySubscribers(signalId);
+      });
+      this.signalUnsubscribers.set(signalId, unsubscribe);
     } else {
       // A live subscription only forwards future changes. A client joining it
       // may have missed updates while unwatched, so send a catch-up delta.
-      const sig = this.signals.get(signalId);
-      if (sig) {
-        this.sendUpdateIfChanged(clientId, signalId, sig.peek());
-      }
+      this.sendUpdateIfChanged(clientId, signalId, sig.peek());
     }
   }
 

@@ -1,3 +1,4 @@
+import type {Signal} from '@preact/signals-core';
 import {
   type ConnectionInfo,
   formatErrorMessage,
@@ -64,6 +65,15 @@ export class RPC {
     if (root !== undefined) {
       this.expose(root);
     }
+  }
+
+  /**
+   * Promise clients that `signals` will never change again. They serialize
+   * with the final flag from now on, so observing them sends no `@W`, and
+   * clients already watching one are told with `@F` to stop.
+   */
+  markFinal(...signals: Signal<any>[]) {
+    this.reflection.markFinal(signals);
   }
 
   registerModel(name: string, Ctor: ModelConstructor) {

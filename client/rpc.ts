@@ -1,6 +1,7 @@
 import type {Signal} from '@preact/signals-core';
 import {
   type ConnectionInfo,
+  FINAL_SIGNALS_METHOD,
   formatCallMessage,
   formatErrorMessage,
   formatNotificationMessage,
@@ -170,9 +171,11 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
       const reviver = (_key: string, val: any) => {
         if (typeof val === 'object' && val) {
           if ('@S' in val) {
-            return Object.hasOwn(val, 'v')
+            const sig = Object.hasOwn(val, 'v')
               ? this.reflection.syncSignalSnapshot(val['@S'], val.v)
               : this.reflection.getOrCreateSignal(val['@S'], undefined);
+            if (val.f) this.reflection.markSignalFinal(sig);
+            return sig;
           }
 
           if ('@M' in val) {
@@ -581,6 +584,8 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
     } else if (method === SIGNAL_UPDATE_METHOD) {
       const [id, value, mode] = params;
       this.reflection.handleUpdate(id, value, mode);
+    } else if (method === FINAL_SIGNALS_METHOD) {
+      this.reflection.markSignalsFinal(params as Array<number | string>);
     } else {
       for (const listener of this.notificationListeners) {
         listener(method, params);

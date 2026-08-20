@@ -71,6 +71,7 @@ All messages are compact, newline-free text strings.
 | `R{id}:{result}`             | Successful response to call `{id}`. `{result}` is a single JSON value.     |
 | `E{id}:{error}`              | Error response to call `{id}`. `{error}` is `{"code":-1,"message":"..."}`. |
 | `N:@S:{id},{value}[,{mode}]` | Signal update notification. `{mode}` is omitted for full replacement.      |
+| `N:@F:{id},{id},...`         | These signals are now final: the client releases its subscriptions.        |
 
 #### Method Routing
 
@@ -86,6 +87,7 @@ During serialization, special objects are embedded in JSON:
 | ------ | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `@S`   | `{"@S": id, "v": value}`              | A server-side `Signal`. The client creates or reuses a `Signal` with the given ID and initial value.                                      |
 | `@S`   | `{"@S": id}`                          | The same signal, without its value: the client already holds it (identical last-sent value plus a live subscription), so the ref resolves against the signal it has. Returning a reflected signal from a method is therefore cheap — the value travels once, as a signal update. |
+| `@S`   | `{"@S": id, "v": value, "f": 1}`      | A final signal: the server promises it will never change. The client still gets a `Signal`, but observing it sends no `@W`, and the server opens no subscription for it. |
 | `@M`   | `{"@M": "TypeName#wireId", ...props}` | A server-side model instance. The client reuses a cached facade or creates a proxy facade directly from the serialized props. Custom registered constructors are still supported. |
 
 Properties beginning with `_` and all functions are stripped from serialized objects.
@@ -136,6 +138,15 @@ signal while ≥1 client is watching, and pushes diffs via `N:@S:`.
 watching it, later serializations send `{"@S": <id>}` alone. So a method with a
 bulky answer should return the signal that already carries it rather than its
 value — `return {diff: this.diff}`, not `return {diff: this.diff.value}`.
+
+**Settled data opts out of the protocol.** `rpc.markFinal(sig)` promises a
+signal will never change again. It serializes with `"f": 1`, so observing it
+produces no `@W` and the server never subscribes to it; clients already
+watching it receive `N:@F:` and stop treating it as watched. The promise is
+permanent: a reconnect or process change never makes a held signal live again.
+Two costs follow from "never watched": a final signal is only weakly held on
+the client, so it is always re-sent inline rather than as a bare `{"@S": id}`
+ref, and an old client that ignores the flag simply keeps watching.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
@@ -204,6 +215,7 @@ Reserved methods:
 |  `@U`  | c→s | `id,id,...`       | unsubscribe                                      |
 |  `@M`  | c→s | `"Type#id",...`  | refresh held model facades by marker            |
 |  `@S`  | s→c | `id,value[,mode]` | signal `id` changed                              |
+|  `@F`  | s→c | `id,id,...`       | signals are final; release their subscriptions   |
 
 Routing on server (`callMethod`):
 

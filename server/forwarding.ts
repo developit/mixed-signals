@@ -1,4 +1,5 @@
 import {
+  FINAL_SIGNALS_METHOD,
   formatCallMessage,
   formatErrorMessage,
   formatNotificationMessage,
@@ -165,6 +166,7 @@ export class ForwardedUpstream {
   private rootSignalIds = new Set<SignalId>();
   private signalSubscriptions = new Map<SignalId, Set<string>>();
   private signalVisibility = new Map<SignalId, Set<string>>();
+  private finalSignalIds = new Set<SignalId>();
 
   constructor(prefix: string, transport: Transport, host: UpstreamHost) {
     this.prefix = prefix;
@@ -200,6 +202,11 @@ export class ForwardedUpstream {
         this.root = addPrefix(this.prefix, rootValue);
         this._resolveReady();
         this.host.onUpstreamRootChanged();
+        return;
+      }
+
+      if (parsed.method === FINAL_SIGNALS_METHOD) {
+        this.forwardFinalSignals(parseWireParams<SignalId[]>(parsed.payload));
         return;
       }
 
@@ -278,6 +285,43 @@ export class ForwardedUpstream {
   }
 
   /**
+   * Relay an upstream `@F` to the clients an update would have reached, and
+   * remember the ids: the cached root predates the `@F`, so a client that
+   * watches one of them later is answered locally.
+   */
+  private forwardFinalSignals(signalIds: SignalId[]) {
+    const idsByClient = new Map<string, SignalId[]>();
+    for (const signalId of signalIds) {
+      this.finalSignalIds.add(signalId);
+      const subscribers = this.signalSubscriptions.get(signalId);
+      const recipients =
+        subscribers && subscribers.size > 0
+          ? subscribers
+          : this.signalVisibility.get(signalId);
+      this.signalSubscriptions.delete(signalId);
+      this.signalVisibility.delete(signalId);
+      if (!recipients) continue;
+
+      const prefixedId = `${this.prefix}${SEP}${signalId}`;
+      for (const clientId of recipients) {
+        let ids = idsByClient.get(clientId);
+        if (!ids) {
+          ids = [];
+          idsByClient.set(clientId, ids);
+        }
+        ids.push(prefixedId);
+      }
+    }
+
+    for (const [clientId, ids] of idsByClient) {
+      this.host.send(
+        clientId,
+        formatNotificationMessage(FINAL_SIGNALS_METHOD, ids),
+      );
+    }
+  }
+
+  /**
    * Forward a method call from a downstream client to the upstream.
    */
   forwardCall(
@@ -341,10 +385,15 @@ export class ForwardedUpstream {
    */
   forwardWatch(clientId: string, signalIds: SignalId[]) {
     const toWatch: SignalId[] = [];
-
-    this.rememberVisibleSignals(clientId, signalIds);
+    let finalIds: SignalId[] | undefined;
 
     for (const signalId of new Set(signalIds)) {
+      if (this.finalSignalIds.has(signalId)) {
+        (finalIds ??= []).push(`${this.prefix}${SEP}${signalId}`);
+        continue;
+      }
+
+      this.rememberVisibleSignals(clientId, [signalId]);
       let subscribers = this.signalSubscriptions.get(signalId);
       const wasUnwatched = !subscribers || subscribers.size === 0;
       if (!subscribers) {
@@ -359,6 +408,12 @@ export class ForwardedUpstream {
     if (toWatch.length > 0) {
       this.transport.send(
         formatNotificationMessage(WATCH_SIGNALS_METHOD, toWatch),
+      );
+    }
+    if (finalIds) {
+      this.host.send(
+        clientId,
+        formatNotificationMessage(FINAL_SIGNALS_METHOD, finalIds),
       );
     }
   }
