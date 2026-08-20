@@ -200,6 +200,9 @@ Messages sent on one end are delivered to the other via queueMicrotask.
 to downstream clients. All models from the upstream are automatically
 forwarded — no per-model declaration needed.
   - `expose(root: any) => void`
+  - `markFinal(...signals: Signal<any>[]) => void` — Promise clients that `signals` will never change again. They serialize
+with the final flag from now on, so observing them sends no `@W`, and
+clients already watching one are told with `@F` to stop.
   - `notify(method: string, params: any[], clientId?: string) => void`
   - `registerModel(name: string, Ctor: ModelConstructor) => void`
 
@@ -221,7 +224,7 @@ Signals become read-only client signals and methods become async RPC calls.
 #### `ReflectedMethod`
 
 - Kind: **Type alias**
-- Type: `(args: Parameters<T>) => Promise<Reflected<Awaited<ReturnType<T>>>>`
+- Type: `(...args: Parameters<T>) => Promise<Reflected<Awaited<ReturnType<T>>>>`
 
 #### `ReflectedModel`
 

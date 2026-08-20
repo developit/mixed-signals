@@ -81,7 +81,7 @@ function sigToLine(sig) {
   const params = (sig.parameters || [])
     .map(
       (p) =>
-        `${p.name}${p.flags?.isOptional ? '?' : ''}: ${typeToString(p.type)}`,
+        `${p.flags?.isRest ? '...' : ''}${p.name}${p.flags?.isOptional ? '?' : ''}: ${typeToString(p.type)}`,
     )
     .join(', ');
   const ret = typeToString(sig.type);

@@ -11,10 +11,19 @@ import {
   ReflectedCounter,
 } from './helpers.ts';
 
-function connect(rpc: RPC, clientId?: string) {
+function connect(rpc: RPC, clientId?: string, clientFrames?: string[]) {
   const {serverTransport, clientTransport, flush} = createLinkedTransportPair();
   const ctx = {rpc: null as any};
-  const rpcClient = new RPCClient(clientTransport, ctx);
+  const transport = clientFrames
+    ? {
+        ...clientTransport,
+        send(data: string) {
+          clientFrames.push(data);
+          clientTransport.send(data);
+        },
+      }
+    : clientTransport;
+  const rpcClient = new RPCClient(transport, ctx);
   ctx.rpc = rpcClient;
   rpcClient.registerModel('Counter', ReflectedCounter);
   const cleanup = rpc.addClient(serverTransport, clientId);
@@ -527,6 +536,63 @@ describe('Integration: Server <-> Client', () => {
 
     expect(a.rpcClient.root.count.peek()).toBe(77);
     expect(b.rpcClient.root.count.peek()).toBe(77);
+  });
+
+  it('never watches a signal the server marked final', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    rpc.expose(root);
+    rpc.markFinal(root.name);
+
+    const clientFrames: string[] = [];
+    const {rpcClient, flush} = connect(rpc, 'c1', clientFrames);
+    await flush();
+    await rpcClient.ready;
+
+    expect(rpcClient.root.name.value).toBe('default');
+    rpcClient.root.name.subscribe(() => undefined);
+    vi.advanceTimersByTime(10);
+    await flush();
+    expect(clientFrames.filter((f) => f.startsWith('N:@W:'))).toEqual([]);
+
+    rpcClient.root.count.subscribe(() => undefined);
+    vi.advanceTimersByTime(10);
+    await flush();
+    expect(clientFrames.filter((f) => f.startsWith('N:@W:'))).toHaveLength(1);
+    root.count.value = 5;
+    await flush();
+    expect(rpcClient.root.count.peek()).toBe(5);
+  });
+
+  it('stops treating a watched signal as watched once the server marks it final', async () => {
+    vi.useFakeTimers();
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    rpc.expose(root);
+
+    const clientFrames: string[] = [];
+    const {rpcClient, flush} = connect(rpc, 'c1', clientFrames);
+    await flush();
+    await rpcClient.ready;
+
+    const stop = rpcClient.root.count.subscribe(() => undefined);
+    vi.advanceTimersByTime(10);
+    await flush();
+    root.count.value = 1;
+    await flush();
+    expect(rpcClient.root.count.peek()).toBe(1);
+
+    clientFrames.length = 0;
+    rpc.markFinal(root.count);
+    await flush();
+    stop();
+    rpcClient.root.count.subscribe(() => undefined);
+    vi.advanceTimersByTime(10);
+    await flush();
+    expect(clientFrames).toEqual([]);
   });
 
   it('client disconnect cleans up subscriptions', async () => {

@@ -58,6 +58,7 @@ export class ClientReflection {
   private signalFinalizerTokens = new WeakMap<Signal<any>, object>();
   private signalFinalizer?: FinalizationRegistry<SignalId>;
   private activeSignals = new Set<Signal<any>>();
+  private finalSignals = new WeakSet<Signal<any>>();
   private models = new Map<string, CacheRef<object>>();
   private modelFinalizerTokens = new WeakMap<object, object>();
   private modelFinalizer?: FinalizationRegistry<string>;
@@ -100,6 +101,7 @@ export class ClientReflection {
     this.signals.clear();
     this.signalIds = new WeakMap();
     this.activeSignals.clear();
+    this.finalSignals = new WeakSet();
     this.models.clear();
     this.modelSignals.clear();
     this.refreshedRootModelMarkers.clear();
@@ -413,12 +415,14 @@ export class ClientReflection {
 
     createdSignal = signal(initialValue, {
       watched: () => {
+        if (this.finalSignals.has(createdSignal)) return;
         this.activeSignals.add(createdSignal);
         this.refreshStaleModelsForSignal(createdSignal);
         // Only tell the server once the client actually observes this signal.
         this.scheduleWatch(createdSignal);
       },
       unwatched: () => {
+        if (this.finalSignals.has(createdSignal)) return;
         // Debounce unwatch so transient unmount/remount cycles stay subscribed.
         this.activeSignals.delete(createdSignal);
         this.scheduleUnwatch(createdSignal);
@@ -427,6 +431,28 @@ export class ClientReflection {
 
     this.rememberSignal(id, createdSignal);
     return createdSignal;
+  }
+
+  /**
+   * The server promised this signal will never change again and has already
+   * dropped its end of any subscription, so no @U is owed: observing the
+   * signal stops producing watch traffic, and it stops being held as watched.
+   */
+  markSignalFinal(sig: Signal<any>) {
+    if (this.finalSignals.has(sig)) return;
+
+    this.finalSignals.add(sig);
+    this.watchBatch.delete(sig);
+    this.unwatchBatch.delete(sig);
+    this.activeSignals.delete(sig);
+    this.watchedSignals.delete(sig);
+  }
+
+  markSignalsFinal(ids: Iterable<SignalId>) {
+    for (const id of ids) {
+      const sig = this.getSignalById(id);
+      if (sig) this.markSignalFinal(sig);
+    }
   }
 
   syncSignalSnapshot(id: SignalId, value: any): Signal<any> {
@@ -607,6 +633,7 @@ export class ClientReflection {
 
     if (this.watchBatch.delete(from)) this.watchBatch.add(to);
     if (this.unwatchBatch.delete(from)) this.unwatchBatch.add(to);
+    if (this.finalSignals.has(from)) this.markSignalFinal(to);
   }
 
   createModelFacade(serialized: any): any {

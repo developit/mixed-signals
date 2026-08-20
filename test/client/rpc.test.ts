@@ -355,6 +355,70 @@ describe('RPCClient', () => {
     });
   });
 
+  describe('final signals', () => {
+    it('never sends @W for a signal flagged final', async () => {
+      vi.useFakeTimers();
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      transport.emit(
+        'N:@R:{"done":{"@S":1,"v":"a","f":1},"live":{"@S":2,"v":0}}',
+      );
+      await client.ready;
+
+      client.root.done.subscribe(() => undefined);
+      client.root.live.subscribe(() => undefined);
+      vi.advanceTimersByTime(10);
+
+      expect(client.root.done.peek()).toBe('a');
+      expect(transport.sent).toEqual(['N:@W:2']);
+    });
+
+    it('@F releases a watched signal without sending @U', async () => {
+      vi.useFakeTimers();
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      transport.emit('N:@R:{"count":{"@S":1,"v":1}}');
+      await client.ready;
+
+      const stop = client.root.count.subscribe(() => undefined);
+      vi.advanceTimersByTime(10);
+      expect(transport.sent).toEqual(['N:@W:1']);
+
+      transport.emit('N:@F:1');
+      stop();
+      client.root.count.subscribe(() => undefined);
+      vi.advanceTimersByTime(10);
+
+      expect(transport.sent).toEqual(['N:@W:1']);
+    });
+
+    it('keeps a signal final across a process change', async () => {
+      vi.useFakeTimers();
+      const transport1 = new FakeTransport();
+      const client = new RPCClient(transport1, createContext());
+      transport1.emit(
+        'N:@R:{"count":{"@S":1,"v":1,"f":1}},{"connectionId":"c1","processId":"p1","resumed":false}',
+      );
+      await client.ready;
+
+      const count = client.root.count;
+      count.subscribe(() => undefined);
+      vi.advanceTimersByTime(10);
+      expect(transport1.sent).toEqual([]);
+
+      const transport2 = new FakeTransport();
+      client.reconnect(transport2);
+      transport2.emit(
+        'N:@R:{"count":{"@S":9,"v":1}},{"connectionId":"c1","processId":"p2","resumed":false}',
+      );
+      await client.ready;
+      vi.advanceTimersByTime(10);
+
+      expect(client.root.count).toBe(count);
+      expect(transport2.sent).toEqual([]);
+    });
+  });
+
   describe('expose', () => {
     it('dispatches a top-level method against the exposed root and emits R', async () => {
       const transport = new FakeTransport();

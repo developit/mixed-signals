@@ -3,6 +3,8 @@ import {beforeEach, describe, expect, it} from 'vitest';
 import {Instances} from '../../server/instances.ts';
 import {Reflection} from '../../server/reflection.ts';
 import {
+  FINAL_SIGNALS_METHOD,
+  formatNotificationMessage,
   parseWireMessage,
   parseWireParams,
   SIGNAL_UPDATE_METHOD,
@@ -54,6 +56,59 @@ describe('Reflection', () => {
     sender = new FakeSender();
     instances = new Instances();
     reflection = new Reflection(sender, instances);
+  });
+
+  describe('final signals', () => {
+    it('serializes a final signal with the f flag and never subscribes to it', () => {
+      reflection.registerModel('Counter', Counter);
+      const c = new Counter();
+      instances.register('0', c);
+      reflection.markFinal([c.name]);
+
+      const serialized = reflection.serialize(c, 'c1');
+
+      expect(serialized.name).toEqual({
+        '@S': serialized.name['@S'],
+        v: 'default',
+        f: 1,
+      });
+      expect(serialized.count).not.toHaveProperty('f');
+
+      reflection.watch('c1', serialized.name['@S']);
+      c.name.value = 'changed';
+      expect(sender.sent).toEqual([]);
+    });
+
+    it('notifies every subscribed client when a signal becomes final', () => {
+      const {counter, countId} = setupCounter(reflection, instances, 'c1');
+      reflection.serialize(counter, 'c2');
+      reflection.serialize(counter, 'c3');
+      reflection.unwatch('c3', countId);
+
+      reflection.markFinal([counter.count]);
+
+      const finalFrame = formatNotificationMessage(FINAL_SIGNALS_METHOD, [
+        countId,
+      ]);
+      expect(sender.sent).toEqual([
+        {clientId: 'c1', message: finalFrame},
+        {clientId: 'c2', message: finalFrame},
+      ]);
+
+      sender.sent.length = 0;
+      counter.count.value = 99;
+      expect(sender.sent).toEqual([]);
+    });
+
+    it('re-serializes a final signal inline instead of as a held ref', () => {
+      const {counter, serialized} = setupCounter(reflection, instances, 'c1');
+      reflection.watch('c1', serialized.count['@S']);
+      reflection.markFinal([counter.count]);
+
+      const again = reflection.serialize(counter.count, 'c1');
+
+      expect(again).toEqual({'@S': serialized.count['@S'], v: 0, f: 1});
+    });
   });
 
   describe('model registration', () => {

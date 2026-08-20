@@ -25,6 +25,7 @@ export const SIGNAL_UPDATE_METHOD = '@S';
 export const WATCH_SIGNALS_METHOD = '@W';
 export const UNWATCH_SIGNALS_METHOD = '@U';
 export const REFRESH_MODELS_METHOD = '@M';
+export const FINAL_SIGNALS_METHOD = '@F';
 
 type ParsedCallMessage = {
   type: 'call';
