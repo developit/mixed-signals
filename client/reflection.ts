@@ -64,11 +64,12 @@ export class ClientReflection {
   private modelFinalizer?: FinalizationRegistry<string>;
   private modelSignals = new Map<string, Set<CacheRef<Signal<any>>>>();
   private signalModelMarkers = new WeakMap<Signal<any>, Set<string>>();
+  private rootSignals = new WeakSet<Signal<any>>();
   private refreshedRootModelMarkers = new Set<string>();
   private staleModelMarkers = new Set<string>();
   private refreshingModelMarkers = new Set<string>();
   private modelRefreshGeneration = 0;
-  private collectingRootModels = false;
+  private collectingRootSnapshot = false;
   private modelRegistry = new Map<string, ReflectedModelConstructor>();
   private rpc: RPCClient;
   private ctx: WireContext;
@@ -78,6 +79,7 @@ export class ClientReflection {
   private watchedSignals = new Set<Signal<any>>();
   private watchBatch = new Set<Signal<any>>();
   private unwatchBatch = new Set<Signal<any>>();
+  private modelRefreshBatch = new Set<string>();
 
   constructor(rpc: RPCClient, ctx?: any) {
     this.rpc = rpc;
@@ -106,11 +108,12 @@ export class ClientReflection {
     this.models.clear();
     this.modelSignals.clear();
     this.signalModelMarkers = new WeakMap();
+    this.rootSignals = new WeakSet();
     this.refreshedRootModelMarkers.clear();
     this.staleModelMarkers.clear();
     this.refreshingModelMarkers.clear();
     this.modelRefreshGeneration++;
-    this.collectingRootModels = false;
+    this.collectingRootSnapshot = false;
     this.watchedSignals.clear();
   }
 
@@ -125,6 +128,7 @@ export class ClientReflection {
     this.refreshingModelMarkers.clear();
     this.modelRefreshGeneration++;
     this.refreshedRootModelMarkers.clear();
+    this.rootSignals = new WeakSet();
     this.staleModelMarkers = new Set(this.models.keys());
   }
 
@@ -156,7 +160,11 @@ export class ClientReflection {
       }
       this.rpc.notify(WATCH_SIGNALS_METHOD, ids);
     }
-    if (this.watchBatch.size === 0 && this.unwatchBatch.size === 0) {
+    if (
+      this.watchBatch.size === 0 &&
+      this.unwatchBatch.size === 0 &&
+      this.modelRefreshBatch.size === 0
+    ) {
       this.cancelWatchFlush();
     }
     return ids;
@@ -168,12 +176,12 @@ export class ClientReflection {
 
   /** @internal */
   beginRootSnapshot() {
-    this.collectingRootModels = true;
+    this.collectingRootSnapshot = true;
   }
 
   /** @internal */
   endRootSnapshot() {
-    this.collectingRootModels = false;
+    this.collectingRootSnapshot = false;
   }
 
   /** @internal */
@@ -225,6 +233,7 @@ export class ClientReflection {
     this.cancelWatchFlush();
     this.watchBatch.clear();
     this.unwatchBatch.clear();
+    this.modelRefreshBatch.clear();
   }
 
   private getSignalById(id: SignalId): Signal<any> | undefined {
@@ -388,6 +397,8 @@ export class ClientReflection {
   }
 
   private flushWatches() {
+    this.flushModelRefreshes();
+
     const watchSignals = Array.from(this.watchBatch).filter(
       (sig) =>
         this.activeSignals.has(sig) &&
@@ -436,16 +447,19 @@ export class ClientReflection {
   }
 
   getOrCreateSignal(id: SignalId, initialValue: any): Signal<any> {
-    const existingSignal = this.getSignalById(id);
-    if (existingSignal) return existingSignal;
+    const sig = this.getSignalById(id) ?? this.createSignal(id, initialValue);
+    if (this.collectingRootSnapshot) this.rootSignals.add(sig);
+    return sig;
+  }
 
+  private createSignal(id: SignalId, initialValue: any): Signal<any> {
     let createdSignal!: Signal<any>;
 
     createdSignal = signal(initialValue, {
       watched: () => {
         if (this.finalSignals.has(createdSignal)) return;
         this.activeSignals.add(createdSignal);
-        this.refreshStaleModelsForSignal(createdSignal);
+        this.scheduleModelRefresh(createdSignal);
         // Only tell the server once the client actually observes this signal.
         if (!this.signalNeedsModelRefresh(createdSignal)) {
           this.scheduleWatch(createdSignal);
@@ -579,8 +593,10 @@ export class ClientReflection {
     }
   }
 
-  /** A signal's wire id is current as soon as one model that owns it is fresh. */
+  /** A signal's wire id is current once the latest root or one model that owns it is fresh. */
   private signalNeedsModelRefresh(sig: Signal<any>): boolean {
+    if (this.rootSignals.has(sig)) return false;
+
     const markers = this.signalModelMarkers.get(sig);
     if (!markers || markers.size === 0) return false;
 
@@ -590,13 +606,29 @@ export class ClientReflection {
     return true;
   }
 
-  private refreshStaleModelsForSignal(sig: Signal<any>) {
-    const markers = Array.from(this.signalModelMarkers.get(sig) ?? []).filter(
+  private scheduleModelRefresh(sig: Signal<any>) {
+    let queued = false;
+    for (const marker of this.signalModelMarkers.get(sig) ?? []) {
+      if (
+        this.staleModelMarkers.has(marker) &&
+        !this.refreshingModelMarkers.has(marker)
+      ) {
+        this.modelRefreshBatch.add(marker);
+        queued = true;
+      }
+    }
+    if (queued) this.queueWatchFlush();
+  }
+
+  private flushModelRefreshes() {
+    const markers = Array.from(this.modelRefreshBatch).filter(
       (marker) =>
+        this.getModel(marker) &&
         this.staleModelMarkers.has(marker) &&
         !this.refreshingModelMarkers.has(marker) &&
-        this.getModel(marker),
+        this.isModelMarkerActive(marker),
     );
+    this.modelRefreshBatch.clear();
     if (markers.length === 0) return;
 
     const generation = this.beginModelRefresh(markers);
@@ -663,6 +695,7 @@ export class ClientReflection {
 
     if (this.watchBatch.delete(from)) this.watchBatch.add(to);
     if (this.unwatchBatch.delete(from)) this.unwatchBatch.add(to);
+    if (this.rootSignals.has(from)) this.rootSignals.add(to);
     if (this.finalSignals.has(from)) this.markSignalFinal(to);
   }
 
@@ -678,7 +711,7 @@ export class ClientReflection {
     const wireId = hashIdx !== -1 ? raw.slice(hashIdx + 1) : undefined;
     const data = {...serialized, '@wireId': wireId};
     const hasModelData = Object.keys(serialized).some((key) => key !== '@M');
-    if (this.collectingRootModels && hasModelData) {
+    if (this.collectingRootSnapshot && hasModelData) {
       this.refreshedRootModelMarkers.add(raw);
     }
 

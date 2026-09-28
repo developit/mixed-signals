@@ -34,13 +34,19 @@ class TestTransport implements Transport {
 type Detail = {title: Signal<string>; status: Signal<string>};
 const clients: RPCClient[] = [];
 
-function detailPayload(offset = 0) {
+function detailPayload(offset = 0, marker = 'Detail#detail') {
   return {
-    '@M': 'Detail#detail',
+    '@M': marker,
     title: {'@S': offset + 1, v: `title-${offset}`},
     status: {'@S': offset + 2, v: 'ready'},
   };
 }
+
+const sharedRootSignalPayload = {
+  '@M': 'Detail#detail',
+  title: {'@S': 'version', v: 1},
+  status: {'@S': 2, v: 'ready'},
+} as unknown as ReturnType<typeof detailPayload>;
 
 function receiveRoot(
   transport: TestTransport,
@@ -56,13 +62,19 @@ function receiveRoot(
   transport.receive(`N:@R:${JSON.stringify(root)},${JSON.stringify(info)}`);
 }
 
-async function setup(payload = detailPayload()) {
+function receivePlainRoot(transport: TestTransport, processId = 'p1') {
+  const root = {version: {'@S': 'version', v: 1}};
+  const info = {connectionId: 'c1', processId, resumed: false};
+  transport.receive(`N:@R:${JSON.stringify(root)},${JSON.stringify(info)}`);
+}
+
+async function setup(payload = detailPayload(), receive = receiveRoot) {
   const transport = new TestTransport();
   const client = new RPCClient(transport);
   clients.push(client);
-  receiveRoot(transport);
+  receive(transport);
   await client.ready;
-  const pending = client.root.loadDetail();
+  const pending = client.call('loadDetail');
   transport.receive(`R1:${JSON.stringify(payload)}`);
   const model: Reflected<Detail> = await pending;
   transport.sent.length = 0;
@@ -126,6 +138,7 @@ describe('method-returned model reacquisition', () => {
     await vi.advanceTimersByTimeAsync(10);
     expect(transport.sent).toEqual(['N:@U:11,12']);
     title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
     await refresh(transport, 3, 20);
     expect(transport.sent).toEqual([
       'N:@U:11,12',
@@ -233,6 +246,7 @@ describe('method-returned model reacquisition', () => {
     const {transport, model} = await setup();
     await becomeIdle(model, transport);
     const stop = model.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
     transport.receive(reply);
     await vi.advanceTimersByTimeAsync(100);
     expect(transport.sent).toEqual(['M2:@M:"Detail#detail"']);
@@ -253,7 +267,12 @@ describe('method-returned model reacquisition', () => {
   it('does not watch a refresh abandoned by its last observer', async () => {
     const {transport, model} = await setup();
     await becomeIdle(model, transport);
+    model.title.subscribe(() => undefined)();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(transport.sent).toEqual([]);
+
     const stop = model.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
     stop();
     await refresh(transport);
     expect(transport.sent).toEqual(['M2:@M:"Detail#detail"']);
@@ -274,6 +293,33 @@ describe('method-returned model reacquisition', () => {
     expect(transport.sent).toEqual(['M2:@M:"Detail#detail"', 'N:@W:"version"']);
     await refresh(transport);
     expect(model.title.peek()).toBe('title-10');
+  });
+
+  it('requests one refresh for models observed in the same flush', async () => {
+    const {client, transport, model} = await setup();
+    const pending = client.call('loadDetail');
+    transport.receive(
+      `R2:${JSON.stringify(detailPayload(50, 'Detail#other'))}`,
+    );
+    const other: Reflected<Detail> = await pending;
+    const stops = [model.title, other.title].map((sig) =>
+      sig.subscribe(() => undefined),
+    );
+    await vi.advanceTimersByTimeAsync(10);
+    for (const stop of stops) stop();
+    await vi.advanceTimersByTimeAsync(10);
+    transport.sent.length = 0;
+
+    model.title.subscribe(() => undefined);
+    other.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(transport.sent).toEqual(['M3:@M:"Detail#detail","Detail#other"']);
+
+    transport.receive(
+      `R3:${JSON.stringify([detailPayload(10), detailPayload(60, 'Detail#other')])}`,
+    );
+    await vi.advanceTimersByTimeAsync(10);
+    expect(transport.sent.at(-1)).toBe('N:@W:11,61');
   });
 
   it('preserves a root unwatch queued during reconnect model refresh', async () => {
@@ -339,11 +385,7 @@ describe('method-returned model reacquisition', () => {
   });
 
   it('watches a root signal shared with an unresolved held model', async () => {
-    const {client, model} = await setup({
-      '@M': 'Detail#detail',
-      title: {'@S': 'version', v: 1},
-      status: {'@S': 2, v: 'ready'},
-    } as unknown as ReturnType<typeof detailPayload>);
+    const {client, model} = await setup(sharedRootSignalPayload);
     model.title.subscribe(() => undefined);
     await vi.advanceTimersByTimeAsync(10);
 
@@ -356,10 +398,47 @@ describe('method-returned model reacquisition', () => {
     expect(second.sent).toEqual(['M2:@M:"Detail#detail"', 'N:@W:"version"']);
   });
 
+  it.each([
+    'p1',
+    'p2',
+  ])('watches a plain root signal shared with an unresolved held model after reconnect to %s', async (processId) => {
+    const {client, model} = await setup(
+      sharedRootSignalPayload,
+      receivePlainRoot,
+    );
+    model.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const second = new TestTransport();
+    client.reconnect(second);
+    receivePlainRoot(second, processId);
+    await client.ready;
+    second.receive('R2:[null]');
+    await vi.advanceTimersByTimeAsync(100);
+    expect(second.sent).toEqual(['M2:@M:"Detail#detail"', 'N:@W:"version"']);
+  });
+
+  it.each([
+    ['model', receiveRoot],
+    ['plain', receivePlainRoot],
+  ])('watches a %s root signal shared with an idle model without waiting for its refresh', async (_shape, receive) => {
+    const {transport, model} = await setup(sharedRootSignalPayload, receive);
+    const stop = model.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+    stop();
+    await vi.advanceTimersByTimeAsync(10);
+    transport.sent.length = 0;
+
+    model.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(transport.sent).toEqual(['M2:@M:"Detail#detail"', 'N:@W:"version"']);
+  });
+
   it('watches active fields when a later payload refreshes an unresolved model', async () => {
     const {client, transport, model} = await setup();
     await becomeIdle(model, transport);
     model.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
     transport.receive('R2:[null]');
     await vi.advanceTimersByTimeAsync(100);
     expect(transport.sent).toEqual(['M2:@M:"Detail#detail"']);
@@ -375,6 +454,7 @@ describe('method-returned model reacquisition', () => {
     const {transport: first, client, model} = await setup();
     await becomeIdle(model, first);
     model.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
     expect(first.sent).toEqual(['M2:@M:"Detail#detail"']);
 
     const second = new TestTransport();
@@ -405,6 +485,7 @@ describe('method-returned model reacquisition', () => {
     await vi.advanceTimersByTimeAsync(10);
     expect(transport.sent).toEqual([]);
     model.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
     await refresh(transport);
     expect(transport.sent).toEqual(['M2:@M:"Detail#detail"', 'N:@W:11']);
   });

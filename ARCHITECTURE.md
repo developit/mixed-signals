@@ -320,13 +320,14 @@ Active models omitted from the root are refreshed through `M{id}:@M:...`; only f
 Unrelated root signals can subscribe while a model refresh is pending.
 Unobserved models remain stale until a field becomes observed, including when the new connection uses the same server process or the existing transport reopens.
 A root that the same process sends again on a live connection changes no subscription and marks no model stale.
-A signal that a stale model shares with a fresh model subscribes immediately, because the fresh model already supplied its current wire id.
+A signal that a stale model shares with the latest root snapshot or a fresh model subscribes immediately, because that source already supplied its current wire id.
 
 For a model returned by a method and omitted from the latest root snapshot, sending the last field's `@U` also marks the model stale.
 The server may then release its registrations after its grace period while application code still holds the client facade.
 Observing that facade again requests `@M` before sending `@W`, preserving the facade and its field signals while refreshing their values and wire ids.
 Invalidation happens when the batched unwatch is sent, so a remount that cancels the unwatch does not cause a model refresh.
-Concurrent observations share an in-flight refresh, and a response received after the last observer leaves does not start subscriptions.
+Refresh requests use the same batched flush as `@W`: observations in one flush share a single `@M` for all their stale models, a refresh whose last observer leaves before the flush is not sent, and concurrent observations share an in-flight refresh.
+A response received after the last observer leaves does not start subscriptions.
 An unresolved marker or failed refresh leaves the cached values in place without subscribing to stale ids; a later observation can retry.
 A later full payload for that model, such as a method result, also subscribes its observed fields.
 Sealed signals remain final and do not trigger reacquisition or subscription traffic.
