@@ -1,4 +1,4 @@
-import type {Signal} from '@preact/signals-core';
+import {batch, type Signal} from '@preact/signals-core';
 import {
   type ConnectionInfo,
   formatCallMessage,
@@ -154,91 +154,93 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
     transport.onOpen?.(() => this.handleOpen(generation));
     transport.onClose?.((error) => this.handleDisconnect(generation, error));
 
-    transport.onMessage((data) => {
-      if (
-        generation !== this.transportGeneration ||
-        transport !== this.transport
-      ) {
-        return;
-      }
-
-      this.lastInboundAt = Date.now();
-
-      const message = parseWireMessage(data.toString());
-      if (!message) return;
-
-      const reviver = (_key: string, val: any) => {
-        if (typeof val === 'object' && val) {
-          if ('@S' in val) {
-            const sig = Object.hasOwn(val, 'v')
-              ? this.reflection.syncSignalSnapshot(val['@S'], val.v)
-              : this.reflection.getOrCreateSignal(val['@S'], undefined);
-            if (val.f) this.reflection.markSignalFinal(sig);
-            return sig;
-          }
-
-          if ('@M' in val) {
-            return this.reflection.createModelFacade(val);
-          }
-        }
-
-        return val;
-      };
-
-      if (message.type === 'result' || message.type === 'error') {
-        const parsed = parseWireValue(message.payload, reviver);
-        const pending = this.pending.get(message.id);
-        if (!pending) return;
-
-        this.pending.delete(message.id);
-        if (this.pending.size === 0) {
-          this.clearStaleTimer();
-        }
-
-        if (message.type === 'result') {
-          pending.resolve(parsed);
+    transport.onMessage((data) =>
+      batch(() => {
+        if (
+          generation !== this.transportGeneration ||
+          transport !== this.transport
+        ) {
           return;
         }
 
-        // Restore any application metadata the server attached to the error.
-        const {message: errorMessage, ...errorProps} = (parsed ?? {}) as {
-          message?: string;
-          [key: string]: unknown;
+        this.lastInboundAt = Date.now();
+
+        const message = parseWireMessage(data.toString());
+        if (!message) return;
+
+        const reviver = (_key: string, val: any) => {
+          if (typeof val === 'object' && val) {
+            if ('@S' in val) {
+              const sig = Object.hasOwn(val, 'v')
+                ? this.reflection.syncSignalSnapshot(val['@S'], val.v)
+                : this.reflection.getOrCreateSignal(val['@S'], undefined);
+              if (val.f) this.reflection.markSignalFinal(sig);
+              return sig;
+            }
+
+            if ('@M' in val) {
+              return this.reflection.createModelFacade(val);
+            }
+          }
+
+          return val;
         };
-        pending.reject(Object.assign(new Error(errorMessage), errorProps));
-        return;
-      }
 
-      if (message.type === 'call') {
-        this.handleCall(
-          generation,
-          transport,
-          message.id,
-          message.method,
-          message.payload,
-          reviver,
-        );
-        return;
-      }
+        if (message.type === 'result' || message.type === 'error') {
+          const parsed = parseWireValue(message.payload, reviver);
+          const pending = this.pending.get(message.id);
+          if (!pending) return;
 
-      if (message.method === ROOT_NOTIFICATION_METHOD) {
-        const rawParams = parseWireParams(message.payload);
-        this.prepareForRootSnapshot(rawParams);
-      }
+          this.pending.delete(message.id);
+          if (this.pending.size === 0) {
+            this.clearStaleTimer();
+          }
 
-      let params: unknown[];
-      if (message.method === ROOT_NOTIFICATION_METHOD) {
-        this.reflection.beginRootSnapshot();
-        try {
-          params = parseWireParams(message.payload, reviver);
-        } finally {
-          this.reflection.endRootSnapshot();
+          if (message.type === 'result') {
+            pending.resolve(parsed);
+            return;
+          }
+
+          // Restore any application metadata the server attached to the error.
+          const {message: errorMessage, ...errorProps} = (parsed ?? {}) as {
+            message?: string;
+            [key: string]: unknown;
+          };
+          pending.reject(Object.assign(new Error(errorMessage), errorProps));
+          return;
         }
-      } else {
-        params = parseWireParams(message.payload, reviver);
-      }
-      this.handleNotification(generation, message.method, params);
-    });
+
+        if (message.type === 'call') {
+          this.handleCall(
+            generation,
+            transport,
+            message.id,
+            message.method,
+            message.payload,
+            reviver,
+          );
+          return;
+        }
+
+        if (message.method === ROOT_NOTIFICATION_METHOD) {
+          const rawParams = parseWireParams(message.payload);
+          this.prepareForRootSnapshot(rawParams);
+        }
+
+        let params: unknown[];
+        if (message.method === ROOT_NOTIFICATION_METHOD) {
+          this.reflection.beginRootSnapshot();
+          try {
+            params = parseWireParams(message.payload, reviver);
+          } finally {
+            this.reflection.endRootSnapshot();
+          }
+        } else {
+          params = parseWireParams(message.payload, reviver);
+        }
+        this.handleNotification(generation, message.method, params);
+      }),
+    );
   }
 
   private prepareForRootSnapshot(params: unknown[]) {
