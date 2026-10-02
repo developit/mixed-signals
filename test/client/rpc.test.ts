@@ -1,3 +1,4 @@
+import {effect} from '@preact/signals-core';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import type {WireContext} from '../../client/reflection.ts';
 import {RPCClient} from '../../client/rpc.ts';
@@ -187,6 +188,29 @@ describe('RPCClient', () => {
       await expect(pending).resolves.toBe('pong');
     });
 
+    it('batches signal hydration within a result frame', async () => {
+      vi.useFakeTimers();
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      transport.emit('N:@R:{"first":{"@S":1,"v":1},"second":{"@S":2,"v":1}}');
+      const {first, second} = client.root;
+      const seen: number[][] = [];
+      const dispose = effect(() => {
+        seen.push([first.value, second.value]);
+      });
+
+      const pending = client.call('refresh');
+      transport.emit('R1:{"first":{"@S":1,"v":2},"second":{"@S":2,"v":2}}');
+
+      expect(await pending).toEqual({first, second});
+      expect(seen).toEqual([
+        [1, 1],
+        [2, 2],
+      ]);
+      dispose();
+      vi.advanceTimersByTime(10);
+    });
+
     it('resolves and rejects pending calls from result and error frames', async () => {
       const transport = new FakeTransport();
       const client = new RPCClient(transport, createContext());
@@ -302,6 +326,51 @@ describe('RPCClient', () => {
       const sig = client.reflection.getOrCreateSignal(5, [1, 2]);
       transport.emit('N:@S:5,[3,4],"append"');
       expect(sig.peek()).toEqual([1, 2, 3, 4]);
+    });
+
+    it('runs effects once after all signals in a root snapshot are hydrated', () => {
+      vi.useFakeTimers();
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      transport.emit('N:@R:{"first":{"@S":1,"v":1},"second":{"@S":2,"v":1}}');
+
+      const {first, second} = client.root;
+      const seen: number[][] = [];
+      const dispose = effect(() => {
+        seen.push([first.value, second.value]);
+      });
+
+      transport.emit('N:@R:{"first":{"@S":1,"v":2},"second":{"@S":2,"v":2}}');
+
+      expect(seen).toEqual([
+        [1, 1],
+        [2, 2],
+      ]);
+      dispose();
+      vi.advanceTimersByTime(10);
+    });
+
+    it('batches nested signal hydration with its enclosing @S update', () => {
+      vi.useFakeTimers();
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      transport.emit('N:@R:{"first":{"@S":1,"v":1},"second":{"@S":2,"v":1}}');
+
+      const {first, second} = client.root;
+      const seen: unknown[][] = [];
+      const dispose = effect(() => {
+        seen.push([first.value, second.value]);
+      });
+
+      transport.emit('N:@S:2,{"nested":{"@S":1,"v":2}}');
+
+      expect(second.peek()).toEqual({nested: first});
+      expect(seen).toEqual([
+        [1, 1],
+        [2, {nested: first}],
+      ]);
+      dispose();
+      vi.advanceTimersByTime(10);
     });
 
     it('hydrates nested signals inside plain objects and arrays', () => {
