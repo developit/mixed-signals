@@ -62,7 +62,7 @@ All messages are compact, newline-free text strings.
 | `M{id}:{method}:{args}` | Method call (expects a response). `{id}` is a monotonic integer; `{args}` is comma-separated JSON values. |
 | `N:{method}:{args}`     | Fire-and-forget notification. Same format but no response is sent.                                        |
 | `N:@W:{ids}`            | Subscribe to signal updates. `{ids}` is comma-separated signal IDs.                                       |
-| `N:@U:{ids}`            | Unsubscribe from signal updates.                                                                          |
+| `N:@U:{ids}`            | Unsubscribe and forget the client's signal value and related model snapshots.                             |
 
 #### Server → Client
 
@@ -214,7 +214,7 @@ Reserved methods:
 | method | dir | payload           | meaning                       |
 | :----: | :-: | ----------------- | ----------------------------- |
 |  `@W`  | c→s | `id,id,...`       | subscribe to these signal ids                    |
-|  `@U`  | c→s | `id,id,...`       | unsubscribe                                      |
+|  `@U`  | c→s | `id,id,...`       | unsubscribe and forget client state               |
 |  `@M`  | c→s | `"Type#id",...`  | refresh held model facades by marker            |
 |  `@S`  | s→c | `id,value[,mode]` | signal `id` changed or was sealed                 |
 
@@ -304,6 +304,13 @@ The client also handles `splice` mode; the server doesn't currently emit it.
 
 Batching coalesces the "20 signals arrive in one response, 20 effects
 subscribe on the same tick" case into one `@W` frame.
+
+`@U` also clears that client's last-sent signal value and saved snapshots of the owning models and their descendants.
+Models in the signal's current value are forgotten too, including when the signal has no owning model.
+The next watch sends the full current value, even if unchanged.
+The next appearance of a forgotten model includes its fields and signal values.
+Other subscriptions and the server's model instances remain available.
+This reset requires an `@U` message; client garbage collection alone sends no message.
 
 Client reflection caches are weak where the runtime supports `WeakRef` and
 `FinalizationRegistry`: signal id → signal, model marker → facade, and model →
