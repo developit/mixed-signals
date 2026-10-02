@@ -242,18 +242,24 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
   }
 
   private prepareForRootSnapshot(params: unknown[]) {
+    if (this.root === undefined) return;
+
     const [, maybeConnectionInfo] = params;
     const nextConnectionInfo = isConnectionInfo(maybeConnectionInfo)
       ? maybeConnectionInfo
       : undefined;
 
     if (
-      this.root !== undefined &&
-      (!nextConnectionInfo ||
-        !this.connectionInfo ||
-        nextConnectionInfo.processId !== this.connectionInfo.processId)
+      !nextConnectionInfo ||
+      !this.connectionInfo ||
+      nextConnectionInfo.processId !== this.connectionInfo.processId
     ) {
       this.reflection.prepareProcessChange();
+      this.replaySubscriptionsOnRoot = true;
+    } else if (this.replaySubscriptionsOnRoot) {
+      // Traffic queued while the transport was down never reached the server.
+      // A root re-sent on a live connection must leave subscriptions alone.
+      this.reflection.prepareReconnect();
     }
   }
 
@@ -535,17 +541,18 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
 
     const modelRefreshGeneration = this.reflection.beginModelRefresh(markers);
     const refresh = this.call(REFRESH_MODELS_METHOD, markers);
-    const replayed = this.reflection.replayActiveSignals();
+    this.reflection.replayActiveSignals();
 
     try {
       await refresh;
     } catch {
-      // The reconnect may have been superseded or disconnected again. In both
-      // cases replaying whatever ids we currently know is the safest fallback.
+      // Unresolved models stay stale; independently hydrated signals can still subscribe.
     } finally {
-      this.reflection.finishModelRefresh(markers, modelRefreshGeneration);
-      if (generation === this.transportGeneration) {
-        this.reflection.replayActiveSignals(replayed);
+      if (
+        this.reflection.finishModelRefresh(markers, modelRefreshGeneration) &&
+        generation === this.transportGeneration
+      ) {
+        this.reflection.replayActiveSignals();
       }
     }
   }

@@ -1031,8 +1031,8 @@ describe('RPCClient', () => {
       expect(transport2.sent).toHaveLength(0);
 
       count.subscribe(() => undefined);
-      expect(transport2.sent[0]).toBe('M1:@M:"Counter#held"');
       vi.advanceTimersByTime(10);
+      expect(transport2.sent[0]).toBe('M1:@M:"Counter#held"');
       expect(transport2.sent).not.toContain('N:@W:1');
 
       transport2.emit(

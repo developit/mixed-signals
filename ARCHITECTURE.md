@@ -314,23 +314,30 @@ Root objects, signal values, reflected model facades held by application code,
 and Preact subscriptions remain ordinary strong references; once those are gone,
 the weak reflection entries can be collected and opportunistically swept.
 
-On reconnect, the client keeps existing roots/signals/model facades alive until
-it receives a fresh `@R` root snapshot. That snapshot refreshes signal values,
-rebases root signals if a different backend process assigned different signal
-ids, refreshes cached model facades with their new underlying signal sources,
-requests fresh snapshots for active held model facades that were not present in
-the reconnect root via `M{id}:@M:...`, replays currently watched signal ids once
-from the root snapshot immediately, and replays them again after held-model
-refreshes bind any additional signal ids. After a process change, inactive held
-facades remain marked stale; if one of their signal props becomes watched later,
-the client lazily refreshes that facade and then replays the newly rebound signal
-ids.
+On reconnect, the client preserves existing roots, signals, and model facades, but marks cached models stale until a full snapshot refreshes them.
+The fresh `@R` root snapshot refreshes signal values and rebinds signal ids when a different backend process owns the connection.
+Active models omitted from the root are refreshed through `M{id}:@M:...`; only fields whose model snapshot has arrived can subscribe through `@W`.
+Unrelated root signals can subscribe while a model refresh is pending.
+Unobserved models remain stale until a field becomes observed, including when the new connection uses the same server process or the existing transport reopens.
+A root that the same process sends again on a live connection changes no subscription and marks no model stale.
+A signal that a stale model shares with the latest root snapshot or a fresh model subscribes immediately, because that source already supplied its current wire id.
+
+For a model returned by a method and omitted from the latest root snapshot, sending the last field's `@U` also marks the model stale.
+The server may then release its registrations after its grace period while application code still holds the client facade.
+Observing that facade again requests `@M` before sending `@W`, preserving the facade and its field signals while refreshing their values and wire ids.
+Invalidation happens when the batched unwatch is sent, so a remount that cancels the unwatch does not cause a model refresh.
+Refresh requests use the same batched flush as `@W`: observations in one flush share a single `@M` for all their stale models, a refresh whose last observer leaves before the flush is not sent, and concurrent observations share an in-flight refresh.
+A response received after the last observer leaves does not start subscriptions.
+An unresolved marker or failed refresh leaves the cached values in place without subscribing to stale ids; a later observation can retry.
+A later full payload for that model, such as a method result, also subscribes its observed fields.
+Sealed signals remain final and do not trigger reacquisition or subscription traffic.
+
 Only explicit protocol identities are preserved: `@S` signals and `@M` model
 facades. The top-level plain root object can be updated in place for ergonomics,
 but unbranded nested arrays and plain objects are replaced instead of reconciled
 by index or shape. Held facades that are not present in the new root can recover
-when the server process can resolve their `Type#id` marker from its `Instances`
-registry.
+when the server process can resolve their `Type#id` marker from its `Instances` registry or an application resolver that reconstructs evicted models.
+Client-held references do not pin server resources, and this does not add a server eviction policy or a new wire message.
 
 The server includes connection metadata as a second `@R` parameter:
 `{connectionId, processId, resumed}`. `connectionId` is opaque and can be fed

@@ -463,6 +463,7 @@ describe('ClientReflection', () => {
       const sweep = vi.spyOn(reflection, 'sweepCollectedEntries');
 
       count.subscribe(() => undefined);
+      vi.advanceTimersByTime(10);
 
       expect(sweep).not.toHaveBeenCalled();
       expect(rpc.call).toHaveBeenCalledWith('@M', ['Counter#abc']);
