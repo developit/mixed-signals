@@ -475,13 +475,16 @@ describe('Reflection', () => {
       expect(value).toBe(5);
     });
 
-    it('compresses the re-watch catch-up against the client last-sent value', () => {
+    it('sends a full value after unwatch, then resumes deltas for that client', () => {
       const {counter, nameId} = setupCounter(reflection, instances, 'c1');
       reflection.serialize(counter, 'c2');
       reflection.watch('c1', nameId);
       reflection.watch('c2', nameId);
       reflection.unwatch('c1', nameId);
       counter.name.value = 'default-updated';
+      expect(
+        parseUpdate(sender.sent.find((m) => m.clientId === 'c2')!.message),
+      ).toEqual([nameId, '-updated', 'append']);
       sender.sent.length = 0;
 
       reflection.watch('c1', nameId);
@@ -490,11 +493,17 @@ describe('Reflection', () => {
       expect(relevant.length).toBe(1);
       const [id, value, mode] = parseUpdate(relevant[0].message);
       expect(id).toBe(nameId);
-      expect(value).toBe('-updated');
-      expect(mode).toBe('append');
+      expect(value).toBe('default-updated');
+      expect(mode).toBeUndefined();
+
+      sender.sent.length = 0;
+      counter.name.value = 'default-updated-again';
+      expect(
+        parseUpdate(sender.sent.find((m) => m.clientId === 'c1')!.message),
+      ).toEqual([nameId, '-again', 'append']);
     });
 
-    it('sends nothing on re-watch when the value has not changed', () => {
+    it('sends a full value on re-watch even when the value has not changed', () => {
       const {counter, countId} = setupCounter(reflection, instances, 'c1');
       reflection.serialize(counter, 'c2');
       reflection.watch('c1', countId);
@@ -504,7 +513,135 @@ describe('Reflection', () => {
 
       reflection.watch('c1', countId);
 
-      expect(sender.sent.filter((m) => m.clientId === 'c1').length).toBe(0);
+      expect(
+        sender.sent
+          .filter((m) => m.clientId === 'c1')
+          .map((m) => parseUpdate(m.message)),
+      ).toEqual([[countId, 0]]);
+    });
+
+    it('forgets the owning model for only the client that unwatched', () => {
+      const {counter, countId, nameId} = setupCounter(
+        reflection,
+        instances,
+        'c1',
+      );
+      reflection.serialize(counter, 'c2');
+      reflection.unwatch('c1', countId);
+      counter.name.value = 'default-updated';
+
+      expect(
+        parseUpdate(sender.sent.find((m) => m.clientId === 'c1')!.message),
+      ).toEqual([nameId, '-updated', 'append']);
+      const restored = reflection.serialize(counter, 'c1');
+      expect(restored.count.v).toBe(0);
+      expect(restored.name.v).toBe('default-updated');
+      expect(restored.items.v).toEqual([]);
+      expect(reflection.serialize(counter, 'c2')).toEqual({'@M': 'Counter#0'});
+      expect(instances.get('0')).toBe(counter);
+    });
+
+    it('includes signal values nested inside a forgotten model', () => {
+      class Nested {
+        fields = {title: signal('title'), other: [signal('other')]};
+      }
+      reflection.registerModel('Nested', Nested);
+      const model = new Nested();
+      const initial = reflection.serialize(model, 'c1');
+      reflection.unwatch('c1', initial.fields.title['@S']);
+
+      const restored = reflection.serialize(model, 'c1');
+
+      expect(restored.fields.title.v).toBe('title');
+      expect(restored.fields.other[0].v).toBe('other');
+    });
+
+    it('rewatches an undefined value as a full wire value', () => {
+      const value = signal(undefined);
+      const id = reflection.serialize(value, 'c1')['@S'];
+      reflection.unwatch('c1', id);
+      sender.sent.length = 0;
+
+      reflection.watch('c1', id);
+
+      expect(sender.sent.map((m) => parseUpdate(m.message))).toEqual([
+        [id, null],
+      ]);
+    });
+
+    it('tracks signals introduced by later updates to shared model fields', () => {
+      const fields = signal({title: signal('first')});
+      class Nested {
+        fields = fields;
+      }
+      reflection.registerModel('Nested', Nested);
+      const models = [new Nested(), new Nested()];
+      reflection.serialize(models, 'c1');
+      fields.value = {title: signal('returned')};
+      const id = reflection.serialize(fields.value.title, 'c1')['@S'];
+
+      reflection.unwatch('c1', id);
+
+      const restored = reflection.serialize(models, 'c1');
+      expect(restored.map((model: any) => model.fields.v.title.v)).toEqual([
+        'returned',
+        'returned',
+      ]);
+    });
+
+    it('forgets nested models when a signal containing them is unwatched', () => {
+      const {counter} = setupCounter(reflection, instances, 'c1');
+      const current = signal([counter]);
+      const id = reflection.serialize(current, 'c1')['@S'];
+      reflection.unwatch('c1', id);
+
+      reflection.watch('c1', id);
+
+      const [signalId, value, mode] = parseUpdate(sender.sent.at(-1)!.message);
+      expect(signalId).toBe(id);
+      expect(value).toMatchObject([
+        {'@M': 'Counter#0', count: {v: 0}, name: {v: 'default'}},
+      ]);
+      expect(mode).toBeUndefined();
+    });
+
+    it('forgets every model sharing an unwatched signal', () => {
+      const shared = signal('shared');
+      class SharedModel {
+        value = shared;
+      }
+      reflection.registerModel('Shared', SharedModel);
+      const first = new SharedModel();
+      const second = new SharedModel();
+      const initial = reflection.serialize([first, second], 'c1');
+      reflection.unwatch('c1', initial[0].value['@S']);
+
+      const restored = reflection.serialize([first, second], 'c1');
+
+      expect(restored.map((model: any) => model.value.v)).toEqual([
+        'shared',
+        'shared',
+      ]);
+    });
+
+    it('forgets cyclic model graphs without losing their identities', () => {
+      class Node {
+        name = signal('node');
+        next = signal<Node | null>(null);
+      }
+      reflection.registerModel('Node', Node);
+      const first = new Node();
+      const second = new Node();
+      first.next.value = second;
+      second.next.value = first;
+      const initial = reflection.serialize(first, 'c1');
+      reflection.unwatch('c1', initial.name['@S']);
+
+      const restored = reflection.serialize(first, 'c1');
+
+      expect(restored.name.v).toBe('node');
+      expect(restored.next.v.name.v).toBe('node');
+      expect(restored.next.v.next.v).toEqual({'@M': initial['@M']});
     });
   });
 

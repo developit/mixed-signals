@@ -511,16 +511,48 @@ describe('RPC', () => {
     await transport.emit('N:@W:1,2,3');
   });
 
-  it('@U message calls reflection unwatch', async () => {
+  it('@U unsubscribes and includes model fields on the next appearance', async () => {
+    class ReopenCounter {
+      count = signal(0);
+      name = signal('default');
+      increment() {
+        this.count.value++;
+      }
+      reopen() {
+        return this;
+      }
+    }
     const rpc = new RPC();
-    rpc.registerModel('Counter', Counter);
-    const root = new Counter();
+    rpc.registerModel('Counter', ReopenCounter);
+    const root = new ReopenCounter();
     rpc.expose(root);
 
     const transport = new FakeTransport();
     rpc.addClient(transport);
 
-    await transport.emit('N:@U:1,2');
+    const initial = parseNotification(transport.sent[0]).params[0] as Record<
+      string,
+      any
+    >;
+    const signalId = initial.name['@S'];
+    transport.sent.length = 0;
+    await transport.emit(
+      formatNotificationMessage(UNWATCH_SIGNALS_METHOD, [signalId]),
+    );
+    root.name.value = 'returned';
+    expect(transport.sent).toHaveLength(0);
+
+    await transport.emit('M1:0#reopen:');
+
+    const result = parseWireMessage(transport.sent[0]);
+    if (result?.type !== 'result') throw new Error('Expected a result');
+    expect(parseWireValue(result.payload)).toMatchObject({
+      '@M': 'Counter#0',
+      name: {'@S': signalId, v: 'returned'},
+      count: {v: 0},
+    });
+    await transport.emit('M2:0#increment:');
+    expect(root.count.peek()).toBe(1);
   });
 
   it('method with parameters', async () => {

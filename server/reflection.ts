@@ -33,6 +33,7 @@ function isWireDropped(value: any): boolean {
 
 export class Reflection {
   private signalIds = new WeakMap<Signal<any>, SignalId>();
+  private signalModels = new WeakMap<Signal<any>, Set<object>>();
   private signals = new Map<SignalId, Signal<any>>();
   private subscriptions = new Map<SignalId, Set<ClientId>>();
   private signalUnsubscribers = new Map<SignalId, () => void>();
@@ -109,7 +110,11 @@ export class Reflection {
     return id;
   }
 
-  private serializeValue(value: any, clientId?: ClientId): any {
+  private serializeValue(
+    value: any,
+    clientId?: ClientId,
+    owners?: Set<object>,
+  ): any {
     if (value === this.rpc || value === this || value === this.instances)
       return undefined;
     if (typeof value === 'function') return undefined;
@@ -117,29 +122,28 @@ export class Reflection {
     if (value instanceof Signal) {
       const id = this.getSignalId(value);
       const signalValue = value.peek();
+      if (owners) {
+        let models = this.signalModels.get(value);
+        if (!models) this.signalModels.set(value, (models = new Set()));
+        for (const owner of owners) models.add(owner);
+      }
 
       if (this.finalSignals.has(value)) {
         // Always inlined: an unwatched signal is only weakly held client-side,
         // so a bare ref could fail to resolve.
-        return {'@S': id, v: this.serializeValue(signalValue, clientId), f: 1};
+        return {
+          '@S': id,
+          v: this.serializeValue(signalValue, clientId, owners),
+          f: 1,
+        };
       }
 
       if (clientId) {
         const key = `${clientId}:${id}`;
-        // Send a bare ref when we can prove the client already holds this exact
-        // value: its reviver resolves a `v`-less `{'@S':id}` against the signal
-        // it has. Re-inlining would ship the payload twice, which for something
-        // like a diff signal returned from an RPC is hundreds of KB of pure
-        // duplicate. Same idea as the model dedup below.
-        //
-        // Both halves of the proof matter. The last-sent value says the bytes
-        // got there; the live subscription says the client still has somewhere
-        // to put them — a watched signal is strongly held client-side, so it
-        // cannot have been collected out of the client's WeakRef cache. Check
-        // it before watch() below adds the subscription. Reconnects are safe on
-        // their own: removeClient() drops these entries when a client goes away
-        // or resumes, so a fresh connection always gets values inlined.
+        // Full models need field values. Standalone signals can use a bare reference
+        // only while this client stays subscribed and holds the current value.
         const alreadyHeld =
+          !owners &&
           this.lastSentValues.has(key) &&
           this.lastSentValues.get(key) === signalValue &&
           !!this.subscriptions.get(id)?.has(clientId);
@@ -148,7 +152,7 @@ export class Reflection {
         if (alreadyHeld) return {'@S': id};
       }
 
-      return {'@S': id, v: this.serializeValue(signalValue, clientId)};
+      return {'@S': id, v: this.serializeValue(signalValue, clientId, owners)};
     }
 
     if (this.isModel(value)) {
@@ -175,10 +179,11 @@ export class Reflection {
       }
 
       const branded: Record<string, any> = {'@M': marker};
+      const modelOwners = new Set([value]);
       for (const [key, prop] of Object.entries(value)) {
         if (key.startsWith('_')) continue;
 
-        const serializedProp = this.serializeValue(prop, clientId);
+        const serializedProp = this.serializeValue(prop, clientId, modelOwners);
         if (serializedProp !== undefined) {
           branded[key] = serializedProp;
         }
@@ -189,7 +194,7 @@ export class Reflection {
 
     if (Array.isArray(value)) {
       return value.map((item) => {
-        const serializedItem = this.serializeValue(item, clientId);
+        const serializedItem = this.serializeValue(item, clientId, owners);
         return serializedItem === undefined ? null : serializedItem;
       });
     }
@@ -199,7 +204,7 @@ export class Reflection {
       for (const [key, prop] of Object.entries(value)) {
         if (key.startsWith('_')) continue;
 
-        const serializedProp = this.serializeValue(prop, clientId);
+        const serializedProp = this.serializeValue(prop, clientId, owners);
         if (serializedProp !== undefined) {
           serialized[key] = serializedProp;
         }
@@ -211,26 +216,11 @@ export class Reflection {
     return value;
   }
 
-  serialize(value: any, clientId?: ClientId): any {
-    const serialized = this.serializeValue(value, clientId);
+  serialize(value: any, clientId?: ClientId, owners?: Set<object>): any {
+    const serialized = this.serializeValue(value, clientId, owners);
     if (serialized === undefined) return null;
 
     return JSON.parse(JSON.stringify(serialized));
-  }
-
-  /**
-   * Drop what we believe this client holds for a model's own signals, so the
-   * next serialization inlines their values instead of sending bare refs. A
-   * refresh means the client no longer trusts its copy — a ref pointing at that
-   * copy is worthless. Nested models are refreshed under their own markers.
-   */
-  private forgetClientSignalValues(instance: any, clientId: ClientId) {
-    for (const [key, prop] of Object.entries(instance)) {
-      if (key.startsWith('_') || !(prop instanceof Signal)) continue;
-
-      const id = this.signalIds.get(prop);
-      if (id !== undefined) this.lastSentValues.delete(`${clientId}:${id}`);
-    }
   }
 
   serializeModelMarker(marker: string, clientId?: ClientId): any {
@@ -244,7 +234,6 @@ export class Reflection {
 
     if (clientId) {
       this.sentModels.get(clientId)?.delete(marker);
-      this.forgetClientSignalValues(instance, clientId);
     }
 
     return this.serialize(instance, clientId);
@@ -316,14 +305,49 @@ export class Reflection {
       this.signalUnsubscribers.set(signalId, unsubscribe);
     } else {
       // A live subscription only forwards future changes. A client joining it
-      // may have missed updates while unwatched, so send a catch-up delta.
+      // may have missed updates while unwatched, so send its current value.
       this.sendUpdateIfChanged(clientId, signalId, sig.peek());
     }
   }
 
   unwatch(clientId: ClientId, signalId: SignalId) {
     this.subscriptions.get(signalId)?.delete(clientId);
+    this.lastSentValues.delete(`${clientId}:${signalId}`);
+    const sig = this.signals.get(signalId);
+    if (sig) {
+      const visited = new Set<object>();
+      this.forgetClientModels(sig.peek(), clientId, visited);
+      for (const model of this.signalModels.get(sig) ?? []) {
+        this.forgetClientModels(model, clientId, visited);
+      }
+    }
     this.disposeSignalIfUnwatched(signalId);
+  }
+
+  private forgetClientModels(
+    value: any,
+    clientId: ClientId,
+    visited: Set<object>,
+  ) {
+    if (!value || typeof value !== 'object' || visited.has(value)) return;
+    if (value === this.rpc || value === this || value === this.instances)
+      return;
+    visited.add(value);
+
+    if (value instanceof Signal) {
+      this.forgetClientModels(value.peek(), clientId, visited);
+      return;
+    }
+
+    if (this.isModel(value)) {
+      const marker = `${this.getModelType(value)}#${this.getInstanceId(value)}`;
+      this.sentModels.get(clientId)?.delete(marker);
+    }
+
+    for (const [key, prop] of Object.entries(value)) {
+      if (!key.startsWith('_'))
+        this.forgetClientModels(prop, clientId, visited);
+    }
   }
 
   removeClient(clientId: ClientId) {
@@ -367,13 +391,16 @@ export class Reflection {
     signalId: SignalId,
     newValue: any,
   ) {
-    const lastValue = this.lastSentValues.get(`${clientId}:${signalId}`);
-    if (lastValue === newValue) return;
+    const key = `${clientId}:${signalId}`;
+    const lastValue = this.lastSentValues.get(key);
+    if (this.lastSentValues.has(key) && lastValue === newValue) return;
 
     const update = this.computeDelta(lastValue, newValue);
     if (!update) return;
 
-    const serializedValue = this.serialize(update.value, clientId);
+    const signal = this.signals.get(signalId);
+    const owners = signal && this.signalModels.get(signal);
+    const serializedValue = this.serialize(update.value, clientId, owners);
     const params = update.mode
       ? [signalId, serializedValue, update.mode]
       : [signalId, serializedValue];
