@@ -716,10 +716,14 @@ export class ClientReflection {
       throw new Error('Model missing @M field');
     }
 
+    // @P lists ordinary properties whose values also have a `v` key.
+    const plainValueProperties = new Set<string>(serialized['@P'] ?? []);
+    delete serialized['@P'];
     // Model properties carry their signal identity implicitly in the model marker.
     for (const [key, value] of Object.entries(serialized)) {
       if (
         key !== '@M' &&
+        !plainValueProperties.has(key) &&
         value &&
         typeof value === 'object' &&
         !Array.isArray(value) &&

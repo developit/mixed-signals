@@ -240,6 +240,22 @@ describe('Reflection', () => {
       expect(other.name).toEqual({v: 'Ship it'});
     });
 
+    it('distinguishes plain model values with a v key from signal snapshots', () => {
+      class Chat {
+        id = '13';
+        title = signal('Hello');
+        settings = {v: 2};
+      }
+      reflection.registerModel('Chat', Chat);
+      expect(reflection.serialize(new Chat(), 'c1')).toEqual({
+        '@M': 'Chat#13',
+        id: '13',
+        title: {v: 'Hello'},
+        settings: {v: 2},
+        '@P': ['settings'],
+      });
+    });
+
     it('serializes model signals with implicit property identity', () => {
       const {serialized} = setupCounter(reflection, instances);
       expect(serialized.count).toEqual({v: 0});
@@ -433,6 +449,30 @@ describe('Reflection', () => {
             countId,
             5,
           ]),
+        },
+      ]);
+    });
+
+    it('rebinds existing watchers when a model property gets a new Signal', () => {
+      class Chat {
+        id = '13';
+        title = signal('old');
+      }
+      reflection.registerModel('Chat', Chat);
+      const chat = new Chat();
+      reflection.serialize(chat, 'c1');
+      reflection.watch('c1', 'Chat#13.title');
+      const oldTitle = chat.title;
+      chat.title = signal('new');
+      reflection.serializeModelMarker('Chat#13', 'c1');
+      sender.sent.length = 0;
+      oldTitle.value = 'obsolete';
+      expect(sender.sent).toEqual([]);
+      chat.title.value = 'newer';
+      expect(sender.sent).toEqual([
+        {
+          clientId: 'c1',
+          message: 'N:@S:"Chat#13.title","er","append"',
         },
       ]);
     });

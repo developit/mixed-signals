@@ -7,6 +7,7 @@ import {addPrefix, stripPrefix} from '../../server/forwarding.ts';
 import {createModel} from '../../server/model.ts';
 import {RPC} from '../../server/rpc.ts';
 import {
+  formatCallMessage,
   formatNotificationMessage,
   parseWireMessage,
   parseWireParams,
@@ -96,11 +97,14 @@ function createLinkedTransports(): {
     browserTransport: defaultDownstream.browserTransport,
     createDownstreamPair,
     async flush() {
-      while (queue.length > 0) {
+      let idleMicrotasks = 0;
+      while (queue.length > 0 || idleMicrotasks < 10) {
         const pending = queue.splice(0);
-        for (const deliver of pending) {
-          await deliver();
-        }
+        if (pending.length) idleMicrotasks = 0;
+        else idleMicrotasks++;
+        for (const deliver of pending) await deliver();
+        // A bare model ref can require an asynchronous upstream refresh.
+        await Promise.resolve();
       }
     },
   };
@@ -146,6 +150,10 @@ class BrokerFactory {
 
   createSecret() {
     return this._secret;
+  }
+
+  getStatus() {
+    return this._secret.status;
   }
 }
 
@@ -313,6 +321,160 @@ describe('addPrefix / stripPrefix', () => {
 });
 
 describe('protocol-level forwarding', () => {
+  it('rehydrates bare refs for a client that forgot them while another still holds them', async () => {
+    const {
+      brokerTransport,
+      serverUpstreamTransport,
+      serverDownstreamTransport,
+      browserTransport,
+      createDownstreamPair,
+      flush,
+    } = createLinkedTransports();
+    const second = createDownstreamPair('second');
+    const firstMessages: string[] = [];
+    const secondMessages: string[] = [];
+    browserTransport.onMessage((data) => firstMessages.push(data.toString()));
+    second.browserTransport.onMessage((data) =>
+      secondMessages.push(data.toString()),
+    );
+    const item = new BrokerSession('secret-1');
+    const broker = new RPC({factory: new BrokerFactory(item)});
+    broker.registerModel('BrokerFactory', BrokerFactory);
+    broker.registerModel('BrokerSession', BrokerSession);
+    broker.addClient(brokerTransport);
+    const server = new RPC();
+    server.addUpstream(serverUpstreamTransport);
+    await flush();
+    server.addClient(serverDownstreamTransport, 'first');
+    server.addClient(second.serverTransport, 'second');
+    await flush();
+    firstMessages.length = secondMessages.length = 0;
+
+    browserTransport.send(formatCallMessage(1, '1_factory#createSecret'));
+    await flush();
+    expect(firstMessages.at(-1)).toContain('"status":{"v":"idle"}');
+    second.browserTransport.send(
+      formatCallMessage(1, '1_factory#createSecret'),
+    );
+    await flush();
+    expect(secondMessages.at(-1)).toContain('"status":{"v":"idle"}');
+    const marker = 'BrokerSession#1_secret-1';
+    const field = `${marker}.status`;
+    browserTransport.send(
+      formatNotificationMessage(WATCH_SIGNALS_METHOD, [field]),
+    );
+    second.browserTransport.send(
+      formatNotificationMessage(WATCH_SIGNALS_METHOD, [field]),
+    );
+    await flush();
+    browserTransport.send(formatNotificationMessage('@D', [marker, field]));
+    await flush();
+
+    browserTransport.send(formatCallMessage(2, '1_factory#getStatus'));
+    await flush();
+    expect(
+      firstMessages.find((message) => message.startsWith('R2:')),
+    ).toContain('"v":"idle"');
+    browserTransport.send(formatCallMessage(3, '1_factory#createSecret'));
+    await flush();
+    expect(
+      firstMessages.find((message) => message.startsWith('R3:')),
+    ).toContain('"status":{"v":"idle"}');
+  });
+
+  it('forgets a method-returned model when its last downstream holder disconnects', async () => {
+    const {
+      brokerTransport,
+      serverUpstreamTransport,
+      serverDownstreamTransport,
+      browserTransport,
+      createDownstreamPair,
+      flush,
+    } = createLinkedTransports();
+    const item = new BrokerSession('secret-1');
+    const broker = new RPC({factory: new BrokerFactory(item)});
+    broker.registerModel('BrokerFactory', BrokerFactory);
+    broker.registerModel('BrokerSession', BrokerSession);
+    broker.addClient(brokerTransport);
+    const server = new RPC();
+    server.addUpstream(serverUpstreamTransport);
+    await flush();
+    const messages: string[] = [];
+    browserTransport.onMessage((data) => messages.push(data.toString()));
+    const cleanup = server.addClient(serverDownstreamTransport, 'first');
+    await flush();
+    browserTransport.send(formatCallMessage(1, '1_factory#createSecret'));
+    await flush();
+    expect(messages.at(-1)).toContain('"status":{"v":"idle"}');
+    cleanup();
+    await flush();
+
+    const next = createDownstreamPair('next');
+    const nextMessages: string[] = [];
+    next.browserTransport.onMessage((data) =>
+      nextMessages.push(data.toString()),
+    );
+    server.addClient(next.serverTransport, 'next');
+    await flush();
+    next.browserTransport.send(formatCallMessage(1, '1_factory#createSecret'));
+    await flush();
+    expect(nextMessages.at(-1)).toContain('"status":{"v":"idle"}');
+  });
+
+  it('notifies a late watcher when a nested model from catch-up is deleted', async () => {
+    const {
+      brokerTransport,
+      serverUpstreamTransport,
+      serverDownstreamTransport,
+      browserTransport,
+      createDownstreamPair,
+      flush,
+    } = createLinkedTransports();
+    const second = createDownstreamPair('late');
+    const firstMessages: string[] = [];
+    const secondMessages: string[] = [];
+    browserTransport.onMessage((data) => firstMessages.push(data.toString()));
+    second.browserTransport.onMessage((data) =>
+      secondMessages.push(data.toString()),
+    );
+    const feed = signal<BrokerSession | null>(null);
+    const item = new BrokerSession('nested');
+    const broker = new RPC({feed});
+    broker.registerModel('BrokerSession', BrokerSession);
+    broker.addClient(brokerTransport);
+    const server = new RPC();
+    server.addUpstream(serverUpstreamTransport);
+    await flush();
+    server.addClient(serverDownstreamTransport, 'first');
+    server.addClient(second.serverTransport, 'second');
+    await flush();
+    const feedId = '1_1';
+    browserTransport.send(
+      formatNotificationMessage(WATCH_SIGNALS_METHOD, [feedId]),
+    );
+    await flush();
+    feed.value = item;
+    await flush();
+    feed.value = null;
+    await flush();
+    feed.value = item; // The upstream now sends only a bare @M reference.
+    await flush();
+    second.browserTransport.send(
+      formatNotificationMessage(WATCH_SIGNALS_METHOD, [feedId]),
+    );
+    await flush();
+    expect(getSignalUpdateValues(secondMessages)).toContainEqual(
+      expect.objectContaining({
+        '@M': 'BrokerSession#1_nested',
+        status: {v: 'idle'},
+      }),
+    );
+    broker.instances.remove('nested');
+    await flush();
+    expect(firstMessages).toContain('N:@D:"BrokerSession#1_nested"');
+    expect(secondMessages).toContain('N:@D:"BrokerSession#1_nested"');
+  });
+
   it('only updates watchers, catches up a late watcher, and forwards deletion', async () => {
     const {
       brokerTransport,

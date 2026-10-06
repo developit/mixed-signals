@@ -122,8 +122,25 @@ export class Reflection {
     if (value instanceof Signal) {
       const id = propertyId ?? this.getSignalId(value);
       if (propertyId) {
+        const previous = this.signals.get(id);
+        if (previous && previous !== value) {
+          if (this.signalIds.get(previous) === id)
+            this.signalIds.delete(previous);
+          this.signalUnsubscribers.get(id)?.();
+          this.signalUnsubscribers.delete(id);
+        }
         this.signalIds.set(value, id);
         this.signals.set(id, value);
+        if (
+          previous &&
+          previous !== value &&
+          this.subscriptions.get(id)?.size
+        ) {
+          this.signalUnsubscribers.set(
+            id,
+            value.subscribe(() => this.notifySubscribers(id)),
+          );
+        }
         this.modelSignalOwners.set(
           propertyId,
           propertyId.slice(0, propertyId.lastIndexOf('.')),
@@ -191,6 +208,7 @@ export class Reflection {
       }
 
       const branded: Record<string, any> = {'@M': marker};
+      const plainValueProperties: string[] = [];
       for (const [key, prop] of Object.entries(value)) {
         if (key.startsWith('_')) continue;
 
@@ -201,8 +219,18 @@ export class Reflection {
         );
         if (serializedProp !== undefined) {
           branded[key] = serializedProp;
+          // A plain `{v: ...}` otherwise looks exactly like a signal snapshot.
+          if (
+            !(prop instanceof Signal) &&
+            serializedProp &&
+            typeof serializedProp === 'object' &&
+            Object.hasOwn(serializedProp, 'v')
+          ) {
+            plainValueProperties.push(key);
+          }
         }
       }
+      if (plainValueProperties.length) branded['@P'] = plainValueProperties;
 
       return branded;
     }

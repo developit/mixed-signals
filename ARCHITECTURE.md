@@ -92,8 +92,10 @@ During serialization, special objects are embedded in JSON:
 | `@M`   | `{"@M": "TypeName#wireId", ...props}` | A server-side model instance. The client reuses a cached facade or creates a proxy facade directly from the serialized props. Custom registered constructors are still supported. |
 
 Model-owned signal properties omit `@S`: `{"@M":"Chat#13","title":{"v":"Hello"}}`
-identifies the signal as `Chat#13.title`. Top-level and other standalone signals
-still use `@S`. Neither form implicitly subscribes a client; only `N:@W:`
+identifies the signal as `Chat#13.title`. If an ordinary model property has a
+`v` key, the model includes `"@P":["propertyName"]` to distinguish it from a
+signal snapshot. Top-level and other standalone signals still use `@S`.
+Neither form implicitly subscribes a client; only `N:@W:`
 starts updates. A watch after an unwatched change receives an immediate catch-up
 `N:@S:` update/delta. `Instances.remove(id)` explicitly deletes a model and
 sends `N:@D:"Type#id"` to clients that received it. Removing a model from an

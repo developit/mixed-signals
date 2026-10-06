@@ -289,6 +289,20 @@ describe('ClientReflection', () => {
       ).not.toThrow();
     });
 
+    it('preserves ordinary model properties that have a v key', () => {
+      const {reflection} = setup();
+      reflection.registerModel('Task', TaskModel);
+      const facade = reflection.createModelFacade({
+        '@M': 'Task#42',
+        '@P': ['settings'],
+        settings: {v: 2},
+        title: {v: 'Ship'},
+      });
+      expect(facade.data.settings).toEqual({v: 2});
+      expect(facade.data.title.peek()).toBe('Ship');
+      expect(facade.data['@P']).toBeUndefined();
+    });
+
     it('reuses cached facades for repeated model markers', () => {
       const {reflection} = setup();
       reflection.registerModel('Task', TaskModel);

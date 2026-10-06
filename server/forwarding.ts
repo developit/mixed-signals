@@ -157,6 +157,7 @@ export class ForwardedUpstream {
   private clients = new Set<string>();
   private signalSubscriptions = new Map<SignalId, Set<string>>();
   private modelVisibility = new Map<string, Set<string>>();
+  private signalVisibility = new Map<SignalId, Set<string>>();
   private latestSignalValues = new Map<SignalId, any>();
   private finalSignalIds = new Set<SignalId>();
 
@@ -176,6 +177,7 @@ export class ForwardedUpstream {
   setClient(clientId: string) {
     this.clients.add(clientId);
     this.rememberVisibleModels(clientId, this.root);
+    this.rememberVisibleSignals(clientId, this.root);
   }
 
   private handleUpstreamMessage(msg: string) {
@@ -191,6 +193,7 @@ export class ForwardedUpstream {
         this.root = addPrefix(this.prefix, rootValue);
         for (const clientId of this.clients) {
           this.rememberVisibleModels(clientId, this.root);
+          this.rememberVisibleSignals(clientId, this.root);
         }
         this._resolveReady();
         this.host.onUpstreamRootChanged();
@@ -232,17 +235,22 @@ export class ForwardedUpstream {
           ? addPrefix(this.prefix, value)
           : value;
 
-        const outParams = mode
-          ? [prefixedId, rewrittenValue, mode]
-          : [prefixedId, rewrittenValue];
-        const message = formatNotificationMessage(
-          SIGNAL_UPDATE_METHOD,
-          outParams,
-        );
-
         for (const clientId of recipients) {
-          this.rememberVisibleModels(clientId, rewrittenValue);
-          this.host.send(clientId, message);
+          const send = (prepared: any) => {
+            if (!this.clients.has(clientId)) return;
+            this.rememberVisibleModels(clientId, prepared);
+            this.rememberVisibleSignals(clientId, prepared);
+            this.host.send(
+              clientId,
+              formatNotificationMessage(
+                SIGNAL_UPDATE_METHOD,
+                mode ? [prefixedId, prepared, mode] : [prefixedId, prepared],
+              ),
+            );
+          };
+          const prepared = this.prepareForClient(rewrittenValue, clientId);
+          if (prepared instanceof Promise) void prepared.then(send);
+          else send(prepared);
         }
         return;
       }
@@ -259,6 +267,10 @@ export class ForwardedUpstream {
             }
           }
           this.modelVisibility.delete(prefixed);
+          for (const id of this.signalVisibility.keys()) {
+            if (typeof id === 'string' && id.startsWith(`${prefixed}.`))
+              this.signalVisibility.delete(id);
+          }
           for (const id of this.latestSignalValues.keys()) {
             if (typeof id === 'string' && id.startsWith(`${marker}.`))
               this.latestSignalValues.delete(id);
@@ -285,17 +297,34 @@ export class ForwardedUpstream {
         ? addPrefix(this.prefix, result)
         : result;
 
-      if (pending.clientId) {
-        this.rememberVisibleModels(pending.clientId, rewritten);
-      }
-
       if ('resolve' in pending) {
+        if (pending.clientId) {
+          this.rememberVisibleModels(pending.clientId, rewritten);
+          this.rememberVisibleSignals(pending.clientId, rewritten);
+        }
         pending.resolve(rewritten);
       } else {
-        this.host.send(
-          pending.clientId,
-          formatResultMessage(pending.callId, rewritten),
-        );
+        const send = (prepared: any) => {
+          if (!this.clients.has(pending.clientId)) return;
+          this.rememberVisibleModels(pending.clientId, prepared);
+          this.rememberVisibleSignals(pending.clientId, prepared);
+          this.host.send(
+            pending.clientId,
+            formatResultMessage(pending.callId, prepared),
+          );
+        };
+        const prepared = this.prepareForClient(rewritten, pending.clientId);
+        if (prepared instanceof Promise) {
+          void prepared.then(send, (error: Error) =>
+            this.host.send(
+              pending.clientId,
+              formatErrorMessage(pending.callId, {
+                code: -1,
+                message: error.message,
+              }),
+            ),
+          );
+        } else send(prepared);
       }
       return;
     }
@@ -376,9 +405,11 @@ export class ForwardedUpstream {
       this.latestSignalValues.set(value['@S'], value.v);
     }
     if (typeof value['@M'] === 'string') {
+      const plainValueProperties = new Set<string>(value['@P'] ?? []);
       for (const [key, field] of Object.entries(value)) {
         if (
           key !== '@M' &&
+          !plainValueProperties.has(key) &&
           field &&
           typeof field === 'object' &&
           Object.hasOwn(field, 'v') &&
@@ -393,6 +424,88 @@ export class ForwardedUpstream {
     }
     for (const nested of Object.values(value))
       this.rememberSignalSnapshots(nested);
+  }
+
+  private rememberVisibleSignals(clientId: string, value: any) {
+    if (!value || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      for (const item of value) this.rememberVisibleSignals(clientId, item);
+      return;
+    }
+    if (Object.hasOwn(value, '@S')) {
+      const id = value['@S'] as SignalId;
+      let clients = this.signalVisibility.get(id);
+      if (!clients) this.signalVisibility.set(id, (clients = new Set()));
+      clients.add(clientId);
+    }
+    if (typeof value['@M'] === 'string') {
+      const plain = new Set(value['@P'] ?? []);
+      for (const [key, field] of Object.entries(value)) {
+        if (
+          key === '@M' ||
+          plain.has(key) ||
+          !field ||
+          typeof field !== 'object' ||
+          !Object.hasOwn(field, 'v') ||
+          Object.hasOwn(field, '@S')
+        )
+          continue;
+        const id = `${value['@M']}.${key}`;
+        let clients = this.signalVisibility.get(id);
+        if (!clients) this.signalVisibility.set(id, (clients = new Set()));
+        clients.add(clientId);
+      }
+    }
+    for (const nested of Object.values(value))
+      this.rememberVisibleSignals(clientId, nested);
+  }
+
+  /** Resolve an upstream bare ref when this particular downstream client has forgotten it. */
+  private prepareForClient(value: any, clientId: string): any | Promise<any> {
+    if (!value || typeof value !== 'object') return value;
+    if (Array.isArray(value)) {
+      const items = value.map((item) => this.prepareForClient(item, clientId));
+      return items.some((item) => item instanceof Promise)
+        ? Promise.all(items)
+        : items;
+    }
+
+    if (
+      Object.hasOwn(value, '@S') &&
+      !Object.hasOwn(value, 'v') &&
+      !this.signalVisibility.get(value['@S'])?.has(clientId)
+    ) {
+      const id = stripSignalPrefix(this.prefix, value['@S']);
+      if (!this.latestSignalValues.has(id))
+        throw new Error(`Signal snapshot unavailable: ${value['@S']}`);
+      value = {
+        ...value,
+        v: addPrefix(this.prefix, this.latestSignalValues.get(id)),
+      };
+    }
+    if (typeof value['@M'] === 'string') {
+      const marker = value['@M'];
+      if (
+        Object.keys(value).length === 1 &&
+        !this.modelVisibility.get(marker)?.has(clientId)
+      ) {
+        const upstreamMarker = stripPrefix(this.prefix, {'@M': marker})['@M'];
+        return this.refreshModels([upstreamMarker]).then(([fresh]) =>
+          fresh ? this.prepareForClient(fresh, clientId) : null,
+        );
+      }
+      // Mark before descending, since nested models can refer back to this one.
+      this.rememberVisibleModels(clientId, {'@M': marker});
+    }
+    const entries = Object.entries(value).map(
+      ([key, item]) => [key, this.prepareForClient(item, clientId)] as const,
+    );
+    if (entries.some(([, item]) => item instanceof Promise)) {
+      return Promise.all(
+        entries.map(async ([key, item]) => [key, await item] as const),
+      ).then((resolved) => Object.fromEntries(resolved));
+    }
+    return Object.fromEntries(entries);
   }
 
   private rememberVisibleModels(clientId: string, value: any) {
@@ -424,8 +537,18 @@ export class ForwardedUpstream {
         if (clients?.size === 0) this.modelVisibility.delete(marker);
         if (!this.modelVisibility.has(marker)) releasable.push(id);
       } else {
+        const visible = this.signalVisibility.get(
+          prefixSignalId(this.prefix, id),
+        );
+        visible?.delete(clientId);
+        if (visible?.size === 0)
+          this.signalVisibility.delete(prefixSignalId(this.prefix, id));
+        const wasSubscribed = this.signalSubscriptions.get(id)?.has(clientId);
         this.forwardUnwatch(clientId, [id]);
-        if (!this.signalSubscriptions.has(id)) releasable.push(id);
+        if (!this.signalSubscriptions.has(id) && !wasSubscribed) {
+          this.latestSignalValues.delete(id);
+          releasable.push(id);
+        }
       }
     }
     if (releasable.length)
@@ -460,13 +583,25 @@ export class ForwardedUpstream {
       } else if (this.latestSignalValues.has(signalId)) {
         // The upstream watches once for all downstream clients. A later watcher
         // may have missed updates already forwarded to another client.
-        this.host.send(
-          clientId,
-          formatNotificationMessage(SIGNAL_UPDATE_METHOD, [
-            prefixSignalId(this.prefix, signalId),
-            addPrefix(this.prefix, this.latestSignalValues.get(signalId)),
-          ]),
+        const value = addPrefix(
+          this.prefix,
+          this.latestSignalValues.get(signalId),
         );
+        const send = (prepared: any) => {
+          if (!this.clients.has(clientId)) return;
+          this.rememberVisibleModels(clientId, prepared);
+          this.rememberVisibleSignals(clientId, prepared);
+          this.host.send(
+            clientId,
+            formatNotificationMessage(SIGNAL_UPDATE_METHOD, [
+              prefixSignalId(this.prefix, signalId),
+              prepared,
+            ]),
+          );
+        };
+        const prepared = this.prepareForClient(value, clientId);
+        if (prepared instanceof Promise) void prepared.then(send);
+        else send(prepared);
       }
     }
 
@@ -499,6 +634,7 @@ export class ForwardedUpstream {
 
       if (subscribers.size === 0) {
         this.signalSubscriptions.delete(signalId);
+        this.latestSignalValues.delete(signalId);
         toUnwatch.push(signalId);
       }
     }
@@ -506,6 +642,9 @@ export class ForwardedUpstream {
     if (toUnwatch.length > 0) {
       this.transport.send(
         formatNotificationMessage(UNWATCH_SIGNALS_METHOD, toUnwatch),
+      );
+      this.transport.send(
+        formatNotificationMessage(DROP_REFERENCES_METHOD, toUnwatch),
       );
     }
   }
@@ -544,9 +683,25 @@ export class ForwardedUpstream {
     this.clients.delete(clientId);
     this.clearPendingCallsForClient(clientId);
 
+    const toForget: string[] = [];
+    for (const [id, clients] of this.signalVisibility) {
+      clients.delete(clientId);
+      if (clients.size === 0) this.signalVisibility.delete(id);
+    }
     for (const [marker, clients] of this.modelVisibility) {
       clients.delete(clientId);
-      if (clients.size === 0) this.modelVisibility.delete(marker);
+      if (clients.size === 0) {
+        this.modelVisibility.delete(marker);
+        const hash = marker.lastIndexOf('#');
+        toForget.push(
+          `${marker.slice(0, hash + 1)}${stripInstancePrefix(this.prefix, marker.slice(hash + 1))}`,
+        );
+      }
+    }
+    if (toForget.length) {
+      this.transport.send(
+        formatNotificationMessage(DROP_REFERENCES_METHOD, toForget),
+      );
     }
 
     const toUnwatch: SignalId[] = [];
@@ -555,6 +710,7 @@ export class ForwardedUpstream {
 
       if (subscribers.size === 0) {
         this.signalSubscriptions.delete(signalId);
+        this.latestSignalValues.delete(signalId);
         toUnwatch.push(signalId);
       }
     }
@@ -562,6 +718,9 @@ export class ForwardedUpstream {
     if (toUnwatch.length > 0) {
       this.transport.send(
         formatNotificationMessage(UNWATCH_SIGNALS_METHOD, toUnwatch),
+      );
+      this.transport.send(
+        formatNotificationMessage(DROP_REFERENCES_METHOD, toUnwatch),
       );
     }
   }
@@ -574,6 +733,7 @@ export class ForwardedUpstream {
     this.clients.clear();
     this.signalSubscriptions.clear();
     this.modelVisibility.clear();
+    this.signalVisibility.clear();
     this.latestSignalValues.clear();
     this.clearPendingCalls(new Error('Upstream disposed'));
   }
