@@ -94,7 +94,8 @@ During serialization, special objects are embedded in JSON:
 Model-owned signal properties omit `@S`: `{"@M":"Chat#13","title":{"v":"Hello"}}`
 identifies the signal as `Chat#13.title`. If an ordinary model property has a
 `v` key, the model includes `"@P":["propertyName"]` to distinguish it from a
-signal snapshot. Top-level and other standalone signals still use `@S`.
+signal snapshot. If the model itself has an `@P` property, the metadata uses
+`{"@P":{"keys":[...],"value":...}}` to preserve that property. Top-level and other standalone signals still use `@S`.
 Neither form implicitly subscribes a client; only `N:@W:`
 starts updates. A watch after an unwatched change receives an immediate catch-up
 `N:@S:` update/delta. `Instances.remove(id)` explicitly deletes a model and

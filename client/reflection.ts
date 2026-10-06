@@ -717,8 +717,15 @@ export class ClientReflection {
     }
 
     // @P lists ordinary properties whose values also have a `v` key.
-    const plainValueProperties = new Set<string>(serialized['@P'] ?? []);
-    delete serialized['@P'];
+    const metadata = serialized['@P'];
+    const plainValueProperties = new Set<string>(
+      Array.isArray(metadata) ? metadata : (metadata?.keys ?? []),
+    );
+    if (metadata && !Array.isArray(metadata)) {
+      serialized['@P'] = metadata.value;
+    } else {
+      delete serialized['@P'];
+    }
     // Model properties carry their signal identity implicitly in the model marker.
     for (const [key, value] of Object.entries(serialized)) {
       if (

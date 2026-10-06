@@ -155,6 +155,9 @@ export class ForwardedUpstream {
   private nextUpstreamCallId = 1;
 
   private clients = new Set<string>();
+  private clientGenerations = new Map<string, number>();
+  private updateVersions = new Map<string, Map<SignalId, number>>();
+  private pendingUpdates = new Map<string, Set<SignalId>>();
   private signalSubscriptions = new Map<SignalId, Set<string>>();
   private modelVisibility = new Map<string, Set<string>>();
   private signalVisibility = new Map<SignalId, Set<string>>();
@@ -175,6 +178,10 @@ export class ForwardedUpstream {
   }
 
   setClient(clientId: string) {
+    this.clientGenerations.set(
+      clientId,
+      (this.clientGenerations.get(clientId) ?? 0) + 1,
+    );
     this.clients.add(clientId);
     this.rememberVisibleModels(clientId, this.root);
     this.rememberVisibleSignals(clientId, this.root);
@@ -236,21 +243,13 @@ export class ForwardedUpstream {
           : value;
 
         for (const clientId of recipients) {
-          const send = (prepared: any) => {
-            if (!this.clients.has(clientId)) return;
-            this.rememberVisibleModels(clientId, prepared);
-            this.rememberVisibleSignals(clientId, prepared);
-            this.host.send(
-              clientId,
-              formatNotificationMessage(
-                SIGNAL_UPDATE_METHOD,
-                mode ? [prefixedId, prepared, mode] : [prefixedId, prepared],
-              ),
-            );
-          };
-          const prepared = this.prepareForClient(rewrittenValue, clientId);
-          if (prepared instanceof Promise) void prepared.then(send);
-          else send(prepared);
+          this.sendPreparedUpdate(
+            clientId,
+            signalId,
+            prefixedId,
+            rewrittenValue,
+            mode,
+          );
         }
         return;
       }
@@ -346,6 +345,59 @@ export class ForwardedUpstream {
     }
   }
 
+  private sendPreparedUpdate(
+    clientId: string,
+    signalId: SignalId,
+    prefixedId: string,
+    value: any,
+    mode?: string,
+    cached = false,
+  ) {
+    let versions = this.updateVersions.get(clientId);
+    if (!versions) this.updateVersions.set(clientId, (versions = new Map()));
+    const version = (versions.get(signalId) ?? 0) + 1;
+    versions.set(signalId, version);
+    const generation = this.clientGenerations.get(clientId);
+    const pending = this.pendingUpdates.get(clientId)?.has(signalId);
+    if (pending) {
+      // A preceding update is waiting on a model refresh. A later delta needs
+      // its complete current value if the earlier frame is superseded.
+      value = addPrefix(this.prefix, this.latestSignalValues.get(signalId));
+      mode = undefined;
+      cached = true;
+    }
+    const send = (prepared: any) => {
+      if (
+        this.clientGenerations.get(clientId) !== generation ||
+        versions.get(signalId) !== version
+      )
+        return;
+      this.pendingUpdates.get(clientId)?.delete(signalId);
+      this.rememberVisibleModels(clientId, prepared);
+      this.rememberVisibleSignals(clientId, prepared);
+      this.host.send(
+        clientId,
+        formatNotificationMessage(
+          SIGNAL_UPDATE_METHOD,
+          mode ? [prefixedId, prepared, mode] : [prefixedId, prepared],
+        ),
+      );
+    };
+    const prepared = this.prepareForClient(
+      value,
+      clientId,
+      cached,
+      new Set(),
+      generation,
+    );
+    if (prepared instanceof Promise) {
+      let ids = this.pendingUpdates.get(clientId);
+      if (!ids) this.pendingUpdates.set(clientId, (ids = new Set()));
+      ids.add(signalId);
+      void prepared.then(send);
+    } else send(prepared);
+  }
+
   private forwardFinalSignal(signalId: SignalId) {
     this.finalSignalIds.add(signalId);
     this.latestSignalValues.delete(signalId);
@@ -405,8 +457,13 @@ export class ForwardedUpstream {
       this.latestSignalValues.set(value['@S'], value.v);
     }
     if (typeof value['@M'] === 'string') {
-      const plainValueProperties = new Set<string>(value['@P'] ?? []);
-      for (const [key, field] of Object.entries(value)) {
+      const metadata = value['@P'];
+      const plainValueProperties = new Set<string>(
+        Array.isArray(metadata) ? metadata : (metadata?.keys ?? []),
+      );
+      for (const [key, rawField] of Object.entries(value)) {
+        const field =
+          key === '@P' && !Array.isArray(metadata) ? metadata?.value : rawField;
         if (
           key !== '@M' &&
           !plainValueProperties.has(key) &&
@@ -439,8 +496,13 @@ export class ForwardedUpstream {
       clients.add(clientId);
     }
     if (typeof value['@M'] === 'string') {
-      const plain = new Set(value['@P'] ?? []);
-      for (const [key, field] of Object.entries(value)) {
+      const metadata = value['@P'];
+      const plain = new Set(
+        Array.isArray(metadata) ? metadata : (metadata?.keys ?? []),
+      );
+      for (const [key, rawField] of Object.entries(value)) {
+        const field =
+          key === '@P' && !Array.isArray(metadata) ? metadata?.value : rawField;
         if (
           key === '@M' ||
           plain.has(key) ||
@@ -461,44 +523,62 @@ export class ForwardedUpstream {
   }
 
   /** Resolve an upstream bare ref when this particular downstream client has forgotten it. */
-  private prepareForClient(value: any, clientId: string): any | Promise<any> {
+  private prepareForClient(
+    value: any,
+    clientId: string,
+    cached = false,
+    seen = new Set<string>(),
+    generation = this.clientGenerations.get(clientId),
+  ): any | Promise<any> {
+    if (this.clientGenerations.get(clientId) !== generation) return null;
     if (!value || typeof value !== 'object') return value;
     if (Array.isArray(value)) {
-      const items = value.map((item) => this.prepareForClient(item, clientId));
+      const items = value.map((item) =>
+        this.prepareForClient(item, clientId, cached, seen, generation),
+      );
       return items.some((item) => item instanceof Promise)
         ? Promise.all(items)
         : items;
     }
 
-    if (
-      Object.hasOwn(value, '@S') &&
-      !Object.hasOwn(value, 'v') &&
-      !this.signalVisibility.get(value['@S'])?.has(clientId)
-    ) {
+    if (Object.hasOwn(value, '@S')) {
       const id = stripSignalPrefix(this.prefix, value['@S']);
-      if (!this.latestSignalValues.has(id))
+      const missing =
+        !Object.hasOwn(value, 'v') &&
+        !this.signalVisibility.get(value['@S'])?.has(clientId);
+      if ((missing || cached) && this.latestSignalValues.has(id)) {
+        value = {
+          ...value,
+          v: addPrefix(this.prefix, this.latestSignalValues.get(id)),
+        };
+      } else if (missing) {
         throw new Error(`Signal snapshot unavailable: ${value['@S']}`);
-      value = {
-        ...value,
-        v: addPrefix(this.prefix, this.latestSignalValues.get(id)),
-      };
+      }
     }
     if (typeof value['@M'] === 'string') {
       const marker = value['@M'];
-      if (
-        Object.keys(value).length === 1 &&
-        !this.modelVisibility.get(marker)?.has(clientId)
-      ) {
-        const upstreamMarker = stripPrefix(this.prefix, {'@M': marker})['@M'];
-        return this.refreshModels([upstreamMarker]).then(([fresh]) =>
-          fresh ? this.prepareForClient(fresh, clientId) : null,
-        );
+      if (!seen.has(marker)) {
+        seen.add(marker);
+        if (
+          cached ||
+          (Object.keys(value).length === 1 &&
+            !this.modelVisibility.get(marker)?.has(clientId))
+        ) {
+          const upstreamMarker = stripPrefix(this.prefix, {'@M': marker})['@M'];
+          return this.refreshModels([upstreamMarker]).then(([fresh]) =>
+            fresh
+              ? this.prepareForClient(fresh, clientId, false, seen, generation)
+              : null,
+          );
+        }
       }
-      // Mark before descending, since nested models can refer back to this one.
-      this.rememberVisibleModels(clientId, {'@M': marker});
     }
     const entries = Object.entries(value).map(
-      ([key, item]) => [key, this.prepareForClient(item, clientId)] as const,
+      ([key, item]) =>
+        [
+          key,
+          this.prepareForClient(item, clientId, cached, seen, generation),
+        ] as const,
     );
     if (entries.some(([, item]) => item instanceof Promise)) {
       return Promise.all(
@@ -587,21 +667,14 @@ export class ForwardedUpstream {
           this.prefix,
           this.latestSignalValues.get(signalId),
         );
-        const send = (prepared: any) => {
-          if (!this.clients.has(clientId)) return;
-          this.rememberVisibleModels(clientId, prepared);
-          this.rememberVisibleSignals(clientId, prepared);
-          this.host.send(
-            clientId,
-            formatNotificationMessage(SIGNAL_UPDATE_METHOD, [
-              prefixSignalId(this.prefix, signalId),
-              prepared,
-            ]),
-          );
-        };
-        const prepared = this.prepareForClient(value, clientId);
-        if (prepared instanceof Promise) void prepared.then(send);
-        else send(prepared);
+        this.sendPreparedUpdate(
+          clientId,
+          signalId,
+          prefixSignalId(this.prefix, signalId),
+          value,
+          undefined,
+          true,
+        );
       }
     }
 
@@ -681,12 +754,22 @@ export class ForwardedUpstream {
    */
   removeClient(clientId: string) {
     this.clients.delete(clientId);
+    this.clientGenerations.set(
+      clientId,
+      (this.clientGenerations.get(clientId) ?? 0) + 1,
+    );
+    this.updateVersions.delete(clientId);
+    this.pendingUpdates.delete(clientId);
     this.clearPendingCallsForClient(clientId);
 
     const toForget: string[] = [];
+    const orphanedSignals: SignalId[] = [];
     for (const [id, clients] of this.signalVisibility) {
       clients.delete(clientId);
-      if (clients.size === 0) this.signalVisibility.delete(id);
+      if (clients.size === 0) {
+        this.signalVisibility.delete(id);
+        orphanedSignals.push(stripSignalPrefix(this.prefix, id as string));
+      }
     }
     for (const [marker, clients] of this.modelVisibility) {
       clients.delete(clientId);
@@ -719,8 +802,15 @@ export class ForwardedUpstream {
       this.transport.send(
         formatNotificationMessage(UNWATCH_SIGNALS_METHOD, toUnwatch),
       );
+    }
+    const released = new Set([...orphanedSignals, ...toUnwatch]);
+    for (const id of released) {
+      if (this.signalSubscriptions.has(id)) released.delete(id);
+      else this.latestSignalValues.delete(id);
+    }
+    if (released.size) {
       this.transport.send(
-        formatNotificationMessage(DROP_REFERENCES_METHOD, toUnwatch),
+        formatNotificationMessage(DROP_REFERENCES_METHOD, [...released]),
       );
     }
   }
@@ -731,6 +821,9 @@ export class ForwardedUpstream {
   dispose() {
     this.disposed = true;
     this.clients.clear();
+    this.clientGenerations.clear();
+    this.updateVersions.clear();
+    this.pendingUpdates.clear();
     this.signalSubscriptions.clear();
     this.modelVisibility.clear();
     this.signalVisibility.clear();

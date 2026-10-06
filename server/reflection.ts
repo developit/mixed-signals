@@ -136,10 +136,15 @@ export class Reflection {
           previous !== value &&
           this.subscriptions.get(id)?.size
         ) {
-          this.signalUnsubscribers.set(
-            id,
-            value.subscribe(() => this.notifySubscribers(id)),
-          );
+          if (this.finalSignals.has(value)) {
+            this.notifySubscribers(id);
+            this.sealSubscribedSignal(id);
+          } else {
+            this.signalUnsubscribers.set(
+              id,
+              value.subscribe(() => this.notifySubscribers(id)),
+            );
+          }
         }
         this.modelSignalOwners.set(
           propertyId,
@@ -230,7 +235,12 @@ export class Reflection {
           }
         }
       }
-      if (plainValueProperties.length) branded['@P'] = plainValueProperties;
+      // Preserve a real property named @P alongside the collision metadata.
+      if (Object.hasOwn(branded, '@P')) {
+        branded['@P'] = {keys: plainValueProperties, value: branded['@P']};
+      } else if (plainValueProperties.length) {
+        branded['@P'] = plainValueProperties;
+      }
 
       return branded;
     }
@@ -312,21 +322,23 @@ export class Reflection {
       this.finalSignals.add(sig);
 
       for (const [id, source] of this.signals) {
-        if (source !== sig) continue;
-        const subs = this.subscriptions.get(id);
-        if (!subs) continue;
-        for (const clientId of subs) {
-          let ids = this.pendingFinalSignals.get(clientId);
-          if (!ids) this.pendingFinalSignals.set(clientId, (ids = new Set()));
-          ids.add(id);
-        }
-        this.subscriptions.delete(id);
-        this.signalUnsubscribers.get(id)?.();
-        this.signalUnsubscribers.delete(id);
+        if (source === sig) this.sealSubscribedSignal(id);
       }
     }
+  }
 
-    if (this.pendingFinalSignals.size > 0 && !this.finalNotificationTimer) {
+  private sealSubscribedSignal(id: SignalId) {
+    const subs = this.subscriptions.get(id);
+    if (!subs) return;
+    for (const clientId of subs) {
+      let ids = this.pendingFinalSignals.get(clientId);
+      if (!ids) this.pendingFinalSignals.set(clientId, (ids = new Set()));
+      ids.add(id);
+    }
+    this.subscriptions.delete(id);
+    this.signalUnsubscribers.get(id)?.();
+    this.signalUnsubscribers.delete(id);
+    if (!this.finalNotificationTimer) {
       this.finalNotificationTimer = setTimeout(
         () => this.flushFinalNotifications(),
         FINAL_NOTIFICATION_DELAY,

@@ -294,13 +294,13 @@ describe('ClientReflection', () => {
       reflection.registerModel('Task', TaskModel);
       const facade = reflection.createModelFacade({
         '@M': 'Task#42',
-        '@P': ['settings'],
+        '@P': {keys: ['settings', '@P'], value: {v: 'ordinary'}},
         settings: {v: 2},
         title: {v: 'Ship'},
       });
       expect(facade.data.settings).toEqual({v: 2});
       expect(facade.data.title.peek()).toBe('Ship');
-      expect(facade.data['@P']).toBeUndefined();
+      expect(facade.data['@P']).toEqual({v: 'ordinary'});
     });
 
     it('reuses cached facades for repeated model markers', () => {

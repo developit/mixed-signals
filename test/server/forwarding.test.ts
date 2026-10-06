@@ -421,6 +421,101 @@ describe('protocol-level forwarding', () => {
     expect(nextMessages.at(-1)).toContain('"status":{"v":"idle"}');
   });
 
+  it('does not deliver an older deferred model update after a newer value', async () => {
+    const {
+      brokerTransport,
+      serverUpstreamTransport,
+      serverDownstreamTransport,
+      browserTransport,
+      createDownstreamPair,
+      flush,
+    } = createLinkedTransports();
+    const second = createDownstreamPair('late');
+    const lateMessages: string[] = [];
+    browserTransport.onMessage(() => undefined);
+    second.browserTransport.onMessage((data) =>
+      lateMessages.push(data.toString()),
+    );
+    const item = new BrokerSession('nested');
+    const feed = signal<BrokerSession | null>(null);
+    const broker = new RPC({feed});
+    broker.registerModel('BrokerSession', BrokerSession);
+    broker.addClient(brokerTransport);
+    const server = new RPC();
+    server.addUpstream(serverUpstreamTransport);
+    await flush();
+    server.addClient(serverDownstreamTransport, 'first');
+    server.addClient(second.serverTransport, 'second');
+    await flush();
+    browserTransport.send(
+      formatNotificationMessage(WATCH_SIGNALS_METHOD, ['1_1']),
+    );
+    await flush();
+    feed.value = item;
+    await flush();
+    feed.value = null;
+    await flush();
+    second.browserTransport.send(
+      formatNotificationMessage(WATCH_SIGNALS_METHOD, ['1_1']),
+    );
+    await flush();
+    lateMessages.length = 0;
+    feed.value = item;
+    feed.value = null;
+    await flush();
+    expect(getSignalUpdateValues(lateMessages).at(-1)).toBeNull();
+  });
+
+  it('refreshes nested fields in a late watcher catch-up', async () => {
+    const {
+      brokerTransport,
+      serverUpstreamTransport,
+      serverDownstreamTransport,
+      browserTransport,
+      createDownstreamPair,
+      flush,
+    } = createLinkedTransports();
+    const second = createDownstreamPair('late');
+    const lateMessages: string[] = [];
+    browserTransport.onMessage(() => undefined);
+    second.browserTransport.onMessage((data) =>
+      lateMessages.push(data.toString()),
+    );
+    const item = new BrokerSession('nested');
+    const feed = signal(item);
+    const broker = new RPC({feed});
+    broker.registerModel('BrokerSession', BrokerSession);
+    broker.addClient(brokerTransport);
+    const server = new RPC();
+    server.addUpstream(serverUpstreamTransport);
+    await flush();
+    server.addClient(serverDownstreamTransport, 'first');
+    server.addClient(second.serverTransport, 'second');
+    await flush();
+    browserTransport.send(
+      formatNotificationMessage(WATCH_SIGNALS_METHOD, ['1_1']),
+    );
+    browserTransport.send(
+      formatNotificationMessage(WATCH_SIGNALS_METHOD, [
+        'BrokerSession#1_nested.status',
+      ]),
+    );
+    await flush();
+    item.status.value = 'running';
+    await flush();
+    lateMessages.length = 0;
+    second.browserTransport.send(
+      formatNotificationMessage(WATCH_SIGNALS_METHOD, ['1_1']),
+    );
+    await flush();
+    expect(getSignalUpdateValues(lateMessages)).toContainEqual(
+      expect.objectContaining({
+        '@M': 'BrokerSession#1_nested',
+        status: {v: 'running'},
+      }),
+    );
+  });
+
   it('notifies a late watcher when a nested model from catch-up is deleted', async () => {
     const {
       brokerTransport,

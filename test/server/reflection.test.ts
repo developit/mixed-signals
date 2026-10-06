@@ -245,6 +245,7 @@ describe('Reflection', () => {
         id = '13';
         title = signal('Hello');
         settings = {v: 2};
+        '@P' = {v: 'ordinary'};
       }
       reflection.registerModel('Chat', Chat);
       expect(reflection.serialize(new Chat(), 'c1')).toEqual({
@@ -252,7 +253,7 @@ describe('Reflection', () => {
         id: '13',
         title: {v: 'Hello'},
         settings: {v: 2},
-        '@P': ['settings'],
+        '@P': {keys: ['settings', '@P'], value: {v: 'ordinary'}},
       });
     });
 
@@ -475,6 +476,34 @@ describe('Reflection', () => {
           message: 'N:@S:"Chat#13.title","er","append"',
         },
       ]);
+    });
+
+    it('updates and seals watchers when a replacement signal was already final', () => {
+      vi.useFakeTimers();
+      class Chat {
+        id = '13';
+        title = signal('old');
+      }
+      reflection.registerModel('Chat', Chat);
+      const chat = new Chat();
+      reflection.serialize(chat, 'c1');
+      reflection.watch('c1', 'Chat#13.title');
+      const final = signal('done');
+      reflection.markFinal([final]);
+      chat.title = final;
+      reflection.serializeModelMarker('Chat#13', 'c1');
+      expect(sender.sent).toContainEqual({
+        clientId: 'c1',
+        message: 'N:@S:"Chat#13.title","done"',
+      });
+      vi.advanceTimersByTime(1_000);
+      expect(sender.sent).toContainEqual({
+        clientId: 'c1',
+        message: 'N:@S:"Chat#13.title",null,"seal"',
+      });
+      sender.sent.length = 0;
+      final.value = 'later';
+      expect(sender.sent).toEqual([]);
     });
 
     it('deletes watched model fields and notifies late subscribers', () => {
