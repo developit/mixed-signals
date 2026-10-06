@@ -8,7 +8,6 @@ import {
   parseWireMessage,
   parseWireParams,
   parseWireValue,
-  REFRESH_MODELS_METHOD,
   ROOT_NOTIFICATION_METHOD,
   SIGNAL_UPDATE_METHOD,
   type Transport,
@@ -168,22 +167,22 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
         const message = parseWireMessage(data.toString());
         if (!message) return;
 
-        const reviver = (_key: string, val: any) => {
-          if (typeof val === 'object' && val) {
-            if ('@S' in val) {
-              const sig = Object.hasOwn(val, 'v')
-                ? this.reflection.syncSignalSnapshot(val['@S'], val.v)
-                : this.reflection.getOrCreateSignal(val['@S'], undefined);
-              if (val.f) this.reflection.markSignalFinal(sig);
-              return sig;
-            }
+        const reflection = this.reflection;
+        const reviver = function (this: object, _key: string, val: any) {
+          if (typeof val !== 'object' || !val) return val;
 
-            if ('@M' in val) {
-              return this.reflection.createModelFacade(val);
-            }
+          let revived = val;
+          if ('@S' in val) {
+            revived = Object.hasOwn(val, 'v')
+              ? reflection.syncSignalSnapshot(val['@S'], val.v)
+              : reflection.getOrCreateSignal(val['@S'], undefined);
+            if (val.f) reflection.markSignalFinal(revived);
+          } else if ('@M' in val) {
+            revived = reflection.createModelFacade(val);
           }
 
-          return val;
+          reflection.noteRevived(this, val, revived !== val);
+          return revived;
         };
 
         if (message.type === 'result' || message.type === 'error') {
@@ -238,7 +237,7 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
         } else {
           params = parseWireParams(message.payload, reviver);
         }
-        this.handleNotification(generation, message.method, params);
+        this.handleNotification(message.method, params);
       }),
     );
   }
@@ -534,36 +533,7 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
     };
   }
 
-  private async refreshHeldModelsAndReplay(generation: number) {
-    const markers = this.reflection.getActiveHeldModelMarkers();
-    if (markers.length === 0) {
-      this.reflection.replayActiveSignals();
-      return;
-    }
-
-    const modelRefreshGeneration = this.reflection.beginModelRefresh(markers);
-    const refresh = this.call(REFRESH_MODELS_METHOD, markers);
-    this.reflection.replayActiveSignals();
-
-    try {
-      await refresh;
-    } catch {
-      // Unresolved models stay stale; independently hydrated signals can still subscribe.
-    } finally {
-      if (
-        this.reflection.finishModelRefresh(markers, modelRefreshGeneration) &&
-        generation === this.transportGeneration
-      ) {
-        this.reflection.replayActiveSignals();
-      }
-    }
-  }
-
-  private handleNotification(
-    generation: number,
-    method: string,
-    params: any[],
-  ) {
+  private handleNotification(method: string, params: any[]) {
     if (method === ROOT_NOTIFICATION_METHOD) {
       const [nextRoot, maybeConnectionInfo] = params;
       const hadRoot = this.root !== undefined;
@@ -587,7 +557,7 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
 
       if (this.replaySubscriptionsOnRoot) {
         this.replaySubscriptionsOnRoot = false;
-        void this.refreshHeldModelsAndReplay(generation);
+        this.reflection.refreshHeldModels();
       }
     } else if (method === SIGNAL_UPDATE_METHOD) {
       const [id, value, mode] = params;

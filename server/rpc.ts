@@ -351,6 +351,7 @@ export class RPC {
   ): boolean {
     const markers = parseWireParams<unknown[]>(payload);
     const results = new Array(markers.length).fill(null);
+    const localIndexes: number[] = [];
     const upstreamBatches = new Map<
       ForwardedUpstream,
       {indexes: number[]; markers: string[]}
@@ -361,16 +362,12 @@ export class RPC {
       if (typeof marker !== 'string') continue;
 
       const hashIdx = marker.lastIndexOf('#');
-      if (hashIdx === -1) {
-        results[index] = this.reflection.serializeModelMarker(marker, clientId);
-        continue;
-      }
-
       const typeName = marker.slice(0, hashIdx);
       const wireId = marker.slice(hashIdx + 1);
-      const upstream = this.findUpstreamForInstance(wireId);
+      const upstream =
+        hashIdx === -1 ? undefined : this.findUpstreamForInstance(wireId);
       if (!upstream) {
-        results[index] = this.reflection.serializeModelMarker(marker, clientId);
+        localIndexes.push(index);
         continue;
       }
 
@@ -385,7 +382,16 @@ export class RPC {
       );
     }
 
+    // The caller serializes an all-local refresh. Serializing here as well
+    // would mark each model as sent, so the reply would carry bare markers.
     if (upstreamBatches.size === 0) return false;
+
+    for (const index of localIndexes) {
+      results[index] = this.reflection.serializeModelMarker(
+        markers[index] as string,
+        clientId,
+      );
+    }
 
     Promise.all(
       Array.from(upstreamBatches, async ([upstream, batch]) => {

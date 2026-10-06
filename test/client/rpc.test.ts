@@ -2,7 +2,7 @@ import {effect} from '@preact/signals-core';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import type {WireContext} from '../../client/reflection.ts';
 import {RPCClient} from '../../client/rpc.ts';
-import type {Transport} from '../../shared/protocol.ts';
+import {parseWireParams, type Transport} from '../../shared/protocol.ts';
 import {ReflectedCounter} from '../helpers.ts';
 
 class FakeTransport implements Transport {
@@ -1141,19 +1141,24 @@ describe('RPCClient', () => {
       await client.ready;
 
       held.count.subscribe(() => undefined);
+      vi.advanceTimersByTime(10);
       held.name.subscribe(() => undefined);
       vi.advanceTimersByTime(10);
 
-      expect(transport2.sent.filter((msg) => msg.includes(':@M:'))).toEqual([
-        'M1:@M:"Counter#held"',
-      ]);
-      expect(transport2.sent).not.toContain('N:@W:1,2');
+      expect(transport2.sent).toEqual(['M1:@M:"Counter#held"']);
 
       transport2.emit(
         'R1:[{"@M":"Counter#held","count":{"@S":10,"v":5},"name":{"@S":20,"v":"y"},"items":{"@S":30,"v":[]},"meta":{"@S":40,"v":{}}}]',
       );
       await vi.waitFor(() => {
-        expect(transport2.sent).toContain('N:@W:10,20');
+        const watches = transport2.sent
+          .filter((msg) => msg.startsWith('N:@W:'))
+          .map((msg) =>
+            parseWireParams<number[]>(msg.slice('N:@W:'.length)).sort(
+              (a, b) => a - b,
+            ),
+          );
+        expect(watches).toEqual([[10, 20]]);
       });
     });
 
