@@ -1,4 +1,5 @@
 import {
+  DROP_REFERENCES_METHOD,
   formatCallMessage,
   formatErrorMessage,
   formatNotificationMessage,
@@ -30,7 +31,7 @@ export function addPrefix(prefix: string, value: any): any {
   for (const key of Object.keys(value)) {
     const v = value[key];
     if (key === '@S' && (typeof v === 'number' || typeof v === 'string')) {
-      out['@S'] = `${prefix}${SEP}${v}`;
+      out['@S'] = prefixSignalId(prefix, v);
     } else if (key === '@M' && typeof v === 'string') {
       const h = v.lastIndexOf('#');
       out['@M'] =
@@ -54,7 +55,11 @@ export function stripPrefix(prefix: string, value: any): any {
   const out: Record<string, any> = {};
   for (const key of Object.keys(value)) {
     const v = value[key];
-    if (key === '@S' && typeof v === 'string' && v.startsWith(pfx)) {
+    if (
+      key === '@S' &&
+      typeof v === 'string' &&
+      (v.startsWith(pfx) || v.slice(v.lastIndexOf('#') + 1).startsWith(pfx))
+    ) {
       out['@S'] = stripSignalPrefix(prefix, v);
     } else if (key === '@M' && typeof v === 'string') {
       const h = v.lastIndexOf('#');
@@ -81,6 +86,10 @@ export function isUpstreamId(prefix: string, id: SignalId): boolean {
  * Strip the prefix from a prefixed signal ID, preserving nested upstream IDs.
  */
 export function stripSignalPrefix(prefix: string, id: string): SignalId {
+  const hash = id.lastIndexOf('#');
+  if (hash !== -1) {
+    return `${id.slice(0, hash + 1)}${stripInstancePrefix(prefix, id.slice(hash + 1))}`;
+  }
   const stripped = id.slice(prefix.length + SEP.length);
   const numeric = Number(stripped);
   return Number.isInteger(numeric) && String(numeric) === stripped
@@ -103,28 +112,12 @@ function needsRewrite(rawPayload: string): boolean {
   return rawPayload.includes('"@S"') || rawPayload.includes('"@M"');
 }
 
-function collectSignalIds(
-  value: any,
-  ids = new Set<SignalId>(),
-): Set<SignalId> {
-  if (value === null || value === undefined || typeof value !== 'object') {
-    return ids;
+function prefixSignalId(prefix: string, id: SignalId): string {
+  if (typeof id === 'string' && id.includes('#')) {
+    const hash = id.lastIndexOf('#');
+    return `${id.slice(0, hash + 1)}${prefix}${SEP}${id.slice(hash + 1)}`;
   }
-
-  if (Array.isArray(value)) {
-    for (const item of value) collectSignalIds(item, ids);
-    return ids;
-  }
-
-  const signalId = value['@S'];
-  if (typeof signalId === 'number' || typeof signalId === 'string') {
-    ids.add(signalId);
-  }
-
-  for (const nested of Object.values(value)) {
-    collectSignalIds(nested, ids);
-  }
-  return ids;
+  return `${prefix}${SEP}${id}`;
 }
 
 interface UpstreamHost {
@@ -162,9 +155,9 @@ export class ForwardedUpstream {
   private nextUpstreamCallId = 1;
 
   private clients = new Set<string>();
-  private rootSignalIds = new Set<SignalId>();
   private signalSubscriptions = new Map<SignalId, Set<string>>();
-  private signalVisibility = new Map<SignalId, Set<string>>();
+  private modelVisibility = new Map<string, Set<string>>();
+  private latestSignalValues = new Map<SignalId, any>();
   private finalSignalIds = new Set<SignalId>();
 
   constructor(prefix: string, transport: Transport, host: UpstreamHost) {
@@ -182,7 +175,7 @@ export class ForwardedUpstream {
 
   setClient(clientId: string) {
     this.clients.add(clientId);
-    this.rememberVisibleSignals(clientId, this.rootSignalIds);
+    this.rememberVisibleModels(clientId, this.root);
   }
 
   private handleUpstreamMessage(msg: string) {
@@ -194,11 +187,11 @@ export class ForwardedUpstream {
     if (parsed.type === 'notification') {
       if (parsed.method === ROOT_NOTIFICATION_METHOD) {
         const [rootValue] = parseWireParams(parsed.payload);
-        this.rootSignalIds = collectSignalIds(rootValue);
-        for (const clientId of this.clients) {
-          this.rememberVisibleSignals(clientId, this.rootSignalIds);
-        }
+        this.rememberSignalSnapshots(rootValue);
         this.root = addPrefix(this.prefix, rootValue);
+        for (const clientId of this.clients) {
+          this.rememberVisibleModels(clientId, this.root);
+        }
         this._resolveReady();
         this.host.onUpstreamRootChanged();
         return;
@@ -206,20 +199,33 @@ export class ForwardedUpstream {
 
       if (parsed.method === SIGNAL_UPDATE_METHOD) {
         // Parse params: [signalId, value, mode?]
-        const params = parseWireParams(parsed.payload);
+        const params = parseWireParams<[SignalId, any, string?]>(
+          parsed.payload,
+        );
         const [signalId, value, mode] = params;
         if (mode === 'seal') {
           this.forwardFinalSignal(signalId as SignalId);
           return;
         }
 
-        const subscribers = this.signalSubscriptions.get(signalId as SignalId);
-        const visibleClients = this.signalVisibility.get(signalId as SignalId);
-        const recipients =
-          subscribers && subscribers.size > 0 ? subscribers : visibleClients;
+        const current = this.latestSignalValues.get(signalId as SignalId);
+        this.latestSignalValues.set(
+          signalId as SignalId,
+          mode === 'append'
+            ? Array.isArray(current)
+              ? [...current, ...value]
+              : typeof current === 'string'
+                ? current + value
+                : value
+            : mode === 'merge' && current && typeof current === 'object'
+              ? {...current, ...value}
+              : value,
+        );
+        this.rememberSignalSnapshots(value);
+        const recipients = this.signalSubscriptions.get(signalId as SignalId);
         if (!recipients || recipients.size === 0) return;
 
-        const prefixedId = `${this.prefix}${SEP}${signalId}`;
+        const prefixedId = prefixSignalId(this.prefix, signalId as SignalId);
 
         // Only rewrite value if it contains @S/@M markers
         const rewrittenValue = needsRewrite(parsed.payload)
@@ -235,7 +241,34 @@ export class ForwardedUpstream {
         );
 
         for (const clientId of recipients) {
+          this.rememberVisibleModels(clientId, rewrittenValue);
           this.host.send(clientId, message);
+        }
+        return;
+      }
+
+      if (parsed.method === DROP_REFERENCES_METHOD) {
+        const markers = parseWireParams<string[]>(parsed.payload);
+        for (const marker of markers) {
+          const prefixed = addPrefix(this.prefix, {'@M': marker})['@M'];
+          const recipients = new Set(this.modelVisibility.get(prefixed) ?? []);
+          for (const [id, subscribers] of this.signalSubscriptions) {
+            if (typeof id === 'string' && id.startsWith(`${marker}.`)) {
+              for (const clientId of subscribers) recipients.add(clientId);
+              this.signalSubscriptions.delete(id);
+            }
+          }
+          this.modelVisibility.delete(prefixed);
+          for (const id of this.latestSignalValues.keys()) {
+            if (typeof id === 'string' && id.startsWith(`${marker}.`))
+              this.latestSignalValues.delete(id);
+          }
+          for (const clientId of recipients) {
+            this.host.send(
+              clientId,
+              formatNotificationMessage(DROP_REFERENCES_METHOD, [prefixed]),
+            );
+          }
         }
         return;
       }
@@ -247,12 +280,13 @@ export class ForwardedUpstream {
       this.pendingCalls.delete(parsed.id);
 
       const result = JSON.parse(parsed.payload);
+      this.rememberSignalSnapshots(result);
       const rewritten = needsRewrite(parsed.payload)
         ? addPrefix(this.prefix, result)
         : result;
 
       if (pending.clientId) {
-        this.rememberVisibleSignals(pending.clientId, collectSignalIds(result));
+        this.rememberVisibleModels(pending.clientId, rewritten);
       }
 
       if ('resolve' in pending) {
@@ -285,17 +319,14 @@ export class ForwardedUpstream {
 
   private forwardFinalSignal(signalId: SignalId) {
     this.finalSignalIds.add(signalId);
+    this.latestSignalValues.delete(signalId);
     const subscribers = this.signalSubscriptions.get(signalId);
-    const recipients =
-      subscribers && subscribers.size > 0
-        ? subscribers
-        : this.signalVisibility.get(signalId);
+    const recipients = subscribers;
     this.signalSubscriptions.delete(signalId);
-    this.signalVisibility.delete(signalId);
     if (!recipients) return;
 
     const message = formatNotificationMessage(SIGNAL_UPDATE_METHOD, [
-      `${this.prefix}${SEP}${signalId}`,
+      prefixSignalId(this.prefix, signalId),
       null,
       'seal',
     ]);
@@ -335,30 +366,72 @@ export class ForwardedUpstream {
     );
   }
 
-  private rememberVisibleSignals(
-    clientId: string,
-    signalIds: Iterable<SignalId>,
-  ) {
-    for (const signalId of signalIds) {
-      let clients = this.signalVisibility.get(signalId);
-      if (!clients) {
-        clients = new Set();
-        this.signalVisibility.set(signalId, clients);
-      }
-      clients.add(clientId);
+  private rememberSignalSnapshots(value: any) {
+    if (!value || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      for (const item of value) this.rememberSignalSnapshots(item);
+      return;
     }
+    if (Object.hasOwn(value, '@S') && Object.hasOwn(value, 'v')) {
+      this.latestSignalValues.set(value['@S'], value.v);
+    }
+    if (typeof value['@M'] === 'string') {
+      for (const [key, field] of Object.entries(value)) {
+        if (
+          key !== '@M' &&
+          field &&
+          typeof field === 'object' &&
+          Object.hasOwn(field, 'v') &&
+          !Object.hasOwn(field, '@S')
+        ) {
+          this.latestSignalValues.set(
+            `${value['@M']}.${key}`,
+            (field as {v: any}).v,
+          );
+        }
+      }
+    }
+    for (const nested of Object.values(value))
+      this.rememberSignalSnapshots(nested);
   }
 
-  private forgetVisibleSignals(
-    clientId: string,
-    signalIds: Iterable<SignalId>,
-  ) {
-    for (const signalId of signalIds) {
-      const clients = this.signalVisibility.get(signalId);
-      if (!clients) continue;
-      clients.delete(clientId);
-      if (clients.size === 0) this.signalVisibility.delete(signalId);
+  private rememberVisibleModels(clientId: string, value: any) {
+    if (!value || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      for (const item of value) this.rememberVisibleModels(clientId, item);
+      return;
     }
+    if (typeof value['@M'] === 'string') {
+      let clients = this.modelVisibility.get(value['@M']);
+      if (!clients)
+        this.modelVisibility.set(value['@M'], (clients = new Set()));
+      clients.add(clientId);
+    }
+    for (const nested of Object.values(value))
+      this.rememberVisibleModels(clientId, nested);
+  }
+
+  forwardForget(clientId: string, ids: SignalId[]) {
+    const releasable: SignalId[] = [];
+    for (const id of ids) {
+      const marker =
+        typeof id === 'string' && id.includes('#')
+          ? (addPrefix(this.prefix, {'@M': id})['@M'] as string)
+          : undefined;
+      if (marker && this.modelVisibility.get(marker)?.has(clientId)) {
+        const clients = this.modelVisibility.get(marker);
+        clients?.delete(clientId);
+        if (clients?.size === 0) this.modelVisibility.delete(marker);
+        if (!this.modelVisibility.has(marker)) releasable.push(id);
+      } else {
+        this.forwardUnwatch(clientId, [id]);
+        if (!this.signalSubscriptions.has(id)) releasable.push(id);
+      }
+    }
+    if (releasable.length)
+      this.transport.send(
+        formatNotificationMessage(DROP_REFERENCES_METHOD, releasable),
+      );
   }
 
   /**
@@ -370,11 +443,10 @@ export class ForwardedUpstream {
 
     for (const signalId of new Set(signalIds)) {
       if (this.finalSignalIds.has(signalId)) {
-        finalIds.push(`${this.prefix}${SEP}${signalId}`);
+        finalIds.push(prefixSignalId(this.prefix, signalId));
         continue;
       }
 
-      this.rememberVisibleSignals(clientId, [signalId]);
       let subscribers = this.signalSubscriptions.get(signalId);
       const wasUnwatched = !subscribers || subscribers.size === 0;
       if (!subscribers) {
@@ -383,7 +455,19 @@ export class ForwardedUpstream {
       }
 
       subscribers.add(clientId);
-      if (wasUnwatched) toWatch.push(signalId);
+      if (wasUnwatched) {
+        toWatch.push(signalId);
+      } else if (this.latestSignalValues.has(signalId)) {
+        // The upstream watches once for all downstream clients. A later watcher
+        // may have missed updates already forwarded to another client.
+        this.host.send(
+          clientId,
+          formatNotificationMessage(SIGNAL_UPDATE_METHOD, [
+            prefixSignalId(this.prefix, signalId),
+            addPrefix(this.prefix, this.latestSignalValues.get(signalId)),
+          ]),
+        );
+      }
     }
 
     if (toWatch.length > 0) {
@@ -408,8 +492,6 @@ export class ForwardedUpstream {
    */
   forwardUnwatch(clientId: string, signalIds: SignalId[]) {
     const toUnwatch: SignalId[] = [];
-
-    this.forgetVisibleSignals(clientId, signalIds);
 
     for (const signalId of new Set(signalIds)) {
       const subscribers = this.signalSubscriptions.get(signalId);
@@ -462,9 +544,9 @@ export class ForwardedUpstream {
     this.clients.delete(clientId);
     this.clearPendingCallsForClient(clientId);
 
-    for (const [signalId, clients] of this.signalVisibility) {
+    for (const [marker, clients] of this.modelVisibility) {
       clients.delete(clientId);
-      if (clients.size === 0) this.signalVisibility.delete(signalId);
+      if (clients.size === 0) this.modelVisibility.delete(marker);
     }
 
     const toUnwatch: SignalId[] = [];
@@ -490,9 +572,9 @@ export class ForwardedUpstream {
   dispose() {
     this.disposed = true;
     this.clients.clear();
-    this.rootSignalIds.clear();
     this.signalSubscriptions.clear();
-    this.signalVisibility.clear();
+    this.modelVisibility.clear();
+    this.latestSignalValues.clear();
     this.clearPendingCalls(new Error('Upstream disposed'));
   }
 }

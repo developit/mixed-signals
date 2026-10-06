@@ -290,6 +290,20 @@ describe('addPrefix / stripPrefix', () => {
     });
   });
 
+  it('keeps implicit model-field IDs aligned across forwarding hops', () => {
+    const model = {'@M': 'Chat#13', title: {v: 'Hello'}};
+    expect(addPrefix('1', model)).toEqual({
+      '@M': 'Chat#1_13',
+      title: {v: 'Hello'},
+    });
+    const ref = {'@S': 'Chat#13.title', v: 'Hello'};
+    expect(addPrefix('2', addPrefix('1', ref))).toEqual({
+      '@S': 'Chat#2_1_13.title',
+      v: 'Hello',
+    });
+    expect(stripPrefix('2', addPrefix('2', ref))).toEqual(ref);
+  });
+
   it('passes through non-prefixed values', () => {
     expect(addPrefix('1', 'hello')).toBe('hello');
     expect(addPrefix('1', 42)).toBe(42);
@@ -299,6 +313,64 @@ describe('addPrefix / stripPrefix', () => {
 });
 
 describe('protocol-level forwarding', () => {
+  it('only updates watchers, catches up a late watcher, and forwards deletion', async () => {
+    const {
+      brokerTransport,
+      serverUpstreamTransport,
+      serverDownstreamTransport,
+      browserTransport,
+      createDownstreamPair,
+      flush,
+    } = createLinkedTransports();
+    const second = createDownstreamPair('late');
+    const firstMessages: string[] = [];
+    const secondMessages: string[] = [];
+    browserTransport.onMessage((data) => firstMessages.push(data.toString()));
+    second.browserTransport.onMessage((data) =>
+      secondMessages.push(data.toString()),
+    );
+    const broker = new RPC();
+    broker.registerModel('BrokerProject', BrokerProject);
+    const project = new BrokerProject('42', 'Initial');
+    broker.expose({project});
+    broker.addClient(brokerTransport);
+    const server = new RPC();
+    server.addUpstream(serverUpstreamTransport);
+    await flush();
+    server.addClient(serverDownstreamTransport, 'first');
+    server.addClient(second.serverTransport, 'second');
+    await flush();
+    firstMessages.length = secondMessages.length = 0;
+
+    const fieldId = 'BrokerProject#1_42.name';
+    project.name.value = 'Before watch';
+    await flush();
+    expect(firstMessages).toEqual([]);
+    expect(secondMessages).toEqual([]);
+    browserTransport.send(
+      formatNotificationMessage(WATCH_SIGNALS_METHOD, [fieldId]),
+    );
+    await flush();
+    expect(getSignalUpdateValues(firstMessages)).toContain('Before watch');
+    firstMessages.length = 0;
+
+    project.name.value = 'Before watch!';
+    await flush();
+    expect(getSignalUpdateValues(firstMessages)).toContain('!');
+    expect(secondMessages).toEqual([]);
+    second.browserTransport.send(
+      formatNotificationMessage(WATCH_SIGNALS_METHOD, [fieldId]),
+    );
+    await flush();
+    expect(getSignalUpdateValues(secondMessages)).toContain('Before watch!');
+
+    firstMessages.length = secondMessages.length = 0;
+    broker.instances.remove('42');
+    await flush();
+    expect(firstMessages).toContain('N:@D:"BrokerProject#1_42"');
+    expect(secondMessages).toContain('N:@D:"BrokerProject#1_42"');
+  });
+
   it('forwards root, signal updates, and method calls through the server', async () => {
     vi.useFakeTimers();
 
@@ -537,6 +609,7 @@ describe('protocol-level forwarding', () => {
   });
 
   it('does not broadcast method-returned model updates to clients that never saw the model', async () => {
+    vi.useFakeTimers();
     const {
       brokerTransport,
       serverUpstreamTransport,
@@ -595,6 +668,9 @@ describe('protocol-level forwarding', () => {
     await flush();
     const secretModel = await createSecret;
     expect(secretModel.status.value).toBe('idle');
+    secretModel.status.subscribe(() => undefined);
+    vi.advanceTimersByTime(10);
+    await flush();
 
     secondMessages.length = 0;
     secret.status.value = 'running';

@@ -1,11 +1,12 @@
 import {Signal} from '@preact/signals-core';
 import {
+  DROP_REFERENCES_METHOD,
   formatNotificationMessage,
   SIGNAL_UPDATE_METHOD,
 } from '../shared/protocol.ts';
 import type {Instances} from './instances.ts';
 
-type SignalId = number;
+type SignalId = number | string;
 type ClientId = string;
 type DeltaMode = 'append' | 'merge';
 
@@ -33,6 +34,7 @@ function isWireDropped(value: any): boolean {
 
 export class Reflection {
   private signalIds = new WeakMap<Signal<any>, SignalId>();
+  private modelSignalOwners = new Map<string, string>();
   private signals = new Map<SignalId, Signal<any>>();
   private subscriptions = new Map<SignalId, Set<ClientId>>();
   private signalUnsubscribers = new Map<SignalId, () => void>();
@@ -100,28 +102,41 @@ export class Reflection {
 
   private getSignalId(sig: Signal<any>): SignalId {
     let id = this.signalIds.get(sig);
-    if (!id) {
+    if (id === undefined || !this.signals.has(id)) {
       id = this.nextSignalId++;
       this.signalIds.set(sig, id);
-      this.signals.set(id, sig);
     }
-
+    this.signals.set(id, sig);
     return id;
   }
 
-  private serializeValue(value: any, clientId?: ClientId): any {
+  private serializeValue(
+    value: any,
+    clientId?: ClientId,
+    propertyId?: string,
+  ): any {
     if (value === this.rpc || value === this || value === this.instances)
       return undefined;
     if (typeof value === 'function') return undefined;
 
     if (value instanceof Signal) {
-      const id = this.getSignalId(value);
+      const id = propertyId ?? this.getSignalId(value);
+      if (propertyId) {
+        this.signalIds.set(value, id);
+        this.signals.set(id, value);
+        this.modelSignalOwners.set(
+          propertyId,
+          propertyId.slice(0, propertyId.lastIndexOf('.')),
+        );
+      }
       const signalValue = value.peek();
 
       if (this.finalSignals.has(value)) {
         // Always inlined: an unwatched signal is only weakly held client-side,
         // so a bare ref could fail to resolve.
-        return {'@S': id, v: this.serializeValue(signalValue, clientId), f: 1};
+        return propertyId
+          ? {v: this.serializeValue(signalValue, clientId), f: 1}
+          : {'@S': id, v: this.serializeValue(signalValue, clientId), f: 1};
       }
 
       if (clientId) {
@@ -144,11 +159,12 @@ export class Reflection {
           this.lastSentValues.get(key) === signalValue &&
           !!this.subscriptions.get(id)?.has(clientId);
         this.lastSentValues.set(key, signalValue);
-        this.watch(clientId, id);
-        if (alreadyHeld) return {'@S': id};
+        if (alreadyHeld && !propertyId) return {'@S': id};
       }
 
-      return {'@S': id, v: this.serializeValue(signalValue, clientId)};
+      return propertyId
+        ? {v: this.serializeValue(signalValue, clientId)}
+        : {'@S': id, v: this.serializeValue(signalValue, clientId)};
     }
 
     if (this.isModel(value)) {
@@ -178,7 +194,11 @@ export class Reflection {
       for (const [key, prop] of Object.entries(value)) {
         if (key.startsWith('_')) continue;
 
-        const serializedProp = this.serializeValue(prop, clientId);
+        const serializedProp = this.serializeValue(
+          prop,
+          clientId,
+          prop instanceof Signal ? `${marker}.${key}` : undefined,
+        );
         if (serializedProp !== undefined) {
           branded[key] = serializedProp;
         }
@@ -228,8 +248,8 @@ export class Reflection {
     for (const [key, prop] of Object.entries(instance)) {
       if (key.startsWith('_') || !(prop instanceof Signal)) continue;
 
-      const id = this.signalIds.get(prop);
-      if (id !== undefined) this.lastSentValues.delete(`${clientId}:${id}`);
+      const marker = `${this.getModelType(instance)}#${this.getInstanceId(instance)}`;
+      this.lastSentValues.delete(`${clientId}:${marker}.${key}`);
     }
   }
 
@@ -240,7 +260,15 @@ export class Reflection {
     const typeName = marker.slice(0, hashIdx);
     const id = marker.slice(hashIdx + 1);
     const instance = this.instances.get(id);
-    if (!instance || this.getModelType(instance) !== typeName) return null;
+    if (!instance || this.getModelType(instance) !== typeName) {
+      if (clientId) {
+        this.rpc.send(
+          clientId,
+          formatNotificationMessage(DROP_REFERENCES_METHOD, [marker]),
+        );
+      }
+      return null;
+    }
 
     if (clientId) {
       this.sentModels.get(clientId)?.delete(marker);
@@ -255,19 +283,19 @@ export class Reflection {
       if (this.finalSignals.has(sig)) continue;
       this.finalSignals.add(sig);
 
-      const id = this.signalIds.get(sig);
-      if (id === undefined) continue;
-      const subs = this.subscriptions.get(id);
-      if (!subs) continue;
-
-      for (const clientId of subs) {
-        let ids = this.pendingFinalSignals.get(clientId);
-        if (!ids) this.pendingFinalSignals.set(clientId, (ids = new Set()));
-        ids.add(id);
+      for (const [id, source] of this.signals) {
+        if (source !== sig) continue;
+        const subs = this.subscriptions.get(id);
+        if (!subs) continue;
+        for (const clientId of subs) {
+          let ids = this.pendingFinalSignals.get(clientId);
+          if (!ids) this.pendingFinalSignals.set(clientId, (ids = new Set()));
+          ids.add(id);
+        }
+        this.subscriptions.delete(id);
+        this.signalUnsubscribers.get(id)?.();
+        this.signalUnsubscribers.delete(id);
       }
-      this.subscriptions.delete(id);
-      this.signalUnsubscribers.get(id)?.();
-      this.signalUnsubscribers.delete(id);
     }
 
     if (this.pendingFinalSignals.size > 0 && !this.finalNotificationTimer) {
@@ -294,7 +322,26 @@ export class Reflection {
   }
 
   watch(clientId: ClientId, signalId: SignalId) {
+    const owner =
+      this.modelSignalOwners.get(String(signalId)) ??
+      (typeof signalId === 'string' &&
+      signalId.includes('#') &&
+      signalId.includes('.')
+        ? signalId.slice(0, signalId.lastIndexOf('.'))
+        : undefined);
+    if (owner) {
+      const hash = owner.lastIndexOf('#');
+      const instance = this.instances.get(owner.slice(hash + 1));
+      if (!instance || this.getModelType(instance) !== owner.slice(0, hash)) {
+        this.rpc.send(
+          clientId,
+          formatNotificationMessage(DROP_REFERENCES_METHOD, [owner]),
+        );
+        return;
+      }
+    }
     const sig = this.signals.get(signalId);
+    if (!sig) return;
     if (sig && this.finalSignals.has(sig)) return;
 
     let subs = this.subscriptions.get(signalId);
@@ -304,7 +351,6 @@ export class Reflection {
     }
 
     subs.add(clientId);
-    if (!sig) return;
 
     if (!this.signalUnsubscribers.has(signalId)) {
       // The server only subscribes to source signals once a client cares.
@@ -324,6 +370,56 @@ export class Reflection {
   unwatch(clientId: ClientId, signalId: SignalId) {
     this.subscriptions.get(signalId)?.delete(clientId);
     this.disposeSignalIfUnwatched(signalId);
+  }
+
+  /** The client no longer holds these wire identities. */
+  forgetClientReferences(clientId: ClientId, ids: Array<string | number>) {
+    for (const id of ids) {
+      if (typeof id === 'string' && this.sentModels.get(clientId)?.has(id)) {
+        this.sentModels.get(clientId)?.delete(id);
+        for (const key of this.lastSentValues.keys()) {
+          if (key.startsWith(`${clientId}:${id}.`))
+            this.lastSentValues.delete(key);
+        }
+      } else {
+        this.lastSentValues.delete(`${clientId}:${id}`);
+        this.unwatch(clientId, id);
+      }
+    }
+  }
+
+  modelRemoved(id: string, instance: any) {
+    const type = this.getModelType(instance);
+    if (!type) return;
+    const marker = `${type}#${id}`;
+    const recipients = new Set<ClientId>();
+    for (const [clientId, sent] of this.sentModels) {
+      if (sent.delete(marker)) recipients.add(clientId);
+    }
+    for (const [signalId, owner] of this.modelSignalOwners) {
+      if (owner !== marker) continue;
+      for (const clientId of this.subscriptions.get(signalId) ?? [])
+        recipients.add(clientId);
+      this.signalUnsubscribers.get(signalId)?.();
+      this.signalUnsubscribers.delete(signalId);
+      this.subscriptions.delete(signalId);
+      const sig = this.signals.get(signalId);
+      if (sig && this.signalIds.get(sig) === signalId)
+        this.signalIds.delete(sig);
+      this.signals.delete(signalId);
+      this.modelSignalOwners.delete(signalId);
+    }
+    for (const key of this.lastSentValues.keys()) {
+      if (key.slice(key.indexOf(':') + 1).startsWith(`${marker}.`)) {
+        this.lastSentValues.delete(key);
+      }
+    }
+    for (const clientId of recipients) {
+      this.rpc.send(
+        clientId,
+        formatNotificationMessage(DROP_REFERENCES_METHOD, [marker]),
+      );
+    }
   }
 
   removeClient(clientId: ClientId) {

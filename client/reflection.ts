@@ -1,5 +1,6 @@
 import {type Signal, Signal as SignalCtor, signal} from '@preact/signals-core';
 import {
+  DROP_REFERENCES_METHOD,
   REFRESH_MODELS_METHOD,
   UNWATCH_SIGNALS_METHOD,
   WATCH_SIGNALS_METHOD,
@@ -90,10 +91,14 @@ export class ClientReflection {
       // to a newer object before an older one is collected, so each callback
       // checks the current cache entry before deleting it.
       this.signalFinalizer = new FinalizationRegistry((id) => {
-        if (!this.signals.get(id)?.deref()) this.signals.delete(id);
+        if (this.signals.has(id) && !this.signals.get(id)?.deref()) {
+          this.forgetSignal(id);
+        }
       });
       this.modelFinalizer = new FinalizationRegistry((marker) => {
-        if (!this.models.get(marker)?.deref()) this.forgetModel(marker);
+        if (this.models.has(marker) && !this.models.get(marker)?.deref()) {
+          this.forgetModel(marker);
+        }
       });
     }
   }
@@ -242,11 +247,16 @@ export class ClientReflection {
 
     const sig = ref.deref();
     if (!sig) {
-      this.signals.delete(id);
+      this.forgetSignal(id);
       return undefined;
     }
 
     return sig;
+  }
+
+  private forgetSignal(id: SignalId) {
+    this.signals.delete(id);
+    this.rpc.notify(DROP_REFERENCES_METHOD, [id]);
   }
 
   private rememberSignal(id: SignalId, sig: Signal<any>) {
@@ -312,8 +322,9 @@ export class ClientReflection {
   }
 
   private forgetModel(marker: string) {
+    if (!this.models.delete(marker)) return;
+    this.rpc.notify(DROP_REFERENCES_METHOD, [marker]);
     this.unlinkModelSignals(marker);
-    this.models.delete(marker);
     this.modelSignals.delete(marker);
     this.refreshedRootModelMarkers.delete(marker);
     this.staleModelMarkers.delete(marker);
@@ -705,6 +716,25 @@ export class ClientReflection {
       throw new Error('Model missing @M field');
     }
 
+    // Model properties carry their signal identity implicitly in the model marker.
+    for (const [key, value] of Object.entries(serialized)) {
+      if (
+        key !== '@M' &&
+        value &&
+        typeof value === 'object' &&
+        !Array.isArray(value) &&
+        !(value instanceof SignalCtor) &&
+        Object.hasOwn(value, 'v') &&
+        !Object.hasOwn(value, '@S')
+      ) {
+        const id = `${raw}.${key}`;
+        const snapshot = value as {v: any; f?: number};
+        const sig = this.syncSignalSnapshot(id, snapshot.v);
+        if (snapshot.f) this.markSignalFinal(sig);
+        serialized[key] = sig;
+      }
+    }
+
     // Models are branded as TypeName#wireId so the facade knows both pieces.
     const hashIdx = raw.lastIndexOf('#');
     const typeName = hashIdx !== -1 ? raw.slice(0, hashIdx) : raw;
@@ -731,6 +761,20 @@ export class ClientReflection {
     this.rememberModelSignals(raw, model, data, hasModelData);
     if (hasModelData) this.markModelFresh(raw);
     return model;
+  }
+
+  /** An instance is no longer available on the server; retain held facades but stop stale subscriptions. */
+  handleModelDeletion(marker: string) {
+    this.staleModelMarkers.add(marker);
+    this.sentModelSignalsUnwatched(marker);
+  }
+
+  private sentModelSignalsUnwatched(marker: string) {
+    for (const sig of this.liveModelSignals(marker)) {
+      this.watchBatch.delete(sig);
+      this.unwatchBatch.delete(sig);
+      this.watchedSignals.delete(sig);
+    }
   }
 
   handleUpdate(id: SignalId, value: any, mode?: string) {

@@ -1,6 +1,7 @@
 import {batch, type Signal} from '@preact/signals-core';
 import {
   type ConnectionInfo,
+  DROP_REFERENCES_METHOD,
   formatCallMessage,
   formatErrorMessage,
   formatNotificationMessage,
@@ -592,6 +593,11 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
     } else if (method === SIGNAL_UPDATE_METHOD) {
       const [id, value, mode] = params;
       this.reflection.handleUpdate(id, value, mode);
+    } else if (method === DROP_REFERENCES_METHOD) {
+      for (const marker of params) {
+        if (typeof marker === 'string')
+          this.reflection.handleModelDeletion(marker);
+      }
     } else {
       for (const listener of this.notificationListeners) {
         listener(method, params);

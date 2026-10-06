@@ -471,6 +471,45 @@ describe('ClientReflection', () => {
     });
   });
 
+  describe('GC notifications', () => {
+    it('reports collected model and signal IDs only once, without notifying for live replacements', () => {
+      const {reflection, notify} = setup();
+      reflection.getOrCreateSignal(1, 'live');
+      reflection.createModelFacade({'@M': 'Chat#live'});
+      (reflection as any).signals.set(2, {deref: () => undefined});
+      (reflection as any).models.set('Chat#gone', {deref: () => undefined});
+
+      reflection.sweepCollectedEntries();
+      reflection.sweepCollectedEntries();
+      expect(notify).toHaveBeenCalledWith('@D', [2]);
+      expect(notify).toHaveBeenCalledWith('@D', ['Chat#gone']);
+      expect(notify).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not watch a deleted model until a fresh snapshot arrives', async () => {
+      vi.useFakeTimers();
+      const {reflection, notify} = setup();
+      const facade = reflection.createModelFacade({
+        '@M': 'Chat#13',
+        title: {v: 'old'},
+      });
+      reflection.handleModelDeletion('Chat#13');
+      facade.title.subscribe(() => undefined);
+      vi.advanceTimersByTime(10);
+      expect(notify).not.toHaveBeenCalledWith(WATCH_SIGNALS_METHOD, [
+        'Chat#13.title',
+      ]);
+      reflection.createModelFacade({'@M': 'Chat#13', title: {v: 'new'}});
+      await Promise.resolve();
+      await Promise.resolve();
+      vi.advanceTimersByTime(10);
+      expect(facade.title.peek()).toBe('new');
+      expect(notify).toHaveBeenCalledWith(WATCH_SIGNALS_METHOD, [
+        'Chat#13.title',
+      ]);
+    });
+  });
+
   describe('reset', () => {
     it('clears signals so new ones are created fresh', () => {
       const {reflection} = setup();

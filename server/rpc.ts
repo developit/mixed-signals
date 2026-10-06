@@ -1,6 +1,7 @@
 import type {Signal} from '@preact/signals-core';
 import {
   type ConnectionInfo,
+  DROP_REFERENCES_METHOD,
   formatErrorMessage,
   formatNotificationMessage,
   formatResultMessage,
@@ -61,6 +62,8 @@ export class RPC {
   constructor(root?: any) {
     this.instances = new Instances();
     this.reflection = new Reflection(this, this.instances);
+    this.instances.onRemove = (id, instance) =>
+      this.reflection.modelRemoved(id, instance);
 
     if (root !== undefined) {
       this.expose(root);
@@ -272,10 +275,11 @@ export class RPC {
     if (
       parsed.type === 'notification' &&
       (parsed.method === WATCH_SIGNALS_METHOD ||
-        parsed.method === UNWATCH_SIGNALS_METHOD)
+        parsed.method === UNWATCH_SIGNALS_METHOD ||
+        parsed.method === DROP_REFERENCES_METHOD)
     ) {
       const ids = parseWireParams<(number | string)[]>(parsed.payload);
-      const localIds: number[] = [];
+      const localIds: Array<number | string> = [];
 
       // Group upstream IDs by prefix
       const upstreamBatches = new Map<
@@ -290,9 +294,9 @@ export class RPC {
             batch = [];
             upstreamBatches.set(upstream, batch);
           }
-          batch.push(stripSignalPrefix(upstream.prefix, id as string));
+          batch.push(this.stripForwardedId(upstream.prefix, id as string));
         } else {
-          localIds.push(id as number);
+          localIds.push(id);
         }
       }
 
@@ -303,8 +307,10 @@ export class RPC {
       for (const [upstream, signalIds] of upstreamBatches) {
         if (parsed.method === WATCH_SIGNALS_METHOD) {
           upstream.forwardWatch(clientId, signalIds);
-        } else {
+        } else if (parsed.method === UNWATCH_SIGNALS_METHOD) {
           upstream.forwardUnwatch(clientId, signalIds);
+        } else {
+          upstream.forwardForget(clientId, signalIds);
         }
       }
 
@@ -312,8 +318,10 @@ export class RPC {
       for (const signalId of localIds) {
         if (parsed.method === WATCH_SIGNALS_METHOD) {
           this.reflection.watch(clientId, signalId);
-        } else {
+        } else if (parsed.method === UNWATCH_SIGNALS_METHOD) {
           this.reflection.unwatch(clientId, signalId);
+        } else {
+          this.reflection.forgetClientReferences(clientId, [signalId]);
         }
       }
 
@@ -351,6 +359,7 @@ export class RPC {
   ): boolean {
     const markers = parseWireParams<unknown[]>(payload);
     const results = new Array(markers.length).fill(null);
+    const localIndexes: number[] = [];
     const upstreamBatches = new Map<
       ForwardedUpstream,
       {indexes: number[]; markers: string[]}
@@ -362,7 +371,7 @@ export class RPC {
 
       const hashIdx = marker.lastIndexOf('#');
       if (hashIdx === -1) {
-        results[index] = this.reflection.serializeModelMarker(marker, clientId);
+        localIndexes.push(index);
         continue;
       }
 
@@ -370,7 +379,7 @@ export class RPC {
       const wireId = marker.slice(hashIdx + 1);
       const upstream = this.findUpstreamForInstance(wireId);
       if (!upstream) {
-        results[index] = this.reflection.serializeModelMarker(marker, clientId);
+        localIndexes.push(index);
         continue;
       }
 
@@ -386,6 +395,12 @@ export class RPC {
     }
 
     if (upstreamBatches.size === 0) return false;
+    for (const index of localIndexes) {
+      results[index] = this.reflection.serializeModelMarker(
+        markers[index] as string,
+        clientId,
+      );
+    }
 
     Promise.all(
       Array.from(upstreamBatches, async ([upstream, batch]) => {
@@ -415,9 +430,17 @@ export class RPC {
     id: number | string,
   ): ForwardedUpstream | undefined {
     if (typeof id !== 'string') return undefined;
+    const hash = id.lastIndexOf('#');
+    const wireId = hash === -1 ? id : id.slice(hash + 1);
     for (const upstream of this.upstreams.values()) {
-      if (isUpstreamId(upstream.prefix, id)) return upstream;
+      if (isUpstreamId(upstream.prefix, wireId)) return upstream;
     }
+  }
+
+  private stripForwardedId(prefix: string, id: string): number | string {
+    const hash = id.lastIndexOf('#');
+    if (hash === -1) return stripSignalPrefix(prefix, id);
+    return `${id.slice(0, hash + 1)}${stripInstancePrefix(prefix, id.slice(hash + 1))}`;
   }
 
   private findUpstreamForInstance(
@@ -448,6 +471,11 @@ export class RPC {
         this.reflection.unwatch(clientId, signalId);
       }
 
+      return;
+    }
+
+    if (method === DROP_REFERENCES_METHOD) {
+      this.reflection.forgetClientReferences(clientId, params);
       return;
     }
 

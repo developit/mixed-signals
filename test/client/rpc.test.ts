@@ -320,6 +320,23 @@ describe('RPCClient', () => {
       expect(sig.peek()).toBe('new');
     });
 
+    it('derives model field IDs and accepts updates without nested @S markers', () => {
+      vi.useFakeTimers();
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      transport.emit('N:@R:{"@M":"Chat#13","title":{"v":"before"}}');
+      expect(client.root.title.peek()).toBe('before');
+      client.root.title.subscribe(() => undefined);
+      vi.advanceTimersByTime(10);
+      expect(transport.sent).toContain('N:@W:"Chat#13.title"');
+      transport.emit('N:@S:"Chat#13.title","-after","append"');
+      expect(client.root.title.peek()).toBe('before-after');
+      transport.emit('N:@D:"Chat#13"');
+      expect((client.reflection as any).staleModelMarkers.has('Chat#13')).toBe(
+        true,
+      );
+    });
+
     it('@S with delta mode', () => {
       const transport = new FakeTransport();
       const client = new RPCClient(transport, createContext());
@@ -1153,7 +1170,11 @@ describe('RPCClient', () => {
         'R1:[{"@M":"Counter#held","count":{"@S":10,"v":5},"name":{"@S":20,"v":"y"},"items":{"@S":30,"v":[]},"meta":{"@S":40,"v":{}}}]',
       );
       await vi.waitFor(() => {
-        expect(transport2.sent).toContain('N:@W:10,20');
+        expect(
+          transport2.sent.some(
+            (message) => message === 'N:@W:10,20' || message === 'N:@W:20,10',
+          ),
+        ).toBe(true);
       });
     });
 
