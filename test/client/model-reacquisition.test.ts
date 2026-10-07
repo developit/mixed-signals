@@ -32,6 +32,7 @@ class TestTransport implements Transport {
 }
 
 type Detail = {title: Signal<string>; status: Signal<string>};
+type Owner = {children: Signal<Detail[]>};
 const clients: RPCClient[] = [];
 
 function detailPayload(offset = 0, marker = 'Detail#detail') {
@@ -39,6 +40,16 @@ function detailPayload(offset = 0, marker = 'Detail#detail') {
     '@M': marker,
     title: {'@S': offset + 1, v: `title-${offset}`},
     status: {'@S': offset + 2, v: 'ready'},
+  };
+}
+
+function ownerPayload(offset = 0) {
+  return {
+    '@M': 'Owner#owner',
+    children: {
+      '@S': 'owner:children',
+      v: [detailPayload(offset), detailPayload(offset + 50, 'Detail#other')],
+    },
   };
 }
 
@@ -68,7 +79,10 @@ function receivePlainRoot(transport: TestTransport, processId = 'p1') {
   transport.receive(`N:@R:${JSON.stringify(root)},${JSON.stringify(info)}`);
 }
 
-async function setup(payload = detailPayload(), receive = receiveRoot) {
+async function setup<T = Detail>(
+  payload: unknown = detailPayload(),
+  receive = receiveRoot,
+) {
   const transport = new TestTransport();
   const client = new RPCClient(transport);
   clients.push(client);
@@ -76,9 +90,17 @@ async function setup(payload = detailPayload(), receive = receiveRoot) {
   await client.ready;
   const pending = client.call('loadDetail');
   transport.receive(`R1:${JSON.stringify(payload)}`);
-  const model: Reflected<Detail> = await pending;
+  const model: Reflected<T> = await pending;
   transport.sent.length = 0;
   return {client, transport, model};
+}
+
+async function reconnect(client: RPCClient, processId = 'p2') {
+  const transport = new TestTransport();
+  client.reconnect(transport);
+  receiveRoot(transport, processId);
+  await client.ready;
+  return transport;
 }
 
 async function becomeIdle(model: Reflected<Detail>, transport: TestTransport) {
@@ -103,6 +125,351 @@ afterEach(() => {
 });
 
 describe('method-returned model reacquisition', () => {
+  it.each([
+    'p1',
+    'p2',
+  ])('recovers child-only observers through one shared owner after reconnect to %s', async (processId) => {
+    const {client, model: owner} = await setup<Owner>(ownerPayload());
+    const children = owner.children.peek();
+    for (const child of children) child.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const replacement = await reconnect(client, processId);
+    expect(replacement.sent).toEqual(['M2:@M:"Detail#detail","Detail#other"']);
+    replacement.receive('R2:[null,null]');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(replacement.sent.at(-1)).toBe('M3:@M:"Owner#owner"');
+
+    replacement.receive(`R3:${JSON.stringify([ownerPayload(10)])}`);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(replacement.sent.at(-1)).toBe('N:@W:11,61');
+    expect(children.map((child) => child.title.peek())).toEqual([
+      'title-10',
+      'title-60',
+    ]);
+    replacement.receive('N:@S:11,"live after reconnect"');
+    expect(children[0].title.peek()).toBe('live after reconnect');
+  });
+
+  it('does not refresh ancestors when the child resolves directly', async () => {
+    const {client, model} = await setup<Owner>(ownerPayload());
+    const child = model.children.peek()[0];
+    child.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+    const replacement = await reconnect(client);
+    replacement.receive(`R2:${JSON.stringify([detailPayload(10)])}`);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(child.title.peek()).toBe('title-10');
+    expect(replacement.sent).toEqual(['M2:@M:"Detail#detail"', 'N:@W:11']);
+  });
+
+  it.each([
+    null,
+    {...ownerPayload(), children: {'@S': 'owner:children', v: []}},
+  ])('does not revive a child missing from its authorized owner', async (payload) => {
+    const {client, model} = await setup<Owner>(ownerPayload());
+    const child = model.children.peek()[0];
+    child.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+    const replacement = await reconnect(client);
+    replacement.receive('R2:[null]');
+    await vi.advanceTimersByTimeAsync(10);
+    replacement.receive(`R3:${JSON.stringify([payload])}`);
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(replacement.sent).toEqual([
+      'M2:@M:"Detail#detail"',
+      'M3:@M:"Owner#owner"',
+    ]);
+    expect(child.title.peek()).toBe('title-0');
+  });
+
+  it('recovers through multiple unobserved ancestors in one fallback batch', async () => {
+    const payload = (offset = 0) => ({
+      '@M': 'Grandparent#root',
+      owner: {'@S': 'grandparent:owner', v: ownerPayload(offset)},
+    });
+    const {client, model} = await setup<{owner: Signal<Owner>}>(payload());
+    const child = model.owner.peek().children.peek()[0];
+    child.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+    const replacement = await reconnect(client);
+    replacement.receive('R2:[null]');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(replacement.sent.at(-1)).toBe(
+      'M3:@M:"Owner#owner","Grandparent#root"',
+    );
+    replacement.receive(`R3:${JSON.stringify([null, payload(10)])}`);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(child.title.peek()).toBe('title-10');
+    expect(replacement.sent.at(-1)).toBe('N:@W:11');
+  });
+
+  it('falls back to the owner when the direct refresh is rejected', async () => {
+    const {client, model} = await setup<Owner>(ownerPayload());
+    const child = model.children.peek()[0];
+    child.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+    const replacement = await reconnect(client);
+    replacement.receive('E2:"unavailable"');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(replacement.sent.at(-1)).toBe('M3:@M:"Owner#owner"');
+    replacement.receive(`R3:${JSON.stringify([ownerPayload(10)])}`);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(child.title.peek()).toBe('title-10');
+    expect(replacement.sent.at(-1)).toBe('N:@W:11');
+  });
+
+  it('asks only the most recent owners of a widely shared child', async () => {
+    const owners = Array.from({length: 10}, (_, index) => ({
+      '@M': `Owner#o${index}`,
+      children: {'@S': `o${index}:children`, v: [detailPayload()]},
+    }));
+    const {client, model} = await setup<Owner[]>(owners);
+    const child = model[0].children.peek()[0];
+    child.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+    const replacement = await reconnect(client);
+    replacement.receive('R2:[null]');
+    await vi.advanceTimersByTimeAsync(10);
+    const recent = owners.slice(2).map((owner) => `"${owner['@M']}"`);
+    expect(replacement.sent.at(-1)).toBe(`M3:@M:${recent.join(',')}`);
+  });
+
+  it('records ownership for children held in a nested signal', async () => {
+    const {client, transport, model} = await setup<{
+      sections: Signal<{open: Signal<Detail[]>}>;
+    }>({
+      '@M': 'Owner#owner',
+      sections: {
+        '@S': 'owner:sections',
+        v: {open: {'@S': 'owner:open', v: [detailPayload()]}},
+      },
+    });
+    transport.receive(
+      `N:@S:"owner:open",${JSON.stringify([detailPayload(50, 'Detail#other')])},"append"`,
+    );
+    for (const child of model.sections.peek().open.peek())
+      child.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+    const replacement = await reconnect(client);
+    expect(replacement.sent).toEqual(['M2:@M:"Detail#detail","Detail#other"']);
+    replacement.receive('R2:[null,null]');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(replacement.sent.at(-1)).toBe('M3:@M:"Owner#owner"');
+  });
+
+  it('does not walk plain data when recording ownership', async () => {
+    const {client, transport} = await setup<Owner>(ownerPayload());
+    const rememberChildren = vi.spyOn(
+      client.reflection as any,
+      'rememberChildren',
+    );
+    const rows = Array.from({length: 100}, (_, index) => ({index}));
+    transport.receive(`N:@S:"owner:children",${JSON.stringify(rows)}`);
+    expect(rememberChildren).toHaveBeenCalledTimes(1);
+  });
+
+  it('recovers an idle child through its fresh owner on the same connection', async () => {
+    const {transport, model} = await setup<Owner>(ownerPayload());
+    const child = model.children.peek()[0];
+    await becomeIdle(child, transport);
+
+    child.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(transport.sent).toEqual(['M2:@M:"Detail#detail"']);
+    transport.receive('R2:[null]');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(transport.sent.at(-1)).toBe('M3:@M:"Owner#owner"');
+    transport.receive(`R3:${JSON.stringify([ownerPayload(10)])}`);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(child.title.peek()).toBe('title-10');
+    expect(transport.sent.at(-1)).toBe('N:@W:11');
+  });
+
+  it('walks only the most recent owners of a widely shared signal', async () => {
+    const shared = {'@S': 'shared', v: 0};
+    const {client, transport} = await setup(
+      Array.from({length: 20}, (_, index) => ({
+        '@M': `Owner#o${index}`,
+        shared,
+      })),
+    );
+    const rememberChildren = vi.spyOn(
+      client.reflection as any,
+      'rememberChildren',
+    );
+    transport.receive('N:@S:"shared",1');
+    expect(rememberChildren).toHaveBeenCalledTimes(8);
+  });
+
+  it('asks only the nearest owners when a child has many ancestors', async () => {
+    const owners = Array.from({length: 8}, (_, index) => ({
+      '@M': `Owner#o${index}`,
+      children: {'@S': `o${index}:children`, v: [detailPayload()]},
+    }));
+    const {client, model} = await setup<{owner: Signal<Owner>}[]>(
+      owners.map((owner, index) => ({
+        '@M': `Grandparent#g${index}`,
+        owner: {'@S': `g${index}:owner`, v: owner},
+      })),
+    );
+    const child = model[0].owner.peek().children.peek()[0];
+    child.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+    const replacement = await reconnect(client);
+    replacement.receive('R2:[null]');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(replacement.sent.at(-1)).toBe(
+      `M3:@M:${owners.map((owner) => `"${owner['@M']}"`).join(',')}`,
+    );
+  });
+
+  it('does not treat a reference back to the owner as ownership', async () => {
+    const part = (index: number) => ({
+      ...detailPayload(index * 10, `Detail#${index}`),
+      owner: {'@M': 'Owner#owner'},
+    });
+    const {transport, model} = await setup<{owner: Signal<Owner>}>({
+      '@M': 'Grandparent#root',
+      owner: {
+        '@S': 'grandparent:owner',
+        v: {
+          '@M': 'Owner#owner',
+          children: {'@S': 'owner:children', v: [part(0), part(1)]},
+        },
+      },
+    });
+    const child = model.owner.peek().children.peek()[0];
+    await becomeIdle(child, transport);
+
+    child.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+    transport.receive('R2:[null]');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(transport.sent.at(-1)).toBe(
+      'M3:@M:"Owner#owner","Grandparent#root"',
+    );
+  });
+
+  it('asks a root-supplied owner for an idle child that arrived after the root', async () => {
+    const transport = new TestTransport();
+    const client = new RPCClient(transport);
+    clients.push(client);
+    receiveRoot(transport, 'p1', {
+      ...ownerPayload(),
+      children: {'@S': 'owner:children', v: []},
+    });
+    await client.ready;
+    transport.receive(
+      `N:@S:"owner:children",${JSON.stringify([detailPayload()])},"append"`,
+    );
+    const child = client.root.detail.children.peek()[0];
+    await becomeIdle(child, transport);
+
+    child.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+    transport.receive('R1:[null]');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(transport.sent).toEqual([
+      'M1:@M:"Detail#detail"',
+      'M2:@M:"Owner#owner"',
+    ]);
+  });
+
+  it.each([
+    'R3:[null]',
+    'E3:"unavailable"',
+  ])('keeps a fresh owner subscribable after its fallback refresh answers %s', async (reply) => {
+    const {transport, model} = await setup<Owner>(ownerPayload());
+    const child = model.children.peek()[0];
+    await becomeIdle(child, transport);
+
+    child.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+    transport.receive('R2:[null]');
+    await vi.advanceTimersByTimeAsync(10);
+    transport.receive(reply);
+    await vi.advanceTimersByTimeAsync(10);
+
+    model.children.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(transport.sent).toEqual([
+      'M2:@M:"Detail#detail"',
+      'M3:@M:"Owner#owner"',
+      'N:@W:"owner:children"',
+    ]);
+  });
+
+  it('does not replay old wire ids when a model refresh starts before the new root', async () => {
+    const {client, model} = await setup(detailPayload(), receivePlainRoot);
+    client.root.version.subscribe(() => undefined);
+    model.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const second = new TestTransport();
+    client.reconnect(second);
+    model.status.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(second.sent).toEqual(['M2:@M:"Detail#detail"']);
+
+    receivePlainRoot(second, 'p2');
+    await client.ready;
+    expect(second.sent).toEqual([
+      'M2:@M:"Detail#detail"',
+      'M3:@M:"Detail#detail"',
+      'N:@W:"version"',
+    ]);
+  });
+
+  it('records ownership for children delivered by a later signal update', async () => {
+    const {client, transport, model} = await setup<Owner>({
+      ...ownerPayload(),
+      children: {'@S': 'owner:children', v: []},
+    });
+    transport.receive(
+      `N:@S:"owner:children",${JSON.stringify([detailPayload()])},"append"`,
+    );
+    const child = model.children.peek()[0];
+    child.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+    const replacement = await reconnect(client);
+    replacement.receive('R2:[null]');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(replacement.sent.at(-1)).toBe('M3:@M:"Owner#owner"');
+    replacement.receive(`R3:${JSON.stringify([ownerPayload(10)])}`);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(child.title.peek()).toBe('title-10');
+    expect(replacement.sent.at(-1)).toBe('N:@W:11');
+  });
+
+  it('shares an in-flight ancestor refresh with a newly observed sibling', async () => {
+    const {client, model} = await setup<Owner>(ownerPayload());
+    const [first, second] = model.children.peek();
+    first.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+    const replacement = await reconnect(client);
+    replacement.receive('R2:[null]');
+    await vi.advanceTimersByTimeAsync(10);
+    second.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+    replacement.receive('R4:[null]');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(replacement.sent).toEqual([
+      'M2:@M:"Detail#detail"',
+      'M3:@M:"Owner#owner"',
+      'M4:@M:"Detail#other"',
+    ]);
+    replacement.receive(`R3:${JSON.stringify([ownerPayload(10)])}`);
+    await vi.advanceTimersByTimeAsync(10);
+    expect([first.title.peek(), second.title.peek()]).toEqual([
+      'title-10',
+      'title-60',
+    ]);
+    expect(replacement.sent.at(-1)).toBe('N:@W:11,61');
+  });
+
   it('uses the method payload for the first observation', async () => {
     const {transport, model} = await setup();
     model.title.subscribe(() => undefined);
@@ -111,6 +478,64 @@ describe('method-returned model reacquisition', () => {
     expect(transport.sent).toEqual(['N:@W:1']);
     transport.receive('N:@S:1,"live"');
     expect(model.title.peek()).toBe('live');
+  });
+
+  it('abandons an ancestor refresh when another transport replaces it', async () => {
+    const {client, model} = await setup<Owner>(ownerPayload());
+    const child = model.children.peek()[0];
+    child.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+    const second = new TestTransport();
+    client.reconnect(second);
+    receiveRoot(second, 'p2');
+    await client.ready;
+    second.receive('R2:[null]');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(second.sent.at(-1)).toBe('M3:@M:"Owner#owner"');
+
+    const third = new TestTransport();
+    client.reconnect(third);
+    receiveRoot(third, 'p3');
+    await client.ready;
+    second.receive(`R3:${JSON.stringify([ownerPayload(10)])}`);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(child.title.peek()).toBe('title-0');
+    third.receive('R4:[null]');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(third.sent.at(-1)).toBe('M5:@M:"Owner#owner"');
+    third.receive(`R5:${JSON.stringify([ownerPayload(20)])}`);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(child.title.peek()).toBe('title-20');
+    expect(third.sent.at(-1)).toBe('N:@W:21');
+  });
+
+  it('retains recovery markers without requiring the parent facade to stay cached', async () => {
+    const {client, model} = await setup<Owner>(ownerPayload());
+    const child = model.children.peek()[0];
+    child.title.subscribe(() => undefined);
+    await vi.advanceTimersByTimeAsync(10);
+    const deref = WeakRef.prototype.deref;
+    const collected = vi
+      .spyOn(WeakRef.prototype, 'deref')
+      .mockImplementation(function (this: WeakRef<object>) {
+        const value = deref.call(this);
+        return value === model ? undefined : value;
+      });
+    const replacement = new TestTransport();
+    try {
+      client.reconnect(replacement);
+      receiveRoot(replacement, 'p2');
+      await client.ready;
+      replacement.receive('R2:[null]');
+      await vi.advanceTimersByTimeAsync(10);
+      expect(replacement.sent.at(-1)).toBe('M3:@M:"Owner#owner"');
+    } finally {
+      collected.mockRestore();
+    }
+    replacement.receive(`R3:${JSON.stringify([ownerPayload(10)])}`);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(child.title.peek()).toBe('title-10');
+    expect(replacement.sent.at(-1)).toBe('N:@W:11');
   });
 
   it('reacquires an idle model once before watching its rebound fields', async () => {

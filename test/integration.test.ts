@@ -4,6 +4,7 @@ import {createReflectedModel} from '../client/model.ts';
 import type {WireContext} from '../client/reflection.ts';
 import {RPCClient} from '../client/rpc.ts';
 
+import {createModel} from '../server/model.ts';
 import {RPC} from '../server/rpc.ts';
 import {
   Counter,
@@ -139,6 +140,8 @@ interface TranscriptSessionApi {
 }
 
 afterEach(() => {
+  // A watch flush left pending on fake timers would block every later flush.
+  if (vi.isFakeTimers()) vi.runOnlyPendingTimers();
   vi.useRealTimers();
 });
 
@@ -652,6 +655,66 @@ describe('Integration: Server <-> Client', () => {
     await flush();
 
     expect(rpcClient.root.count.peek()).toBe(10);
+  });
+
+  it.each([
+    [
+      'a signal',
+      () => ({children: signal([new Counter(), new Counter()])}),
+      (owner: any) => owner.children.peek(),
+    ],
+    [
+      'a nested signal',
+      () => ({
+        sections: signal({open: signal([new Counter(), new Counter()])}),
+      }),
+      (owner: any) => owner.sections.peek().open.peek(),
+    ],
+  ])('recovers idle siblings through an owner that holds them in %s', async (_shape, factory, childrenOf) => {
+    vi.useFakeTimers();
+    const Owner = createModel<any>(factory);
+    const owner = new Owner();
+    const rpc = new RPC({
+      getOwner() {
+        return owner;
+      },
+    });
+    rpc.registerModel('Counter', Counter);
+    rpc.registerModel('Owner', Owner);
+
+    const frames: string[] = [];
+    const {rpcClient, flush} = connect(rpc, 'c1', frames);
+    const settle = async () => {
+      for (let round = 0; round < 5; round++) {
+        await vi.advanceTimersByTimeAsync(10);
+        await flush();
+      }
+    };
+    await flush();
+    await rpcClient.ready;
+
+    const pending = rpcClient.call('getOwner');
+    await flush();
+    const children = childrenOf(await pending);
+    const stops = children.map((child: any) =>
+      child.count.subscribe(() => undefined),
+    );
+    await settle();
+    for (const stop of stops) stop();
+    await settle();
+
+    for (const [index, child] of children.entries()) {
+      rpc.instances.remove(child.id.peek());
+      frames.length = 0;
+      child.count.subscribe(() => undefined);
+      await settle();
+      expect(frames.filter((frame) => frame.startsWith('N:@W:'))).toHaveLength(
+        1,
+      );
+      childrenOf(owner)[index].increment();
+      await settle();
+      expect(child.count.peek()).toBe(1);
+    }
   });
 
   it('refreshes held models and replays watches when reconnecting to a new RPC process', async () => {

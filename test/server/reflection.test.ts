@@ -1,6 +1,7 @@
 import {signal} from '@preact/signals-core';
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {Instances} from '../../server/instances.ts';
+import {createModel} from '../../server/model.ts';
 import {Reflection} from '../../server/reflection.ts';
 import {
   formatNotificationMessage,
@@ -358,6 +359,41 @@ describe('Reflection', () => {
       const refreshed = reflection.serializeModelMarker('Counter#0', 'clientA');
       expect(refreshed.count.v).toBe(counter.count.peek());
       expect(refreshed.name.v).toBe(counter.name.peek());
+    });
+
+    it('sends a nested model in full after its own marker failed to refresh', () => {
+      reflection.registerModel('Counter', Counter);
+      const child = new Counter();
+      const marker = reflection.serialize({child}, 'clientA').child['@M'];
+      expect(reflection.serialize({child}, 'clientA').child).toEqual({
+        '@M': marker,
+      });
+
+      instances.remove(marker.slice(marker.lastIndexOf('#') + 1));
+      expect(reflection.serializeModelMarker(marker, 'clientA')).toBeNull();
+      expect(reflection.serialize({child}, 'clientA').child).toHaveProperty(
+        'count',
+      );
+    });
+
+    it('refreshes a model that references the rpc', () => {
+      const {counter} = setupCounter(reflection, instances, 'clientA');
+      Object.assign(sender, {reflection});
+      Object.assign(counter, {rpc: sender});
+
+      const refreshed = reflection.serializeModelMarker('Counter#0', 'clientA');
+      expect(refreshed.count.v).toBe(counter.count.peek());
+    });
+
+    it('re-inlines signals nested in a signal value when refreshing a model by marker', () => {
+      const Owner = createModel(() => ({
+        sections: signal({open: signal(['a'])}),
+      }));
+      reflection.registerModel('Owner', Owner);
+      const marker = reflection.serialize(new Owner(), 'clientA')['@M'];
+
+      const refreshed = reflection.serializeModelMarker(marker, 'clientA');
+      expect(refreshed.sections.v.open.v).toEqual(['a']);
     });
 
     it('does not dedupe signal payloads across clients', () => {

@@ -222,15 +222,32 @@ export class Reflection {
    * Drop what we believe this client holds for a model's own signals, so the
    * next serialization inlines their values instead of sending bare refs. A
    * refresh means the client no longer trusts its copy — a ref pointing at that
-   * copy is worthless. Nested models are refreshed under their own markers.
+   * copy is worthless. This includes signals nested in those values, because a
+   * bare ref there would hide the models below it. Nested models are refreshed
+   * under their own markers.
    */
   private forgetClientSignalValues(instance: any, clientId: ClientId) {
-    for (const [key, prop] of Object.entries(instance)) {
-      if (key.startsWith('_') || !(prop instanceof Signal)) continue;
+    const forgotten = new Set<Signal<any>>();
+    const forget = (value: any) => {
+      if (value === this.rpc || value === this || value === this.instances)
+        return;
+      if (value instanceof Signal) {
+        if (forgotten.has(value)) return;
+        forgotten.add(value);
 
-      const id = this.signalIds.get(prop);
-      if (id !== undefined) this.lastSentValues.delete(`${clientId}:${id}`);
-    }
+        const id = this.signalIds.get(value);
+        if (id !== undefined) this.lastSentValues.delete(`${clientId}:${id}`);
+        forget(value.peek());
+      } else if (value && typeof value === 'object' && !this.isModel(value)) {
+        forgetProps(value);
+      }
+    };
+    const forgetProps = (object: object) => {
+      for (const [key, prop] of Object.entries(object)) {
+        if (!key.startsWith('_')) forget(prop);
+      }
+    };
+    forgetProps(instance);
   }
 
   serializeModelMarker(marker: string, clientId?: ClientId): any {
@@ -240,12 +257,12 @@ export class Reflection {
     const typeName = marker.slice(0, hashIdx);
     const id = marker.slice(hashIdx + 1);
     const instance = this.instances.get(id);
+    // The client distrusts its copy even when the marker cannot resolve here,
+    // so the next owner that serializes this model must send it in full.
+    if (clientId) this.sentModels.get(clientId)?.delete(marker);
     if (!instance || this.getModelType(instance) !== typeName) return null;
 
-    if (clientId) {
-      this.sentModels.get(clientId)?.delete(marker);
-      this.forgetClientSignalValues(instance, clientId);
-    }
+    if (clientId) this.forgetClientSignalValues(instance, clientId);
 
     return this.serialize(instance, clientId);
   }

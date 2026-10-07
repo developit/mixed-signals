@@ -91,6 +91,18 @@ During serialization, special objects are embedded in JSON:
 
 Properties beginning with `_` and all functions are stripped from serialized objects.
 
+#### Held children after reconnect
+
+The client first refreshes observed models missing from the new root with `@M`.
+When a child remains unresolved or its refresh is rejected, it requests the nearest known ancestors of that child, at most 8 per child, in one additional batch, deduplicated across siblings and in-flight refreshes.
+The same path runs when an idle model is observed again on a live connection.
+An ancestor does not need observed fields or a retained facade to provide this recovery path.
+The client remembers the 8 most recent owners of each child, including owners reached through nested signals.
+After a reconnect it skips owners that the new root already supplied.
+The server must authorize and reconstruct at least one ancestor, or provide a direct resolver for an independently returned model.
+A refresh of a marker that does not resolve still clears the server record that the client holds that model, so the next owner payload carries the model in full.
+Only a full model payload makes a stale child subscribable again; a missing owner or a parent payload that omits the child does not restore its watches.
+
 #### Delta Update Modes
 
 When a signal's value changes, the server may send only the diff instead of the full value:

@@ -21,6 +21,7 @@ export interface WireContext {
 type SignalId = number | string;
 
 const WATCH_FLUSH_DELAY = 10;
+const MAX_RECOVERY_OWNERS = 8;
 
 function uniqueSignalIds(ids: Array<SignalId | undefined>): SignalId[] {
   const unique = new Set<SignalId>();
@@ -38,6 +39,11 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 type CacheRef<T extends object> = WeakRef<T> | StrongCacheRef<T>;
 
+interface ModelRecovery {
+  marker: string;
+  parents: Set<ModelRecovery>;
+}
+
 class StrongCacheRef<T extends object> {
   constructor(private value: T) {}
 
@@ -52,6 +58,15 @@ function createCacheRef<T extends object>(value: T): CacheRef<T> {
   return weakRefsAvailable ? new WeakRef(value) : new StrongCacheRef(value);
 }
 
+function addRecent<T>(recent: Set<T>, item: T) {
+  recent.delete(item);
+  recent.add(item);
+  if (recent.size > MAX_RECOVERY_OWNERS) {
+    const [oldest] = recent;
+    recent.delete(oldest);
+  }
+}
+
 export class ClientReflection {
   private signals = new Map<SignalId, CacheRef<Signal<any>>>();
   private signalIds = new WeakMap<Signal<any>, SignalId>();
@@ -63,6 +78,9 @@ export class ClientReflection {
   private modelFinalizerTokens = new WeakMap<object, object>();
   private modelFinalizer?: FinalizationRegistry<string>;
   private modelSignals = new Map<string, Set<CacheRef<Signal<any>>>>();
+  private modelRecovery = new WeakMap<object, ModelRecovery>();
+  private signalRecovery = new WeakMap<Signal<any>, Set<ModelRecovery>>();
+  private identifiedContainers = new WeakSet<object>();
   private signalModelMarkers = new WeakMap<Signal<any>, Set<string>>();
   private rootSignals = new WeakSet<Signal<any>>();
   private refreshedRootModelMarkers = new Set<string>();
@@ -107,6 +125,9 @@ export class ClientReflection {
     this.finalSignals = new WeakSet();
     this.models.clear();
     this.modelSignals.clear();
+    this.modelRecovery = new WeakMap();
+    this.signalRecovery = new WeakMap();
+    this.identifiedContainers = new WeakSet();
     this.signalModelMarkers = new WeakMap();
     this.rootSignals = new WeakSet();
     this.refreshedRootModelMarkers.clear();
@@ -184,8 +205,7 @@ export class ClientReflection {
     this.collectingRootSnapshot = false;
   }
 
-  /** @internal */
-  getActiveHeldModelMarkers(): string[] {
+  private getActiveHeldModelMarkers(): string[] {
     this.sweepCollectedEntries();
     return Array.from(this.models.keys()).filter(
       (marker) =>
@@ -196,26 +216,83 @@ export class ClientReflection {
   }
 
   /** @internal */
-  beginModelRefresh(markers: string[]): number {
+  refreshHeldModels() {
+    void this.refreshModels(this.getActiveHeldModelMarkers(), true);
+    this.replayActiveSignals();
+  }
+
+  private async refreshModels(
+    markers: string[],
+    afterRoot = false,
+  ): Promise<void> {
+    if (markers.length === 0) return;
+
     const generation = this.modelRefreshGeneration;
     for (const marker of markers) {
       this.staleModelMarkers.add(marker);
       this.refreshingModelMarkers.add(marker);
     }
-    return generation;
-  }
 
-  /** @internal */
-  finishModelRefresh(markers: string[], generation: number): boolean {
-    if (generation !== this.modelRefreshGeneration) return false;
+    let parents: string[] = [];
+    try {
+      try {
+        await this.rpc.call(REFRESH_MODELS_METHOD, markers);
+      } catch {
+        // A rejected refresh is as unresolved as a null reply, so recovery still tries the owners.
+      }
+      if (generation !== this.modelRefreshGeneration) return;
 
-    for (const marker of markers) {
-      this.refreshingModelMarkers.delete(marker);
-      if (this.getModel(marker) && !this.isModelMarkerActive(marker)) {
-        this.staleModelMarkers.add(marker);
+      parents = this.recoveryParents(markers, afterRoot);
+      if (parents.length === 0) return;
+      for (const marker of parents) this.refreshingModelMarkers.add(marker);
+      await this.rpc.call(REFRESH_MODELS_METHOD, parents);
+    } catch {
+      // A missing or unavailable owner leaves its child stale until a later observation.
+    } finally {
+      if (generation === this.modelRefreshGeneration) {
+        for (const marker of parents)
+          this.refreshingModelMarkers.delete(marker);
+        for (const marker of markers) {
+          this.refreshingModelMarkers.delete(marker);
+          if (this.getModel(marker) && !this.isModelMarkerActive(marker))
+            this.staleModelMarkers.add(marker);
+        }
+        this.replayActiveSignals();
       }
     }
-    return true;
+  }
+
+  private recoveryParents(markers: string[], afterRoot: boolean): string[] {
+    const parents = new Set<string>();
+    for (const marker of markers) {
+      if (
+        !this.staleModelMarkers.has(marker) ||
+        !this.isModelMarkerActive(marker)
+      )
+        continue;
+      const model = this.getModel(marker);
+      const child = model && this.modelRecovery.get(model);
+      if (!child) continue;
+
+      const nearest = [child];
+      for (const node of nearest) {
+        // Only the root itself is above an owner that the root supplied.
+        if (node !== child && this.refreshedRootModelMarkers.has(node.marker))
+          continue;
+        for (const parent of node.parents) {
+          if (nearest.length > MAX_RECOVERY_OWNERS) break;
+          if (nearest.includes(parent)) continue;
+          // The root that started this refresh already sent this owner without the child.
+          if (afterRoot && this.refreshedRootModelMarkers.has(parent.marker))
+            continue;
+          nearest.push(parent);
+        }
+      }
+      for (const {marker: parent} of nearest.slice(1)) {
+        if (!this.refreshingModelMarkers.has(parent)) parents.add(parent);
+      }
+    }
+    return [...parents];
   }
 
   private cancelWatchFlush() {
@@ -494,6 +571,7 @@ export class ClientReflection {
 
   syncSignalSnapshot(id: SignalId, value: any): Signal<any> {
     const sig = this.getOrCreateSignal(id, value);
+    this.rememberSignalChildren(sig, value);
     sig.value = value;
     return sig;
   }
@@ -631,16 +709,79 @@ export class ClientReflection {
     this.modelRefreshBatch.clear();
     if (markers.length === 0) return;
 
-    const generation = this.beginModelRefresh(markers);
+    void this.refreshModels(markers);
+  }
 
-    void this.rpc
-      .call(REFRESH_MODELS_METHOD, markers)
-      .catch(() => undefined)
-      .finally(() => {
-        if (this.finishModelRefresh(markers, generation)) {
-          this.replayActiveSignals();
-        }
-      });
+  /**
+   * Record that a revived value holds a signal or a model, so ownership walks
+   * can skip plain data. Call it from the JSON reviver, whose `this` is the holder.
+   * @internal
+   */
+  noteRevived(holder: object, value: object, identified: boolean) {
+    if (identified || this.identifiedContainers.has(value))
+      this.identifiedContainers.add(holder);
+  }
+
+  private inheritIdentified<T extends object>(
+    merged: T,
+    ...sources: object[]
+  ): T {
+    if (sources.some((source) => this.identifiedContainers.has(source)))
+      this.identifiedContainers.add(merged);
+    return merged;
+  }
+
+  private rememberRecovery(
+    marker: string,
+    model: object,
+    data: Record<string, any>,
+  ) {
+    let owner = this.modelRecovery.get(model);
+    if (!owner) {
+      owner = {marker, parents: new Set()};
+      this.modelRecovery.set(model, owner);
+    }
+    for (const value of Object.values(data))
+      this.rememberChildren(owner, value);
+  }
+
+  private rememberSignalChildren(sig: Signal<any>, value: unknown) {
+    const owners = this.signalRecovery.get(sig);
+    if (!owners) return;
+    for (const owner of owners) this.rememberChildren(owner, value);
+  }
+
+  private rememberChildren(owner: ModelRecovery, value: unknown) {
+    if (!value || typeof value !== 'object') return;
+
+    const child = this.modelRecovery.get(value);
+    if (child) {
+      this.linkRecoveryParent(child, owner);
+    } else if (value instanceof SignalCtor) {
+      // A known owner already saw every value this signal received.
+      if (this.rememberSignalOwner(value, owner))
+        this.rememberChildren(owner, value.peek());
+    } else if (this.identifiedContainers.has(value)) {
+      for (const item of Object.values(value))
+        this.rememberChildren(owner, item);
+    }
+  }
+
+  private rememberSignalOwner(sig: Signal<any>, owner: ModelRecovery): boolean {
+    let owners = this.signalRecovery.get(sig);
+    if (!owners) this.signalRecovery.set(sig, (owners = new Set()));
+    if (owners.has(owner)) return false;
+
+    addRecent(owners, owner);
+    return true;
+  }
+
+  private linkRecoveryParent(child: ModelRecovery, owner: ModelRecovery) {
+    if (child === owner) return;
+
+    // A child that points back at its owner does not own it.
+    owner.parents.delete(child);
+    addRecent(child.parents, owner);
   }
 
   private markModelFresh(marker: string) {
@@ -657,6 +798,8 @@ export class ClientReflection {
     nextSignal: Signal<any>,
     preferExisting = false,
   ): Signal<any> {
+    if (previousSignal === nextSignal) return previousSignal;
+
     const nextId = this.signalIds.get(nextSignal);
     if (nextId !== undefined) {
       const existingSignal = this.getSignalById(nextId);
@@ -668,6 +811,7 @@ export class ClientReflection {
         this.transferSignalState(previousSignal, existingSignal);
         this.transferSignalState(nextSignal, existingSignal);
         previousSignal.value = existingSignal.peek();
+        this.rememberSignalChildren(existingSignal, existingSignal.peek());
         return existingSignal;
       }
 
@@ -677,11 +821,15 @@ export class ClientReflection {
     this.transferSignalState(nextSignal, previousSignal);
 
     previousSignal.value = nextSignal.peek();
+    this.rememberSignalChildren(previousSignal, previousSignal.peek());
     return previousSignal;
   }
 
   private transferSignalState(from: Signal<any>, to: Signal<any>) {
     if (from === to) return;
+
+    for (const owner of this.signalRecovery.get(from) ?? [])
+      this.rememberSignalOwner(to, owner);
 
     if (this.activeSignals.has(from)) {
       this.activeSignals.delete(from);
@@ -719,6 +867,7 @@ export class ClientReflection {
     if (existing) {
       existing[REFRESH_REFLECTED_MODEL]?.(data);
       this.rememberModelSignals(raw, existing, data, hasModelData);
+      this.rememberRecovery(raw, existing, data);
       if (hasModelData) this.markModelFresh(raw);
       return existing;
     }
@@ -728,6 +877,7 @@ export class ClientReflection {
       ? new ModelCtor(this.ctx, data)
       : createReflectedModelFacade(this.ctx, data, {typeName});
     this.rememberModel(raw, model);
+    this.rememberRecovery(raw, model, data);
     this.rememberModelSignals(raw, model, data, hasModelData);
     if (hasModelData) this.markModelFresh(raw);
     return model;
@@ -736,6 +886,7 @@ export class ClientReflection {
   handleUpdate(id: SignalId, value: any, mode?: string) {
     const sig = this.getSignalById(id);
     if (!sig) return;
+    this.rememberSignalChildren(sig, value);
 
     if (mode === 'seal') {
       this.markSignalFinal(sig);
@@ -753,7 +904,11 @@ export class ClientReflection {
       case 'append':
         // Streaming text and immutable array pushes both land here.
         if (Array.isArray(current)) {
-          sig.value = [...current, ...value];
+          sig.value = this.inheritIdentified(
+            [...current, ...value],
+            current,
+            value,
+          );
         } else if (typeof current === 'string') {
           sig.value = current + value;
         }
@@ -761,7 +916,11 @@ export class ClientReflection {
 
       case 'merge':
         if (current && typeof current === 'object') {
-          sig.value = {...current, ...value};
+          sig.value = this.inheritIdentified(
+            {...current, ...value},
+            current,
+            value,
+          );
         }
         break;
 
@@ -771,7 +930,7 @@ export class ClientReflection {
           const {start, deleteCount, items} = value;
           const nextArray = [...current];
           nextArray.splice(start, deleteCount, ...items);
-          sig.value = nextArray;
+          sig.value = this.inheritIdentified(nextArray, current, value);
         }
         break;
 
