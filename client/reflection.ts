@@ -80,6 +80,9 @@ export class ClientReflection {
   private watchedSignals = new Set<Signal<any>>();
   private watchBatch = new Set<Signal<any>>();
   private unwatchBatch = new Set<Signal<any>>();
+  private dropBatch = new Set<SignalId>();
+  private dropFlushQueued = false;
+  private dropFlushGeneration = 0;
   private modelRefreshBatch = new Set<string>();
 
   constructor(rpc: RPCClient, ctx?: any) {
@@ -151,6 +154,7 @@ export class ClientReflection {
 
   /** Watch every observed signal that has a current wire id and is not watched yet. */
   replayActiveSignals(): SignalId[] {
+    this.flushPendingDrops();
     const signals = Array.from(this.activeSignals).filter(
       (sig) =>
         this.signalIds.get(sig) !== undefined &&
@@ -238,6 +242,9 @@ export class ClientReflection {
     this.cancelWatchFlush();
     this.watchBatch.clear();
     this.unwatchBatch.clear();
+    this.dropBatch.clear();
+    this.dropFlushQueued = false;
+    this.dropFlushGeneration++;
     this.modelRefreshBatch.clear();
   }
 
@@ -256,7 +263,29 @@ export class ClientReflection {
 
   private forgetSignal(id: SignalId) {
     this.signals.delete(id);
-    this.rpc.notify(DROP_REFERENCES_METHOD, [id]);
+    this.queueDrop(id);
+  }
+
+  private queueDrop(id: SignalId) {
+    this.dropBatch.add(id);
+    if (this.dropFlushQueued) return;
+    this.dropFlushQueued = true;
+    const generation = this.dropFlushGeneration;
+    // A model cannot safely remain forgotten until the 10ms watch flush:
+    // an unsolicited update could carry a bare reference to it meanwhile.
+    queueMicrotask(() => {
+      if (generation !== this.dropFlushGeneration) return;
+      this.dropFlushQueued = false;
+      this.flushPendingDrops();
+    });
+  }
+
+  /** @internal Flush before a request that may cause the server to serialize cached identities. */
+  flushPendingDrops() {
+    if (this.dropBatch.size === 0) return;
+    const ids = Array.from(this.dropBatch);
+    this.dropBatch.clear();
+    this.rpc.notify(DROP_REFERENCES_METHOD, ids);
   }
 
   private rememberSignal(id: SignalId, sig: Signal<any>) {
@@ -323,7 +352,7 @@ export class ClientReflection {
 
   private forgetModel(marker: string) {
     if (!this.models.delete(marker)) return;
-    this.rpc.notify(DROP_REFERENCES_METHOD, [marker]);
+    this.queueDrop(marker);
     this.unlinkModelSignals(marker);
     this.modelSignals.delete(marker);
     this.refreshedRootModelMarkers.delete(marker);
@@ -408,6 +437,8 @@ export class ClientReflection {
   }
 
   private flushWatches() {
+    // Release old identities before refreshing models or subscribing to new ones.
+    this.flushPendingDrops();
     this.flushModelRefreshes();
 
     const watchSignals = Array.from(this.watchBatch).filter(

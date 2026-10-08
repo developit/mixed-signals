@@ -381,6 +381,9 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
     const generation = this.transportGeneration;
     const transport = this.transport;
     const ready = this.transportReady;
+    // Queue @D before waiting for readiness, so both its send and this
+    // call retain their order relative to later notifications.
+    this.reflection.flushPendingDrops();
 
     if (ready) {
       await Promise.race([ready, this.disconnectPromise]);
@@ -403,6 +406,7 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
   }
 
   notify(method: string, params?: any[]) {
+    if (method !== DROP_REFERENCES_METHOD) this.reflection.flushPendingDrops();
     const message = formatNotificationMessage(method, params);
     const generation = this.transportGeneration;
     const transport = this.transport;

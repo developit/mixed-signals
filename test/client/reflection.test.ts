@@ -17,6 +17,8 @@ class TaskModel {
   }
 }
 
+const reflections = new Set<ClientReflection>();
+
 function setup() {
   const notify = vi.fn();
   const rpc = {
@@ -26,10 +28,13 @@ function setup() {
   } satisfies Partial<RPCClient> as unknown as RPCClient;
   const ctx = {rpc};
   const reflection = new ClientReflection(rpc);
+  reflections.add(reflection);
   return {reflection, notify, rpc, ctx};
 }
 
 afterEach(() => {
+  for (const reflection of reflections) reflection.reset();
+  reflections.clear();
   vi.useRealTimers();
   vi.clearAllMocks();
 });
@@ -486,18 +491,44 @@ describe('ClientReflection', () => {
   });
 
   describe('GC notifications', () => {
-    it('reports collected model and signal IDs only once, without notifying for live replacements', () => {
+    it('batches collected signal and model IDs once, without notifying for live replacements', async () => {
       const {reflection, notify} = setup();
       reflection.getOrCreateSignal(1, 'live');
       reflection.createModelFacade({'@M': 'Chat#live'});
       (reflection as any).signals.set(2, {deref: () => undefined});
+      (reflection as any).signals.set(3, {deref: () => undefined});
       (reflection as any).models.set('Chat#gone', {deref: () => undefined});
 
       reflection.sweepCollectedEntries();
       reflection.sweepCollectedEntries();
-      expect(notify).toHaveBeenCalledWith('@D', [2]);
-      expect(notify).toHaveBeenCalledWith('@D', ['Chat#gone']);
-      expect(notify).toHaveBeenCalledTimes(2);
+      expect(notify).not.toHaveBeenCalled();
+      await Promise.resolve();
+      expect(notify).toHaveBeenCalledExactlyOnceWith('@D', [2, 3, 'Chat#gone']);
+    });
+
+    it('drops pending GC notifications on reconnect', async () => {
+      const {reflection, notify} = setup();
+      (reflection as any).signals.set(1, {deref: () => undefined});
+      reflection.sweepCollectedEntries();
+
+      reflection.prepareReconnect();
+      await Promise.resolve();
+      expect(notify).not.toHaveBeenCalled();
+    });
+
+    it('flushes pending GC notifications before replayed watches', () => {
+      vi.useFakeTimers();
+      const {reflection, notify} = setup();
+      const sig = reflection.getOrCreateSignal(1, 'live');
+      sig.subscribe(() => undefined);
+      (reflection as any).models.set('Chat#gone', {deref: () => undefined});
+      reflection.sweepCollectedEntries();
+
+      reflection.replayActiveSignals();
+      expect(notify.mock.calls).toEqual([
+        ['@D', ['Chat#gone']],
+        [WATCH_SIGNALS_METHOD, [1]],
+      ]);
     });
 
     it('does not watch a deleted model until a fresh snapshot arrives', async () => {
