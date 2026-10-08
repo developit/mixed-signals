@@ -25,6 +25,8 @@ export const SIGNAL_UPDATE_METHOD = '@S';
 export const WATCH_SIGNALS_METHOD = '@W';
 export const UNWATCH_SIGNALS_METHOD = '@U';
 export const REFRESH_MODELS_METHOD = '@M';
+/** Server: model deleted. Client: no longer holds these model/signal IDs. */
+export const DROP_REFERENCES_METHOD = '@D';
 
 type ParsedCallMessage = {
   type: 'call';

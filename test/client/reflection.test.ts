@@ -17,6 +17,8 @@ class TaskModel {
   }
 }
 
+const reflections = new Set<ClientReflection>();
+
 function setup() {
   const notify = vi.fn();
   const rpc = {
@@ -26,10 +28,13 @@ function setup() {
   } satisfies Partial<RPCClient> as unknown as RPCClient;
   const ctx = {rpc};
   const reflection = new ClientReflection(rpc);
+  reflections.add(reflection);
   return {reflection, notify, rpc, ctx};
 }
 
 afterEach(() => {
+  for (const reflection of reflections) reflection.reset();
+  reflections.clear();
   vi.useRealTimers();
   vi.clearAllMocks();
 });
@@ -289,6 +294,20 @@ describe('ClientReflection', () => {
       ).not.toThrow();
     });
 
+    it('preserves ordinary model properties that have a v key', () => {
+      const {reflection} = setup();
+      reflection.registerModel('Task', TaskModel);
+      const facade = reflection.createModelFacade({
+        '@M': 'Task#42',
+        '@P': {keys: ['settings', '@P'], value: {v: 'ordinary'}},
+        settings: {v: 2},
+        title: {v: 'Ship'},
+      });
+      expect(facade.data.settings).toEqual({v: 2});
+      expect(facade.data.title.peek()).toBe('Ship');
+      expect(facade.data['@P']).toEqual({v: 'ordinary'});
+    });
+
     it('reuses cached facades for repeated model markers', () => {
       const {reflection} = setup();
       reflection.registerModel('Task', TaskModel);
@@ -468,6 +487,71 @@ describe('ClientReflection', () => {
       expect(sweep).not.toHaveBeenCalled();
       expect(rpc.call).toHaveBeenCalledWith('@M', ['Counter#abc']);
       reflection.reset();
+    });
+  });
+
+  describe('GC notifications', () => {
+    it('batches collected signal and model IDs once, without notifying for live replacements', async () => {
+      const {reflection, notify} = setup();
+      reflection.getOrCreateSignal(1, 'live');
+      reflection.createModelFacade({'@M': 'Chat#live'});
+      (reflection as any).signals.set(2, {deref: () => undefined});
+      (reflection as any).signals.set(3, {deref: () => undefined});
+      (reflection as any).models.set('Chat#gone', {deref: () => undefined});
+
+      reflection.sweepCollectedEntries();
+      reflection.sweepCollectedEntries();
+      expect(notify).not.toHaveBeenCalled();
+      await Promise.resolve();
+      expect(notify).toHaveBeenCalledExactlyOnceWith('@D', [2, 3, 'Chat#gone']);
+    });
+
+    it('drops pending GC notifications on reconnect', async () => {
+      const {reflection, notify} = setup();
+      (reflection as any).signals.set(1, {deref: () => undefined});
+      reflection.sweepCollectedEntries();
+
+      reflection.prepareReconnect();
+      await Promise.resolve();
+      expect(notify).not.toHaveBeenCalled();
+    });
+
+    it('flushes pending GC notifications before replayed watches', () => {
+      vi.useFakeTimers();
+      const {reflection, notify} = setup();
+      const sig = reflection.getOrCreateSignal(1, 'live');
+      sig.subscribe(() => undefined);
+      (reflection as any).models.set('Chat#gone', {deref: () => undefined});
+      reflection.sweepCollectedEntries();
+
+      reflection.replayActiveSignals();
+      expect(notify.mock.calls).toEqual([
+        ['@D', ['Chat#gone']],
+        [WATCH_SIGNALS_METHOD, [1]],
+      ]);
+    });
+
+    it('does not watch a deleted model until a fresh snapshot arrives', async () => {
+      vi.useFakeTimers();
+      const {reflection, notify} = setup();
+      const facade = reflection.createModelFacade({
+        '@M': 'Chat#13',
+        title: {v: 'old'},
+      });
+      reflection.handleModelDeletion('Chat#13');
+      facade.title.subscribe(() => undefined);
+      vi.advanceTimersByTime(10);
+      expect(notify).not.toHaveBeenCalledWith(WATCH_SIGNALS_METHOD, [
+        'Chat#13.title',
+      ]);
+      reflection.createModelFacade({'@M': 'Chat#13', title: {v: 'new'}});
+      await Promise.resolve();
+      await Promise.resolve();
+      vi.advanceTimersByTime(10);
+      expect(facade.title.peek()).toBe('new');
+      expect(notify).toHaveBeenCalledWith(WATCH_SIGNALS_METHOD, [
+        'Chat#13.title',
+      ]);
     });
   });
 

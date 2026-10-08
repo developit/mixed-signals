@@ -150,6 +150,14 @@ are replaced instead of reconciled by index or shape. Watches are replayed once
 immediately from the ids already known in the root snapshot and again after
 held-model refreshes bind any additional signal ids.
 
+Model properties use implicit signal IDs (`Type#id.propertyName`), serialized
+as `{"@M":"Chat#13","title":{"v":"Hello"}}`. Standalone signals still
+carry `@S`. A snapshot does not subscribe the client; observation sends `@W`,
+and a later watch catches up any intervening update. Servers announce explicit
+`rpc.instances.remove(id)` deletions with `N:@D:"Type#id"`. Client GC sends
+`N:@D:` for collected model/signal IDs so the server re-inlines them if sent
+again; GC notifications are best-effort.
+
 Client reflection caches use weak references when the runtime supports them, so
 cached signal ids and reflected model markers do not by themselves keep
 unwatched, otherwise-unheld client objects alive. Watched signals remain strongly

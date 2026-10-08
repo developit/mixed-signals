@@ -19,7 +19,7 @@ class FakeSender {
   }
 }
 
-function parseUpdate(message: string): [number, unknown, string?] {
+function parseUpdate(message: string): [number | string, unknown, string?] {
   const parsed = parseWireMessage(message);
   expect(parsed).toMatchObject({
     type: 'notification',
@@ -27,7 +27,7 @@ function parseUpdate(message: string): [number, unknown, string?] {
   });
   if (!parsed || parsed.type !== 'notification')
     throw new Error('Expected a signal update notification');
-  return parseWireParams<[number, unknown, string?]>(parsed.payload);
+  return parseWireParams<[number | string, unknown, string?]>(parsed.payload);
 }
 
 function setupCounter(
@@ -39,10 +39,10 @@ function setupCounter(
   const c = new Counter();
   instances.register('0', c);
   const serialized = reflection.serialize(c, clientId);
-  const countId = serialized.count['@S'] as number;
-  const nameId = serialized.name['@S'] as number;
-  const itemsId = serialized.items['@S'] as number;
-  const metaId = serialized.meta['@S'] as number;
+  const countId = `${serialized['@M']}.count`;
+  const nameId = `${serialized['@M']}.name`;
+  const itemsId = `${serialized['@M']}.items`;
+  const metaId = `${serialized['@M']}.meta`;
   return {counter: c, serialized, countId, nameId, itemsId, metaId};
 }
 
@@ -70,14 +70,10 @@ describe('Reflection', () => {
 
       const serialized = reflection.serialize(c, 'c1');
 
-      expect(serialized.name).toEqual({
-        '@S': serialized.name['@S'],
-        v: 'default',
-        f: 1,
-      });
+      expect(serialized.name).toEqual({v: 'default', f: 1});
       expect(serialized.count).not.toHaveProperty('f');
 
-      reflection.watch('c1', serialized.name['@S']);
+      reflection.watch('c1', `${serialized['@M']}.name`);
       c.name.value = 'changed';
       expect(sender.sent).toEqual([]);
     });
@@ -91,6 +87,10 @@ describe('Reflection', () => {
       );
       reflection.serialize(counter, 'c2');
       reflection.serialize(counter, 'c3');
+      for (const clientId of ['c1', 'c2', 'c3']) {
+        reflection.watch(clientId, countId);
+        reflection.watch(clientId, nameId);
+      }
       reflection.unwatch('c3', countId);
 
       reflection.markFinal([counter.count]);
@@ -104,7 +104,7 @@ describe('Reflection', () => {
 
       vi.advanceTimersByTime(1_000);
 
-      const sealFrame = (id: number) =>
+      const sealFrame = (id: number | string) =>
         formatNotificationMessage(SIGNAL_UPDATE_METHOD, [id, null, 'seal']);
       expect(sender.sent).toEqual([
         {clientId: 'c1', message: sealFrame(countId)},
@@ -118,12 +118,12 @@ describe('Reflection', () => {
     it('re-serializes a final signal inline instead of as a held ref', () => {
       vi.useFakeTimers();
       const {counter, serialized} = setupCounter(reflection, instances, 'c1');
-      reflection.watch('c1', serialized.count['@S']);
+      reflection.watch('c1', `${serialized['@M']}.count`);
       reflection.markFinal([counter.count]);
 
       const again = reflection.serialize(counter.count, 'c1');
 
-      expect(again).toEqual({'@S': serialized.count['@S'], v: 0, f: 1});
+      expect(again).toEqual({'@S': 'Counter#0.count', v: 0, f: 1});
     });
   });
 
@@ -220,8 +220,8 @@ describe('Reflection', () => {
       // task model
       expect(result.task['@M']).toBe('Task#42');
       expect(result.task.extra).toBe('public');
-      expect(result.task.id).toHaveProperty('@S');
-      expect(result.task.name).toHaveProperty('@S');
+      expect(result.task.id).toEqual({v: '42'});
+      expect(result.task.name).toEqual({v: 'Ship it'});
       expect(result.task._secret).toBeUndefined();
       expect(result.task.rename).toBeUndefined();
 
@@ -237,13 +237,29 @@ describe('Reflection', () => {
       // full serialization for different client
       const other = reflection.serialize(task, 'client-2');
       expect(other['@M']).toBe('Task#42');
-      expect(other.name).toHaveProperty('@S');
+      expect(other.name).toEqual({v: 'Ship it'});
     });
 
-    it('serializes model signals as {@S: id, v: value} markers', () => {
+    it('distinguishes plain model values with a v key from signal snapshots', () => {
+      class Chat {
+        id = '13';
+        title = signal('Hello');
+        settings = {v: 2};
+        '@P' = {v: 'ordinary'};
+      }
+      reflection.registerModel('Chat', Chat);
+      expect(reflection.serialize(new Chat(), 'c1')).toEqual({
+        '@M': 'Chat#13',
+        id: '13',
+        title: {v: 'Hello'},
+        settings: {v: 2},
+        '@P': {keys: ['settings', '@P'], value: {v: 'ordinary'}},
+      });
+    });
+
+    it('serializes model signals with implicit property identity', () => {
       const {serialized} = setupCounter(reflection, instances);
-      expect(serialized.count).toHaveProperty('@S');
-      expect(serialized.count.v).toBe(0);
+      expect(serialized.count).toEqual({v: 0});
     });
 
     it('assigns unique signal IDs', () => {
@@ -261,15 +277,15 @@ describe('Reflection', () => {
       instances.register('0', c);
       const first = reflection.serialize(c);
       const second = reflection.serialize(c);
-      expect(first.count['@S']).toBe(second.count['@S']);
-      expect(first.name['@S']).toBe(second.name['@S']);
+      expect(first.count).toEqual(second.count);
+      expect(first.name).toEqual(second.name);
     });
 
     it('serializes model with @M marker and signal props', () => {
       const {serialized} = setupCounter(reflection, instances);
       expect(serialized['@M']).toMatch(/^Counter#/);
-      expect(serialized.count).toHaveProperty('@S');
-      expect(serialized.name).toHaveProperty('@S');
+      expect(serialized.count).toEqual({v: 0});
+      expect(serialized.name).toEqual({v: 'default'});
     });
 
     it('skips properties starting with _', () => {
@@ -289,7 +305,7 @@ describe('Reflection', () => {
       const c = new Counter();
       instances.register('0', c);
       const first = reflection.serialize(c, 'clientA');
-      expect(first.count).toHaveProperty('@S');
+      expect(first.count).toEqual({v: 0});
       const second = reflection.serialize(c, 'clientA');
       expect(second.count).toBeUndefined();
       expect(second['@M']).toMatch(/^Counter#/);
@@ -301,8 +317,8 @@ describe('Reflection', () => {
       const id = first.diff['@S'] as number;
       expect(first.diff.v).toBe(big.peek());
 
-      // The first serialization watched the signal on clientA's behalf, so the
-      // client provably still holds it: the repeat carries the id alone.
+      // Only an explicit watch proves that the client still holds the signal.
+      reflection.watch('clientA', id);
       const second = reflection.serialize({diff: big}, 'clientA');
       expect(second.diff).toEqual({'@S': id});
     });
@@ -380,8 +396,8 @@ describe('Reflection', () => {
       instances.register('0', c);
       const forA = reflection.serialize(c, 'clientA');
       const forB = reflection.serialize(c, 'clientB');
-      expect(forA.count).toHaveProperty('@S');
-      expect(forB.count).toHaveProperty('@S');
+      expect(forA.count).toEqual({v: 0});
+      expect(forB.count).toEqual({v: 0});
     });
 
     it('auto-registers model instance', () => {
@@ -421,6 +437,106 @@ describe('Reflection', () => {
   });
 
   describe('watch / unwatch', () => {
+    it('does not subscribe on serialization and catches up on the first watch', () => {
+      const {counter, countId} = setupCounter(reflection, instances, 'c1');
+      counter.count.value = 5;
+      expect(sender.sent).toEqual([]);
+
+      reflection.watch('c1', countId);
+      expect(sender.sent).toEqual([
+        {
+          clientId: 'c1',
+          message: formatNotificationMessage(SIGNAL_UPDATE_METHOD, [
+            countId,
+            5,
+          ]),
+        },
+      ]);
+    });
+
+    it('rebinds existing watchers when a model property gets a new Signal', () => {
+      class Chat {
+        id = '13';
+        title = signal('old');
+      }
+      reflection.registerModel('Chat', Chat);
+      const chat = new Chat();
+      reflection.serialize(chat, 'c1');
+      reflection.watch('c1', 'Chat#13.title');
+      const oldTitle = chat.title;
+      chat.title = signal('new');
+      reflection.serializeModelMarker('Chat#13', 'c1');
+      sender.sent.length = 0;
+      oldTitle.value = 'obsolete';
+      expect(sender.sent).toEqual([]);
+      chat.title.value = 'newer';
+      expect(sender.sent).toEqual([
+        {
+          clientId: 'c1',
+          message: 'N:@S:"Chat#13.title","er","append"',
+        },
+      ]);
+    });
+
+    it('updates and seals watchers when a replacement signal was already final', () => {
+      vi.useFakeTimers();
+      class Chat {
+        id = '13';
+        title = signal('old');
+      }
+      reflection.registerModel('Chat', Chat);
+      const chat = new Chat();
+      reflection.serialize(chat, 'c1');
+      reflection.watch('c1', 'Chat#13.title');
+      const final = signal('done');
+      reflection.markFinal([final]);
+      chat.title = final;
+      reflection.serializeModelMarker('Chat#13', 'c1');
+      expect(sender.sent).toContainEqual({
+        clientId: 'c1',
+        message: 'N:@S:"Chat#13.title","done"',
+      });
+      vi.advanceTimersByTime(1_000);
+      expect(sender.sent).toContainEqual({
+        clientId: 'c1',
+        message: 'N:@S:"Chat#13.title",null,"seal"',
+      });
+      sender.sent.length = 0;
+      final.value = 'later';
+      expect(sender.sent).toEqual([]);
+    });
+
+    it('deletes watched model fields and notifies late subscribers', () => {
+      const {counter, countId} = setupCounter(reflection, instances, 'c1');
+      instances.onRemove = (id, instance) =>
+        reflection.modelRemoved(id, instance);
+      reflection.watch('c1', countId);
+      instances.remove('0');
+      expect(sender.sent).toEqual([
+        {
+          clientId: 'c1',
+          message: 'N:@D:"Counter#0"',
+        },
+      ]);
+
+      sender.sent.length = 0;
+      counter.count.value = 10;
+      reflection.watch('c1', countId);
+      expect(sender.sent).toEqual([
+        {
+          clientId: 'c1',
+          message: 'N:@D:"Counter#0"',
+        },
+      ]);
+    });
+
+    it('forgets a collected model so the next send contains its properties', () => {
+      const {counter} = setupCounter(reflection, instances, 'c1');
+      expect(reflection.serialize(counter, 'c1')).toEqual({'@M': 'Counter#0'});
+      reflection.forgetClientReferences('c1', ['Counter#0']);
+      expect(reflection.serialize(counter, 'c1').count).toEqual({v: 0});
+    });
+
     it('watch subscribes client to signal updates', () => {
       const clientId = 'c1';
       const {counter, countId} = setupCounter(reflection, instances, clientId);
@@ -864,12 +980,12 @@ describe('Reflection', () => {
       const c = new Counter();
       instances.register('0', c);
       const first = reflection.serialize(c, 'clientA');
-      expect(first.count).toHaveProperty('@S');
+      expect(first.count).toEqual({v: 0});
       const deduped = reflection.serialize(c, 'clientA');
       expect(deduped.count).toBeUndefined();
       reflection.removeClient('clientA');
       const full = reflection.serialize(c, 'clientA');
-      expect(full.count).toHaveProperty('@S');
+      expect(full.count).toEqual({v: 0});
     });
   });
 });

@@ -177,7 +177,7 @@ describe('RPC', () => {
     const payload = parseNotification(second.sent[0]).params;
     expect(payload[0] as any).toMatchObject({
       '@M': 'Counter#0',
-      count: {'@S': expect.any(Number), v: 0},
+      count: {v: 0},
     });
   });
 
@@ -200,7 +200,7 @@ describe('RPC', () => {
       expect(parseWireValue(message.payload)).toMatchObject([
         {
           '@M': 'Counter#0',
-          count: {'@S': expect.any(Number), v: 7},
+          count: {v: 7},
         },
       ]);
     }
@@ -217,11 +217,60 @@ describe('RPC', () => {
 
     await transport.emit(formatCallMessage(1, '@M', ['Counter#missing']));
 
-    const message = parseWireMessage(transport.sent[0]);
+    expect(transport.sent[0]).toBe('N:@D:"Counter#missing"');
+    const message = parseWireMessage(transport.sent[1]);
     expect(message?.type).toBe('result');
     if (message?.type === 'result') {
       expect(parseWireValue(message.payload)).toEqual([null]);
     }
+  });
+
+  it('notifies clients of removed model instances and rejects late watches', async () => {
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const counter = new Counter();
+    rpc.expose({counter});
+    const transport = new FakeTransport();
+    rpc.addClient(transport, 'c1');
+    const model = (parseNotification(transport.sent[0]).params[0] as any)
+      .counter;
+    const id = `${model['@M']}.count`;
+    transport.sent.length = 0;
+    await transport.emit(formatNotificationMessage(WATCH_SIGNALS_METHOD, [id]));
+    rpc.instances.remove(model['@M'].split('#')[1]);
+    expect(transport.sent).toEqual(['N:@D:"Counter#1"']);
+    transport.sent.length = 0;
+    counter.count.value = 10;
+    await transport.emit(formatNotificationMessage(WATCH_SIGNALS_METHOD, [id]));
+    expect(transport.sent).toEqual(['N:@D:"Counter#1"']);
+  });
+
+  it('forgets client model and signal identities without affecting other clients', async () => {
+    const rpc = new RPC();
+    rpc.registerModel('Counter', Counter);
+    const root = new Counter();
+    rpc.expose({
+      counter: root,
+      getCounter() {
+        return root;
+      },
+    });
+    const first = new FakeTransport();
+    const second = new FakeTransport();
+    rpc.addClient(first, 'a');
+    rpc.addClient(second, 'b');
+    first.sent.length = 0;
+    second.sent.length = 0;
+    await first.emit('N:@D:"Counter#1"');
+    await first.emit(formatCallMessage(1, 'getCounter'));
+    await second.emit(formatCallMessage(1, 'getCounter'));
+    expect(
+      (parseWireValue((parseWireMessage(first.sent[0]) as any).payload) as any)
+        .count,
+    ).toEqual({v: 0});
+    expect(
+      parseWireValue((parseWireMessage(second.sent[0]) as any).payload),
+    ).toEqual({'@M': 'Counter#1'});
   });
 
   it('late cleanup from an old transport does not delete a reconnected client id', () => {

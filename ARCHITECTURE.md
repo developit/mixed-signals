@@ -63,6 +63,7 @@ All messages are compact, newline-free text strings.
 | `N:{method}:{args}`     | Fire-and-forget notification. Same format but no response is sent.                                        |
 | `N:@W:{ids}`            | Subscribe to signal updates. `{ids}` is comma-separated signal IDs.                                       |
 | `N:@U:{ids}`            | Unsubscribe from signal updates.                                                                          |
+| `N:@D:{ids}`            | Forget collected model markers or signal IDs; the next send must inline their full representation.       |
 
 #### Server → Client
 
@@ -71,6 +72,7 @@ All messages are compact, newline-free text strings.
 | `R{id}:{result}`             | Successful response to call `{id}`. `{result}` is a single JSON value.     |
 | `E{id}:{error}`              | Error response to call `{id}`. `{error}` is `{"code":-1,"message":"..."}`. |
 | `N:@S:{id},{value}[,{mode}]` | Signal update or seal notification. `{mode}` is omitted for full replacement. |
+| `N:@D:"Type#id"`           | A registered model instance was removed (or a requested marker is no longer available). |
 
 #### Method Routing
 
@@ -88,6 +90,19 @@ During serialization, special objects are embedded in JSON:
 | `@S`   | `{"@S": id}`                          | The same signal, without its value: the client already holds it (identical last-sent value plus a live subscription), so the ref resolves against the signal it has. Returning a reflected signal from a method is therefore cheap — the value travels once, as a signal update. |
 | `@S`   | `{"@S": id, "v": value, "f": 1}`      | A final signal: the server promises it will never change. The client still gets a `Signal`, but observing it sends no `@W`, and the server opens no subscription for it. |
 | `@M`   | `{"@M": "TypeName#wireId", ...props}` | A server-side model instance. The client reuses a cached facade or creates a proxy facade directly from the serialized props. Custom registered constructors are still supported. |
+
+Model-owned signal properties omit `@S`: `{"@M":"Chat#13","title":{"v":"Hello"}}`
+identifies the signal as `Chat#13.title`. If an ordinary model property has a
+`v` key, the model includes `"@P":["propertyName"]` to distinguish it from a
+signal snapshot. If the model itself has an `@P` property, the metadata uses
+`{"@P":{"keys":[...],"value":...}}` to preserve that property. Top-level and other standalone signals still use `@S`.
+Neither form implicitly subscribes a client; only `N:@W:`
+starts updates. A watch after an unwatched change receives an immediate catch-up
+`N:@S:` update/delta. `Instances.remove(id)` explicitly deletes a model and
+sends `N:@D:"Type#id"` to clients that received it. Removing a model from an
+application collection alone does not remove its strong `Instances` registration:
+call `remove` when it is truly deleted. Client GC reports `N:@D:` on a
+best-effort basis where `WeakRef` and `FinalizationRegistry` are available.
 
 Properties beginning with `_` and all functions are stripped from serialized objects.
 
@@ -239,17 +254,17 @@ live objects into wire markers. The client's `JSON.parse` reviver inverts it.
   signal(3)           ──▶   {"@S":7,"v":3}          ──▶   live Signal (id 7)
 
   thread instance     ──▶   {"@M":"Thread#42",      ──▶   new ThreadModel(ctx,
-  (registered in             "id":{"@S":9,"v":42},          data)  via
-   Instances with            "title":{"@S":10,...}}         modelRegistry
+  (registered in             "id":{"v":42},                  data)  via
+   Instances with            "title":{"v":"Hello"}}        modelRegistry
    type "Thread")
 
   obj._private        ──▶   (dropped)
   obj.method          ──▶   (dropped — replaced by RPC stubs on client)
 ```
 
-`@M` handling is eager: it iterates own props, inlines nested `@S` markers
-immediately (so `Signal.toJSON()` never runs), and strips `_`-prefixed and
-function props.
+`@M` handling is eager: it iterates own props, inlines their signal values
+without separate IDs (so `Signal.toJSON()` never runs), and strips
+`_`-prefixed and function props.
 
 ---
 
@@ -323,7 +338,7 @@ A root that the same process sends again on a live connection changes no subscri
 A signal that a stale model shares with the latest root snapshot or a fresh model subscribes immediately, because that source already supplied its current wire id.
 
 For a model returned by a method and omitted from the latest root snapshot, sending the last field's `@U` also marks the model stale.
-The server may then release its registrations after its grace period while application code still holds the client facade.
+The application may explicitly remove its registration while client code still holds the facade.
 Observing that facade again requests `@M` before sending `@W`, preserving the facade and its field signals while refreshing their values and wire ids.
 Invalidation happens when the batched unwatch is sent, so a remount that cancels the unwatch does not cause a model refresh.
 Refresh requests use the same batched flush as `@W`: observations in one flush share a single `@M` for all their stale models, a refresh whose last observer leaves before the flush is not sent, and concurrent observations share an in-flight refresh.
@@ -337,7 +352,8 @@ facades. The top-level plain root object can be updated in place for ergonomics,
 but unbranded nested arrays and plain objects are replaced instead of reconciled
 by index or shape. Held facades that are not present in the new root can recover
 when the server process can resolve their `Type#id` marker from its `Instances` registry or an application resolver that reconstructs evicted models.
-Client-held references do not pin server resources, and this does not add a server eviction policy or a new wire message.
+Client-held references do not pin server resources. Explicit deletion uses `@D`;
+there is no automatic server eviction policy.
 
 The server includes connection metadata as a second `@R` parameter:
 `{connectionId, processId, resumed}`. `connectionId` is opaque and can be fed
@@ -426,9 +442,8 @@ have the method, the RPC response rejects with `Method not found: <name>`.
 
 ## Invariants
 
-- **Signal identity** — one server `Signal` = one wire id for the process
-  lifetime (`WeakMap<Signal,id>`). Re-serializing the same signal yields the
-  same id; the client dedupes on it.
+- **Signal identity** — model properties use `Type#id.propertyName`; standalone
+  signals use stable wire IDs (`WeakMap<Signal,id>`). The client dedupes by ID.
 - **Instance identity** — `Instances.nextId()` skips occupied slots and
   ratchets past any `register(id, …)` so storage-hydrated ids and fresh ids
   never collide.

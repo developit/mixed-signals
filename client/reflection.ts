@@ -1,5 +1,6 @@
 import {type Signal, Signal as SignalCtor, signal} from '@preact/signals-core';
 import {
+  DROP_REFERENCES_METHOD,
   REFRESH_MODELS_METHOD,
   UNWATCH_SIGNALS_METHOD,
   WATCH_SIGNALS_METHOD,
@@ -79,6 +80,9 @@ export class ClientReflection {
   private watchedSignals = new Set<Signal<any>>();
   private watchBatch = new Set<Signal<any>>();
   private unwatchBatch = new Set<Signal<any>>();
+  private dropBatch = new Set<SignalId>();
+  private dropFlushQueued = false;
+  private dropFlushGeneration = 0;
   private modelRefreshBatch = new Set<string>();
 
   constructor(rpc: RPCClient, ctx?: any) {
@@ -90,10 +94,14 @@ export class ClientReflection {
       // to a newer object before an older one is collected, so each callback
       // checks the current cache entry before deleting it.
       this.signalFinalizer = new FinalizationRegistry((id) => {
-        if (!this.signals.get(id)?.deref()) this.signals.delete(id);
+        if (this.signals.has(id) && !this.signals.get(id)?.deref()) {
+          this.forgetSignal(id);
+        }
       });
       this.modelFinalizer = new FinalizationRegistry((marker) => {
-        if (!this.models.get(marker)?.deref()) this.forgetModel(marker);
+        if (this.models.has(marker) && !this.models.get(marker)?.deref()) {
+          this.forgetModel(marker);
+        }
       });
     }
   }
@@ -146,6 +154,7 @@ export class ClientReflection {
 
   /** Watch every observed signal that has a current wire id and is not watched yet. */
   replayActiveSignals(): SignalId[] {
+    this.flushPendingDrops();
     const signals = Array.from(this.activeSignals).filter(
       (sig) =>
         this.signalIds.get(sig) !== undefined &&
@@ -233,6 +242,9 @@ export class ClientReflection {
     this.cancelWatchFlush();
     this.watchBatch.clear();
     this.unwatchBatch.clear();
+    this.dropBatch.clear();
+    this.dropFlushQueued = false;
+    this.dropFlushGeneration++;
     this.modelRefreshBatch.clear();
   }
 
@@ -242,11 +254,38 @@ export class ClientReflection {
 
     const sig = ref.deref();
     if (!sig) {
-      this.signals.delete(id);
+      this.forgetSignal(id);
       return undefined;
     }
 
     return sig;
+  }
+
+  private forgetSignal(id: SignalId) {
+    this.signals.delete(id);
+    this.queueDrop(id);
+  }
+
+  private queueDrop(id: SignalId) {
+    this.dropBatch.add(id);
+    if (this.dropFlushQueued) return;
+    this.dropFlushQueued = true;
+    const generation = this.dropFlushGeneration;
+    // A model cannot safely remain forgotten until the 10ms watch flush:
+    // an unsolicited update could carry a bare reference to it meanwhile.
+    queueMicrotask(() => {
+      if (generation !== this.dropFlushGeneration) return;
+      this.dropFlushQueued = false;
+      this.flushPendingDrops();
+    });
+  }
+
+  /** @internal Flush before a request that may cause the server to serialize cached identities. */
+  flushPendingDrops() {
+    if (this.dropBatch.size === 0) return;
+    const ids = Array.from(this.dropBatch);
+    this.dropBatch.clear();
+    this.rpc.notify(DROP_REFERENCES_METHOD, ids);
   }
 
   private rememberSignal(id: SignalId, sig: Signal<any>) {
@@ -312,8 +351,9 @@ export class ClientReflection {
   }
 
   private forgetModel(marker: string) {
+    if (!this.models.delete(marker)) return;
+    this.queueDrop(marker);
     this.unlinkModelSignals(marker);
-    this.models.delete(marker);
     this.modelSignals.delete(marker);
     this.refreshedRootModelMarkers.delete(marker);
     this.staleModelMarkers.delete(marker);
@@ -397,6 +437,8 @@ export class ClientReflection {
   }
 
   private flushWatches() {
+    // Release old identities before refreshing models or subscribing to new ones.
+    this.flushPendingDrops();
     this.flushModelRefreshes();
 
     const watchSignals = Array.from(this.watchBatch).filter(
@@ -705,6 +747,36 @@ export class ClientReflection {
       throw new Error('Model missing @M field');
     }
 
+    // @P lists ordinary properties whose values also have a `v` key.
+    const metadata = serialized['@P'];
+    const plainValueProperties = new Set<string>(
+      Array.isArray(metadata) ? metadata : (metadata?.keys ?? []),
+    );
+    if (metadata && !Array.isArray(metadata)) {
+      serialized['@P'] = metadata.value;
+    } else {
+      delete serialized['@P'];
+    }
+    // Model properties carry their signal identity implicitly in the model marker.
+    for (const [key, value] of Object.entries(serialized)) {
+      if (
+        key !== '@M' &&
+        !plainValueProperties.has(key) &&
+        value &&
+        typeof value === 'object' &&
+        !Array.isArray(value) &&
+        !(value instanceof SignalCtor) &&
+        Object.hasOwn(value, 'v') &&
+        !Object.hasOwn(value, '@S')
+      ) {
+        const id = `${raw}.${key}`;
+        const snapshot = value as {v: any; f?: number};
+        const sig = this.syncSignalSnapshot(id, snapshot.v);
+        if (snapshot.f) this.markSignalFinal(sig);
+        serialized[key] = sig;
+      }
+    }
+
     // Models are branded as TypeName#wireId so the facade knows both pieces.
     const hashIdx = raw.lastIndexOf('#');
     const typeName = hashIdx !== -1 ? raw.slice(0, hashIdx) : raw;
@@ -731,6 +803,20 @@ export class ClientReflection {
     this.rememberModelSignals(raw, model, data, hasModelData);
     if (hasModelData) this.markModelFresh(raw);
     return model;
+  }
+
+  /** An instance is no longer available on the server; retain held facades but stop stale subscriptions. */
+  handleModelDeletion(marker: string) {
+    this.staleModelMarkers.add(marker);
+    this.sentModelSignalsUnwatched(marker);
+  }
+
+  private sentModelSignalsUnwatched(marker: string) {
+    for (const sig of this.liveModelSignals(marker)) {
+      this.watchBatch.delete(sig);
+      this.unwatchBatch.delete(sig);
+      this.watchedSignals.delete(sig);
+    }
   }
 
   handleUpdate(id: SignalId, value: any, mode?: string) {

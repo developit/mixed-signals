@@ -1,6 +1,7 @@
 import {batch, type Signal} from '@preact/signals-core';
 import {
   type ConnectionInfo,
+  DROP_REFERENCES_METHOD,
   formatCallMessage,
   formatErrorMessage,
   formatNotificationMessage,
@@ -380,6 +381,9 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
     const generation = this.transportGeneration;
     const transport = this.transport;
     const ready = this.transportReady;
+    // Queue @D before waiting for readiness, so both its send and this
+    // call retain their order relative to later notifications.
+    this.reflection.flushPendingDrops();
 
     if (ready) {
       await Promise.race([ready, this.disconnectPromise]);
@@ -402,6 +406,7 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
   }
 
   notify(method: string, params?: any[]) {
+    if (method !== DROP_REFERENCES_METHOD) this.reflection.flushPendingDrops();
     const message = formatNotificationMessage(method, params);
     const generation = this.transportGeneration;
     const transport = this.transport;
@@ -592,6 +597,11 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
     } else if (method === SIGNAL_UPDATE_METHOD) {
       const [id, value, mode] = params;
       this.reflection.handleUpdate(id, value, mode);
+    } else if (method === DROP_REFERENCES_METHOD) {
+      for (const marker of params) {
+        if (typeof marker === 'string')
+          this.reflection.handleModelDeletion(marker);
+      }
     } else {
       for (const listener of this.notificationListeners) {
         listener(method, params);

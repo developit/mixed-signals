@@ -139,6 +139,8 @@ interface TranscriptSessionApi {
 }
 
 afterEach(() => {
+  // Drain the shared watch batch before replacing fake timers between tests.
+  vi.runOnlyPendingTimers();
   vi.useRealTimers();
 });
 
@@ -934,6 +936,14 @@ describe('mixed-signals roundtrip', () => {
 
     expect(client.root.session.items.value[1].name.value).toBe('read');
     expect(client.root.session.items.value[1].output.value).toBe('Reading...');
+    const stopOutput = client.root.session.items.value[1].output.subscribe(
+      () => undefined,
+    );
+    const stopToolStatus = client.root.session.items.value[1].status.subscribe(
+      () => undefined,
+    );
+    vi.advanceTimersByTime(10);
+    await flush();
 
     toolCall.output.value = 'file contents';
     toolCall.status.value = 'complete';
@@ -958,6 +968,8 @@ describe('mixed-signals roundtrip', () => {
 
     stopContent?.();
     stopMessageStatus();
+    stopOutput();
+    stopToolStatus();
     stopItems();
     stopStatus();
   });

@@ -120,6 +120,41 @@ describe('RPCClient', () => {
       expect(transport.sent[0]).toBe('M1:doSomething:1,"two"');
     });
 
+    it('sends collected model IDs before calls that can return bare references', async () => {
+      vi.useFakeTimers();
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      (client.reflection as any).models.set('Chat#3', {
+        deref: () => undefined,
+      });
+      client.reflection.sweepCollectedEntries();
+
+      const pending = client.call('getChat', []);
+      expect(transport.sent).toEqual(['N:@D:"Chat#3"', 'M1:getChat:']);
+      transport.emit('R1:null');
+      await pending;
+    });
+
+    it('orders pending drops before calls while the transport becomes ready', async () => {
+      let resolveReady!: () => void;
+      const ready = new Promise<void>((resolve) => {
+        resolveReady = resolve;
+      });
+      const transport = new FakeTransport(ready);
+      const client = new RPCClient(transport, createContext());
+      (client.reflection as any).models.set('Chat#3', {
+        deref: () => undefined,
+      });
+      client.reflection.sweepCollectedEntries();
+
+      const pending = client.call('getChat', []);
+      resolveReady();
+      await vi.waitFor(() => expect(transport.sent).toHaveLength(2));
+      expect(transport.sent).toEqual(['N:@D:"Chat#3"', 'M1:getChat:']);
+      transport.emit('R1:null');
+      await pending;
+    });
+
     it('increments message IDs', async () => {
       const transport = new FakeTransport();
       const client = new RPCClient(transport, createContext());
@@ -254,6 +289,57 @@ describe('RPCClient', () => {
       expect(transport.sent[0]).toBe('N:ping:');
     });
 
+    it('sends pending drops before another notification', () => {
+      vi.useFakeTimers();
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      (client.reflection as any).models.set('Chat#3', {
+        deref: () => undefined,
+      });
+      client.reflection.sweepCollectedEntries();
+
+      client.notify('fetch', []);
+      expect(transport.sent).toEqual(['N:@D:"Chat#3"', 'N:fetch:']);
+    });
+
+    it('batches collected signal and model IDs into one @D frame', async () => {
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      (client.reflection as any).signals.set(1, {deref: () => undefined});
+      (client.reflection as any).signals.set(2, {deref: () => undefined});
+      (client.reflection as any).models.set('Chat#3', {
+        deref: () => undefined,
+      });
+
+      client.reflection.sweepCollectedEntries();
+      expect(transport.sent).toEqual([]);
+      await Promise.resolve();
+      expect(transport.sent).toEqual(['N:@D:1,2,"Chat#3"']);
+    });
+
+    it('keeps notifications ordered behind a pending drop while transport becomes ready', async () => {
+      let resolveReady!: () => void;
+      const ready = new Promise<void>((resolve) => {
+        resolveReady = resolve;
+      });
+      const transport = new FakeTransport(ready);
+      const client = new RPCClient(transport, createContext());
+      (client.reflection as any).models.set('Chat#3', {
+        deref: () => undefined,
+      });
+      client.reflection.sweepCollectedEntries();
+
+      client.notify('first', []);
+      client.notify('second', []);
+      resolveReady();
+      await vi.waitFor(() => expect(transport.sent).toHaveLength(3));
+      expect(transport.sent).toEqual([
+        'N:@D:"Chat#3"',
+        'N:first:',
+        'N:second:',
+      ]);
+    });
+
     it('waits for transport.ready before sending', async () => {
       let resolveReady!: () => void;
       const ready = new Promise<void>((r) => {
@@ -318,6 +404,23 @@ describe('RPCClient', () => {
       const sig = client.reflection.getOrCreateSignal(5, 'old');
       transport.emit('N:@S:5,"new"');
       expect(sig.peek()).toBe('new');
+    });
+
+    it('derives model field IDs and accepts updates without nested @S markers', () => {
+      vi.useFakeTimers();
+      const transport = new FakeTransport();
+      const client = new RPCClient(transport, createContext());
+      transport.emit('N:@R:{"@M":"Chat#13","title":{"v":"before"}}');
+      expect(client.root.title.peek()).toBe('before');
+      client.root.title.subscribe(() => undefined);
+      vi.advanceTimersByTime(10);
+      expect(transport.sent).toContain('N:@W:"Chat#13.title"');
+      transport.emit('N:@S:"Chat#13.title","-after","append"');
+      expect(client.root.title.peek()).toBe('before-after');
+      transport.emit('N:@D:"Chat#13"');
+      expect((client.reflection as any).staleModelMarkers.has('Chat#13')).toBe(
+        true,
+      );
     });
 
     it('@S with delta mode', () => {
@@ -1153,7 +1256,11 @@ describe('RPCClient', () => {
         'R1:[{"@M":"Counter#held","count":{"@S":10,"v":5},"name":{"@S":20,"v":"y"},"items":{"@S":30,"v":[]},"meta":{"@S":40,"v":{}}}]',
       );
       await vi.waitFor(() => {
-        expect(transport2.sent).toContain('N:@W:10,20');
+        expect(
+          transport2.sent.some(
+            (message) => message === 'N:@W:10,20' || message === 'N:@W:20,10',
+          ),
+        ).toBe(true);
       });
     });
 
